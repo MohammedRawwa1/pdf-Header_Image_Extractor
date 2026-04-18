@@ -1,0 +1,47 @@
+## Render service manifest (example)
+## Replace placeholder values before deploying.
+
+services:
+  - type: web
+    name: pdf-header-image-bot
+    env: docker
+    branch: main
+    dockerfilePath: Dockerfile
+    startCommand: "uvicorn bot:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: "/health"
+    envVars:
+      - key: BOT_TOKEN
+        value: "<REPLACE_WITH_BOT_TOKEN>"
+      - key: WEBHOOK_URL
+        value: "https://<your-service>.onrender.com"
+      - key: USE_POLLING
+        value: "false"
+      - key: ADMIN_USERS
+        value: ""
+      - key: ADMIN_SECRET
+        value: "<REPLACE_WITH_STRONG_SECRET>"
+      - key: REDIS_URL
+        value: "redis://localhost:6379/0"
+      - key: LOG_CHANNEL
+        value: ""
+      - key: SENTRY_DSN
+        value: ""
+      - key: MAX_FILE_SIZE
+        value: "52428800"
+  - type: worker
+    name: pdf-header-image-worker
+    env: docker
+    branch: main
+    dockerfilePath: Dockerfile
+    startCommand: "python worker.py"
+    envVars:
+      - key: REDIS_URL
+        value: "redis://localhost:6379/0"
+      - key: BOT_TOKEN
+        value: "<REPLACE_WITH_BOT_TOKEN>"
+      - key: LOG_CHANNEL
+        value: ""
+      - key: TMP_DIR
+        value: "/tmp"
+      - key: MAX_FILE_SIZE
+        value: "52428800"
