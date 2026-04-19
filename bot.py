@@ -282,16 +282,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    is_admin = config.is_admin_user(getattr(user, "id", None))
-    info: Dict[str, Any] = {"ok": True, "use_polling": USE_POLLING, "webhook_url": WEBHOOK_URL}
-    if is_admin:
-        try:
-            webhook_info = await context.bot.get_webhook_info()
-            info["webhook_info"] = webhook_info.to_dict() if webhook_info else None
-        except Exception:
-            info["webhook_info"] = None
-    await update.effective_message.reply_text(str(info))
+    # Minimal, non-sensitive status reply
+    await update.effective_message.reply_text("active")
 
 
 async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -637,8 +629,8 @@ async def set_commands(request: Request, admin_token: str | None = Header(defaul
 
 
 @app.get("/health")
-async def health() -> dict:
-    return {"ok": True}
+async def health() -> str:
+    return "active"
 
 
 if __name__ == '__main__':

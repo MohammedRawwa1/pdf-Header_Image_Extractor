@@ -10,18 +10,19 @@ import logging
 import argparse
 import sys
 from redis import Redis
-from rq import Worker, Queue, Connection
+from rq import Worker, Queue, SimpleWorker
 
 listen = ["default"]
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
 def run_worker():
-    redis_conn = Redis.from_url(redis_url)
-    with Connection(redis_conn):
-        qs = list(map(Queue, listen))
-        worker = Worker(qs)
-        worker.work()
+  redis_conn = Redis.from_url(redis_url)
+  qs = [Queue(name, connection=redis_conn) for name in listen]
+  # Use SimpleWorker on Windows (no fork) otherwise use the regular Worker
+  worker_cls = SimpleWorker if os.name == 'nt' else Worker
+  worker = worker_cls(qs, connection=redis_conn)
+  worker.work()
 
 
 def enqueue_test_job(bot_token: str, chat_id: int, file_id: str, filename: str, mime: str = "") -> None:
