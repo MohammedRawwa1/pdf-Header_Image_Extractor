@@ -13,6 +13,7 @@ from redis import Redis
 from rq import Worker, Queue, SimpleWorker
 import traceback
 import time
+import threading
 
 listen = ["default"]
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -25,8 +26,14 @@ def run_worker():
     print("WORKER: connected to Redis", flush=True)
     qs = [Queue(name, connection=redis_conn) for name in listen]
     print(f"WORKER: listening queues={listen}", flush=True)
-    # Use SimpleWorker on Windows (no fork) otherwise use the regular Worker
-    worker_cls = SimpleWorker if os.name == 'nt' else Worker
+    # If running in a non-main thread (started in-process), use SimpleWorker
+    # to avoid installing signal handlers (which requires the main thread).
+    if threading.current_thread() is not threading.main_thread():
+      print("WORKER: running in non-main thread; using SimpleWorker to avoid signal handlers", flush=True)
+      worker_cls = SimpleWorker
+    else:
+      # Use SimpleWorker on Windows (no fork) otherwise use the regular Worker
+      worker_cls = SimpleWorker if os.name == 'nt' else Worker
     worker = worker_cls(qs, connection=redis_conn)
     print(f"WORKER: instantiated worker {getattr(worker, 'name', repr(worker))}, starting work()", flush=True)
     worker.work()
