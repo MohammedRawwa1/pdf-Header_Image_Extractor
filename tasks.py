@@ -5,6 +5,9 @@ from typing import Optional
 import io
 import requests
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Use direct Telegram Bot HTTP API calls in background workers (synchronous)
 
@@ -17,11 +20,42 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
             bot_token = _config.BOT_TOKEN
         except Exception:
             bot_token = None
+    logger = logging.getLogger(__name__)
     url = f"https://api.telegram.org/bot{bot_token}/getFile"
-    r = requests.get(url, params={"file_id": file_id}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data["result"]["file_path"]
+    # Try a couple of times for transient issues (e.g., 5xx or rate limits)
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params={"file_id": file_id}, timeout=30)
+        except Exception as e:
+            logger.exception("Network error fetching getFile for %s (attempt %s)", file_id, attempt + 1)
+            if attempt < 2:
+                time.sleep(1 + attempt)
+                continue
+            raise
+
+        if r.status_code != 200:
+            # Try to extract Telegram error description for more context
+            try:
+                body = r.json()
+                desc = body.get("description") or body
+            except Exception:
+                desc = r.text
+            msg = f"Telegram getFile failed: status={r.status_code} desc={desc}"
+            logger.error(msg)
+            # For server errors or rate limits, retry a couple times
+            if r.status_code >= 500 or r.status_code == 429:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+            # Raise an HTTPError with details so callers can include it in their handling
+            raise requests.HTTPError(msg)
+
+        try:
+            data = r.json()
+            return data["result"]["file_path"]
+        except Exception as e:
+            logger.exception("Failed parsing getFile JSON for %s", file_id)
+            raise
 
 
 def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
@@ -147,6 +181,7 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                     pass
                 return res
         except Exception as e:
+            logger.exception("Error in disk-mode processing for file_id=%s", file_id)
             try:
                 _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
             except Exception:
@@ -198,6 +233,7 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
             pass
         return res
     except Exception as e:
+        logger.exception("Error in in-memory processing for file_id=%s", file_id)
         try:
             _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
         except Exception:
