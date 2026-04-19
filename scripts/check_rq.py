@@ -61,20 +61,36 @@ try:
     if not queue_keys:
         print('No RQ queues found (rq:queue:*).')
     else:
+        # Filter to keys that are actually lists to avoid WRONGTYPE errors
+        queue_list_keys = []
         for k in queue_keys:
+            try:
+                ktype = r.type(k)
+            except Exception:
+                ktype = None
+            # decode bytes if necessary
+            if isinstance(ktype, (bytes, bytearray)):
+                try:
+                    ktype = ktype.decode('utf-8')
+                except Exception:
+                    ktype = str(ktype)
+            if ktype != 'list':
+                print(f'Queue {k} type={ktype} (skipping)')
+                continue
             try:
                 length = r.llen(k)
             except Exception:
                 length = 'N/A'
             print(f'Queue {k} length={length}')
+            queue_list_keys.append(k)
     workers = r.smembers('rq:workers')
     print('rq:workers set members count ->', len(workers))
     if workers:
         print('Workers:', workers)
     worker_keys = r.keys('rq:worker:*')
     print('Worker keys:', worker_keys)
-    # show sample job ids
-    for k in (queue_keys[:1] if queue_keys else []):
+    # show sample job ids (only from keys that are lists)
+    for k in (queue_list_keys[:1] if queue_keys else []):
         ids = r.lrange(k, 0, -1)
         print(f'Sample jobs in {k} ({len(ids)}):')
         for jid in ids[:10]:
