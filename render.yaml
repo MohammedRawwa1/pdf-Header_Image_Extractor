@@ -41,8 +41,10 @@ services:
         value: ""
       - key: SENTRY_DSN
         value: ""
+      - key: TMP_DIR
+        value: "/tmp"
       - key: MAX_FILE_SIZE
-        value: "52428800"
+        value: "524288000"
   - type: worker
     name: pdf-header-image-worker
     env: docker
@@ -58,5 +60,7 @@ services:
         value: "<REPLACE_WITH_BOT_TOKEN>"
       - key: LOG_CHANNEL
         value: ""
+      - key: TMP_DIR
+        value: "/tmp"
       - key: MAX_FILE_SIZE
-        value: "52428800"
+        value: "524288000"
