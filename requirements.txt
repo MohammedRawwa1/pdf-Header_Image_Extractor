@@ -7,3 +7,4 @@ aiohttp>=3.8.4
 aiofiles>=23.1.0
 redis>=4.5.5
 rq>=1.2.0
+requests>=2.31.0

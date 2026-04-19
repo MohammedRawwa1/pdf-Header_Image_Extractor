@@ -198,8 +198,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             input_doc = InputFile(f_doc, filename=filename)
-            await msg.reply_document(document=input_doc, thumb=f_thumb,
-                                     caption="Here is your file with an auto-generated cover preview.")
+            chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb,
+                                           caption="Here is your file with an auto-generated cover preview.")
     except Exception as e:
         logger.exception("Failed to process document")
         try:
@@ -245,8 +246,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # send original image back as document to preserve original bytes, attach thumbnail
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
-            await msg.reply_document(document=input_doc, thumb=f_thumb,
-                                     caption="Here is your image with an auto-generated thumbnail.")
+            chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb,
+                                           caption="Here is your image with an auto-generated thumbnail.")
     except Exception as e:
         logger.exception("Failed to process photo")
         try:
@@ -508,7 +510,8 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                 create_thumbnail_from_pdf(file_path, thumb_path)
                 with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                     input_doc = InputFile(f_doc, filename=base)
-                    await msg.reply_document(document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
+                    chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
             except Exception as e:
                 logger.exception("Failed to process PDF URL")
                 try:
@@ -537,7 +540,8 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                                 create_thumbnail_from_pdf(file_path, thumb_path)
                                 with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                                     input_doc = InputFile(f_doc, filename=base)
-                                    await msg.reply_document(document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
+                                    chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+                                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
                             except Exception as e:
                                 logger.exception("Failed to process PDF URL")
                                 try:
