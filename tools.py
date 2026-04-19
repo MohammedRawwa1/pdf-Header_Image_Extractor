@@ -132,29 +132,34 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
     except Exception:
         pass
 
-    # 1) Ghostscript path
-    gs_cmd = [
-        "gs",
-        "-sDEVICE=pdfwrite",
-        "-dCompatibilityLevel=1.4",
-        f"-dPDFSETTINGS={gs_quality}",
-        "-dNOPAUSE",
-        "-dQUIET",
-        "-dBATCH",
-        f"-sOutputFile={output_path}",
-        input_path,
-    ]
-    try:
-        subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-        return os.path.exists(output_path)
-    except FileNotFoundError:
-        # Ghostscript not installed, continue to PyMuPDF fallback
-        pass
-    except subprocess.CalledProcessError:
-        # Ghostscript failed; continue to fallback
-        pass
-    except Exception:
-        pass
+    # 1) Ghostscript: try common executable names (Linux/macOS: 'gs', Windows: 'gswin64c'/'gswin32c')
+    import shutil
+
+    gs_candidates = ["gs", "gswin64c", "gswin32c"]
+    for gs_exe in gs_candidates:
+        gs_path = shutil.which(gs_exe)
+        if not gs_path:
+            continue
+        gs_cmd = [
+            gs_path,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={gs_quality}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path,
+        ]
+        try:
+            subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+            return os.path.exists(output_path)
+        except subprocess.CalledProcessError:
+            # Ghostscript ran but failed for this candidate; try next candidate
+            continue
+        except Exception:
+            # Could be permission/timeout/etc. Try next candidate
+            continue
 
     # 2) PyMuPDF fallback (best-effort)
     try:

@@ -4,6 +4,11 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+try:
+    import config
+except Exception:
+    config = None
+
 
 def upload_file_and_get_presigned_url(file_path: str, object_name: str | None = None) -> str | None:
     """Upload `file_path` to configured S3 bucket and return a presigned GET URL.
@@ -144,3 +149,94 @@ def purge_objects_older_than(ttl_seconds: int, prefix: str = 'pdf-bot/') -> int:
     except Exception:
         logger.exception("Failed listing S3 objects for purge")
         return deleted_count
+
+
+def get_storage_backend_sync():
+    """Return a synchronous storage backend object with `upload_file(file_path, key)`.
+
+    Returns None when S3 is not configured or boto3 is unavailable.
+    """
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except Exception:
+        logger.exception("boto3 not available; storage backend sync not available")
+        return None
+
+    try:
+        # reload config inside function to allow dynamic env changes
+        import config as _config
+    except Exception:
+        _config = config
+
+    bucket = getattr(_config, 'S3_BUCKET', None)
+    if not bucket:
+        logger.error("S3 bucket not configured; storage backend not available")
+        return None
+
+    client_kwargs = {}
+    if getattr(_config, 'S3_REGION', None):
+        client_kwargs['region_name'] = _config.S3_REGION
+    if getattr(_config, 'S3_ENDPOINT', None):
+        client_kwargs['endpoint_url'] = _config.S3_ENDPOINT
+    if getattr(_config, 'AWS_ACCESS_KEY_ID', None) or getattr(_config, 'AWS_SECRET_ACCESS_KEY', None):
+        client_kwargs['aws_access_key_id'] = _config.AWS_ACCESS_KEY_ID or None
+        client_kwargs['aws_secret_access_key'] = _config.AWS_SECRET_ACCESS_KEY or None
+
+    try:
+        sig = getattr(_config, 'S3_SIGNATURE_VERSION', 's3v4')
+        boto_cfg = BotoConfig(signature_version=sig)
+        s3 = boto3.client('s3', config=boto_cfg, **client_kwargs)
+    except Exception:
+        logger.exception("Failed to create S3 client for backend")
+        return None
+
+    class _S3BackendSync:
+        def __init__(self, s3_client, bucket_name):
+            self.s3 = s3_client
+            self.bucket = bucket_name
+
+        def upload_file(self, file_path: str, key: str, ExtraArgs: dict | None = None):
+            extra = ExtraArgs or {}
+            try:
+                orig_size = str(os.path.getsize(file_path))
+            except Exception:
+                orig_size = "0"
+            # ensure metadata keys exist
+            md = extra.get('Metadata', {})
+            md.setdefault('orig_filename', os.path.basename(key) if key else os.path.basename(file_path))
+            md.setdefault('orig_size', orig_size)
+            extra['Metadata'] = md
+            self.s3.upload_file(file_path, self.bucket, key, ExtraArgs=extra)
+
+        def copy_key(self, src_key: str, dest_key: str):
+            copy_source = {'Bucket': self.bucket, 'Key': src_key}
+            self.s3.copy_object(Bucket=self.bucket, CopySource=copy_source, Key=dest_key)
+
+    return _S3BackendSync(s3, bucket)
+
+
+async def get_storage_backend():
+    """Async wrapper around `get_storage_backend_sync` that provides async `upload_file`/`copy_key`.
+
+    Returns None when S3 is not configured.
+    """
+    backend = get_storage_backend_sync()
+    if backend is None:
+        return None
+
+    class _AsyncBackend:
+        def __init__(self, sync_backend):
+            self._b = sync_backend
+
+        async def upload_file(self, file_path: str, key: str, ExtraArgs: dict | None = None):
+            import asyncio
+
+            return await asyncio.to_thread(self._b.upload_file, file_path, key, ExtraArgs or None)
+
+        async def copy_key(self, src_key: str, dest_key: str):
+            import asyncio
+
+            return await asyncio.to_thread(self._b.copy_key, src_key, dest_key)
+
+    return _AsyncBackend(backend)
