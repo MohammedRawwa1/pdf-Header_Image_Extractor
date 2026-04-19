@@ -43,6 +43,11 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
                 desc = r.text
             msg = f"Telegram getFile failed: status={r.status_code} desc={desc}"
             logger.error(msg)
+            # record diagnostic info in Redis io:out key for this file_id
+            try:
+                _set_io_keys(file_id, output_meta={"status": "getfile_failed", "http_status": r.status_code, "desc": str(desc), "timestamp": int(time.time())})
+            except Exception:
+                pass
             # For server errors or rate limits, retry a couple times
             if r.status_code >= 500 or r.status_code == 429:
                 if attempt < 2:
@@ -170,9 +175,9 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
 
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
     """
-    # If TMP_DIR is set, fallback to disk-based processing for large files.
-    # prepare io keys for tracing (use file_unique_id when available)
     unique_key = file_unique_id or file_id
+
+    # persist input metadata
     try:
         input_meta = {
             "file_id": file_id,
@@ -185,303 +190,369 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
         _set_io_keys(unique_key, input_meta=input_meta)
     except Exception:
         logger.exception("Failed to write initial io input key for %s", unique_key)
-    if config.TMP_DIR:
-        tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
+
+    # init output meta / timings
+    out_meta = {"status": "processing", "timestamps": {"start": int(time.time())}, "durations": {}, "sizes": {}}
+    try:
+        _set_io_keys(unique_key, output_meta=out_meta)
+    except Exception:
+        pass
+
+    tmpdir = None
+    try:
+        # 1) getFile (path)
+        gf_start = time.time()
+        tg_file_path = _tg_get_file_path(None, file_id)
+        gf_elapsed = time.time() - gf_start
+        out_meta.setdefault("durations", {})["getfile_ms"] = int(gf_elapsed * 1000)
+        out_meta.setdefault("timestamps", {})["getfile_end"] = int(time.time())
         try:
-            # Fetch Telegram file path and download via HTTP
-            tg_file_path = _tg_get_file_path(None, file_id)
-            # resolve bot token from config for file download URL
-            try:
-                import config as _config
-                _bot_token = _config.BOT_TOKEN
-            except Exception:
-                _bot_token = None
+            _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:
+            pass
+
+        # Decide disk vs in-memory
+        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+
+        if config.TMP_DIR:
+            # disk-mode
+            tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
             file_path = os.path.join(tmpdir, filename)
-            with requests.get(f"https://api.telegram.org/file/bot{_bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
+
+            # download file
+            try:
+                import config as _conf
+                bot_token = _conf.BOT_TOKEN
+            except Exception:
+                bot_token = None
+
+            dl_start = time.time()
+            with requests.get(f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
                 r.raise_for_status()
-                with open(file_path, 'wb') as f:
+                with open(file_path, 'wb') as fh:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
-                            f.write(chunk)
+                            fh.write(chunk)
+            dl_elapsed = time.time() - dl_start
+            out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
+            out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
+            try:
+                out_meta.setdefault("sizes", {})["orig_bytes"] = os.path.getsize(file_path)
+            except Exception:
+                pass
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
 
+            # thumbnail
             thumb_path = os.path.join(tmpdir, "thumb.jpg")
             if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
                 create_thumbnail_from_pdf(file_path, thumb_path)
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
 
-            # Check upload limit (use configured MAX_FILE_SIZE if >0, otherwise default 50MB)
-            upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+            # compression flow
+            upload_path = file_path
             try:
                 orig_size = os.path.getsize(file_path)
             except Exception:
                 orig_size = None
 
-            upload_path = file_path
-            # Attempt compression when file is larger than upload_limit
+            compress_total = 0.0
             if orig_size and upload_limit and orig_size > upload_limit:
-                # Try default compression (Ghostscript /ebook then /screen)
-                compressed1 = file_path + ".compressed.pdf"
-                tried = False
+                # attempt first pass
                 try:
-                    tried = compress_pdf(file_path, compressed1, gs_quality="/ebook")
-                except Exception:
-                    tried = False
-                if tried:
+                    a_start = time.time()
+                    c1 = file_path + '.compressed.pdf'
+                    ok1 = compress_pdf(file_path, c1, gs_quality='/ebook')
+                    a_elapsed = time.time() - a_start
+                    compress_total += a_elapsed
+                    out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
+                    out_meta.setdefault("timestamps", {})["compress_attempt_1_end"] = int(time.time())
                     try:
-                        csize = os.path.getsize(compressed1)
-                    except Exception:
-                        csize = None
-                    if csize and csize <= upload_limit:
-                        upload_path = compressed1
-                    else:
-                        # try more aggressive compression and accept only if under the limit
-                        compressed2 = file_path + ".compressed.screen.pdf"
-                        try:
-                            if compress_pdf(file_path, compressed2, gs_quality="/screen"):
-                                c2 = os.path.getsize(compressed2)
-                                if c2 and c2 <= upload_limit:
-                                    upload_path = compressed2
-                        except Exception:
-                            pass
-                # If compression didn't produce an acceptable file, try S3 fallback (if enabled), otherwise notify and stop
-                if upload_path == file_path and orig_size and orig_size > upload_limit:
-                    # S3 fallback
-                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
-                        try:
-                            if upload_file_and_get_presigned_url:
-                                url = upload_file_and_get_presigned_url(file_path, filename)
-                                if url:
-                                    try:
-                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
-                                    except Exception:
-                                        pass
-                                    # write output io key for diagnostics
-                                    try:
-                                        _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
-                                    except Exception:
-                                        pass
-                                    return {"s3_url": url}
-                        except Exception:
-                            logger.exception("S3 fallback failed for file_id=%s", file_id)
-
-                    try:
-                        _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
+                        _set_io_keys(unique_key, output_meta=out_meta)
                     except Exception:
                         pass
-                    try:
-                        _set_io_keys(unique_key, output_meta={"status": "too_large_after_compress", "orig_size": orig_size, "timestamp": int(time.time())})
-                    except Exception:
-                        pass
-                    return {"error": "file too large after compression"}
-
-            with open(upload_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                # thumbnail caching removed
-                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                                       caption="Here is your file with an auto-generated cover preview.")
-                # persist response in job meta for debugging
-                try:
-                    if get_current_job is not None:
-                        job = get_current_job()
-                        if job is not None:
-                            job.meta['tg_response'] = res
-                            job.save_meta()
+                    if ok1:
+                        try:
+                            csize = os.path.getsize(c1)
+                        except Exception:
+                            csize = None
+                        if csize and csize <= upload_limit:
+                            upload_path = c1
+                            out_meta.setdefault("sizes", {})["compressed_bytes"] = csize
                 except Exception:
                     pass
-                return res
-        except Exception as e:
-            logger.exception("Error in disk-mode processing for file_id=%s", file_id)
-            try:
-                _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
-            except Exception:
-                pass
-            return {"error": str(e)}
 
-
-        
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-
-    # In-memory processing (no disk writes)
-    try:
-        # Get file path and download into memory via HTTP
-        tg_file_path = _tg_get_file_path(None, file_id)
-        file_bytes = _tg_download_to_bytes(None, tg_file_path)
-
-        if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
-            thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
-        else:
-            thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
-
-        # If in-memory buffer is large, attempt compression via a temp file
-        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
-        if upload_limit and len(file_bytes) > upload_limit:
-            tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
-            try:
-                tmp_in = os.path.join(tmpdir, filename)
-                with open(tmp_in, 'wb') as f:
-                    f.write(file_bytes)
-                compressed_tmp = tmp_in + '.compressed.pdf'
-                compressed_ok = False
-                try:
-                    compressed_ok = compress_pdf(tmp_in, compressed_tmp, gs_quality="/ebook")
-                except Exception:
-                    compressed_ok = False
-                if compressed_ok:
+                if upload_path == file_path:
+                    # try second, more aggressive pass
                     try:
-                        csize = os.path.getsize(compressed_tmp)
-                    except Exception:
-                        csize = None
-                    if csize and csize <= upload_limit:
-                        with open(compressed_tmp, 'rb') as cf:
-                            file_bytes = cf.read()
-                    else:
-                        # try more aggressive
-                        compressed2 = tmp_in + '.compressed.screen.pdf'
+                        b_start = time.time()
+                        c2 = file_path + '.compressed.screen.pdf'
+                        ok2 = compress_pdf(file_path, c2, gs_quality='/screen')
+                        b_elapsed = time.time() - b_start
+                        compress_total += b_elapsed
+                        out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
+                        out_meta.setdefault("timestamps", {})["compress_attempt_2_end"] = int(time.time())
                         try:
-                            if compress_pdf(tmp_in, compressed2, gs_quality="/screen"):
-                                c2 = os.path.getsize(compressed2)
-                                if c2 and c2 <= upload_limit:
-                                    with open(compressed2, 'rb') as cf:
-                                        file_bytes = cf.read()
-                                else:
-                                    # still too big: try S3 fallback if enabled
-                                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
-                                        try:
-                                            # prefer the more compressed file if it exists
-                                            candidate = compressed2 if os.path.exists(compressed2) else compressed_tmp
-                                            if upload_file_and_get_presigned_url and candidate and os.path.exists(candidate):
-                                                url = upload_file_and_get_presigned_url(candidate, filename)
-                                                if url:
-                                                                            try:
-                                                                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
-                                                                            except Exception:
-                                                                                pass
-                                                                            try:
-                                                                                _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
-                                                                            except Exception:
-                                                                                pass
-                                                                            return {"s3_url": url}
-                                        except Exception:
-                                            logger.exception("S3 fallback failed for in-memory file for chat_id=%s", chat_id)
-                                    try:
-                                        _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
-                                    except Exception:
-                                        pass
-                                    return {"error": "file too large after compression"}
+                            _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:
-                            # Compression attempt failed; try S3 fallback or notify
-                            if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
-                                try:
-                                    # upload original tmp_in
-                                    if upload_file_and_get_presigned_url and os.path.exists(tmp_in):
-                                        url = upload_file_and_get_presigned_url(tmp_in, filename)
-                                        if url:
-                                                try:
-                                                    _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
-                                                except Exception:
-                                                    pass
-                                                return {"s3_url": url}
-                                except Exception:
-                                    logger.exception("S3 fallback failed for in-memory compression exception for chat_id=%s", chat_id)
+                            pass
+                        if ok2:
                             try:
-                                _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
+                                c2size = os.path.getsize(c2)
+                            except Exception:
+                                c2size = None
+                            if c2size and c2size <= upload_limit:
+                                upload_path = c2
+                                out_meta.setdefault("sizes", {})["compressed_bytes"] = c2size
+                    except Exception:
+                        pass
+
+            # if still too large, try S3 fallback
+            if upload_path == file_path and orig_size and upload_limit and orig_size > upload_limit:
+                if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+                    try:
+                        up_start = time.time()
+                        url = upload_file_and_get_presigned_url(file_path, filename)
+                        up_elapsed = time.time() - up_start
+                        if url:
+                            try:
+                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
                             except Exception:
                                 pass
-                            return {"error": "file too large after compression"}
-                else:
-                    # compression not available; try S3 fallback
-                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
+                            out_meta.setdefault("durations", {})["s3_upload_ms"] = int(up_elapsed * 1000)
+                            out_meta.setdefault("timestamps", {})["s3_upload_end"] = int(time.time())
+                            out_meta.setdefault("status", "s3_fallback")
+                            out_meta.setdefault("s3", {})["url"] = url
+                            try:
+                                _set_io_keys(unique_key, output_meta=out_meta)
+                            except Exception:
+                                pass
+                            return {"s3_url": url}
+                    except Exception:
+                        logger.exception("S3 fallback failed for file_id=%s", file_id)
+
+                # otherwise notify user and persist io entry
+                try:
+                    _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
+                except Exception:
+                    pass
+                out_meta.setdefault("status", "too_large_after_compress")
+                out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
+                out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:
+                    pass
+                return {"error": "file too large after compression"}
+
+            # send final document via Telegram
+            send_start = time.time()
+            with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
+                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
+            send_elapsed = time.time() - send_start
+            out_meta.setdefault("durations", {})["tg_send_ms"] = int(send_elapsed * 1000)
+            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            out_meta.setdefault("status", "done")
+            try:
+                out_meta.setdefault("sizes", {})["out_bytes"] = os.path.getsize(upload_path)
+            except Exception:
+                pass
+            try:
+                out_meta["tg_response"] = res
+            except Exception:
+                pass
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
+
+            try:
+                if get_current_job is not None:
+                    job = get_current_job()
+                    if job is not None:
+                        job.meta['tg_response'] = res
+                        job.save_meta()
+            except Exception:
+                pass
+
+            return res
+
+        else:
+            # in-memory pathway
+            dl_start = time.time()
+            file_bytes = _tg_download_to_bytes(None, tg_file_path)
+            dl_elapsed = time.time() - dl_start
+            out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
+            out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
+            try:
+                out_meta.setdefault("sizes", {})["orig_bytes"] = len(file_bytes)
+            except Exception:
+                pass
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
+
+            if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
+                thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
+            else:
+                thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
+
+            # If large, attempt compression via temp file flow
+            if upload_limit and len(file_bytes) > upload_limit:
+                td = tempfile.mkdtemp()
+                try:
+                    tmp_in = os.path.join(td, filename)
+                    with open(tmp_in, 'wb') as fh:
+                        fh.write(file_bytes)
+
+                    compress_total = 0.0
+                    try:
+                        a_start = time.time()
+                        c1 = tmp_in + '.compressed.pdf'
+                        ok1 = compress_pdf(tmp_in, c1, gs_quality='/ebook')
+                        a_elapsed = time.time() - a_start
+                        compress_total += a_elapsed
+                        out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
+                        out_meta.setdefault("timestamps", {})["compress_attempt_1_end"] = int(time.time())
                         try:
-                            if upload_file_and_get_presigned_url and os.path.exists(tmp_in):
-                                url = upload_file_and_get_presigned_url(tmp_in, filename)
+                            _set_io_keys(unique_key, output_meta=out_meta)
+                        except Exception:
+                            pass
+                        if ok1:
+                            try:
+                                csize = os.path.getsize(c1)
+                            except Exception:
+                                csize = None
+                            if csize and csize <= upload_limit:
+                                with open(c1, 'rb') as cf:
+                                    file_bytes = cf.read()
+                                out_meta.setdefault("sizes", {})["compressed_bytes"] = csize
+                    except Exception:
+                        pass
+
+                    if len(file_bytes) > upload_limit:
+                        try:
+                            b_start = time.time()
+                            c2 = tmp_in + '.compressed.screen.pdf'
+                            ok2 = compress_pdf(tmp_in, c2, gs_quality='/screen')
+                            b_elapsed = time.time() - b_start
+                            compress_total += b_elapsed
+                            out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
+                            out_meta.setdefault("timestamps", {})["compress_attempt_2_end"] = int(time.time())
+                            try:
+                                _set_io_keys(unique_key, output_meta=out_meta)
+                            except Exception:
+                                pass
+                            if ok2:
+                                try:
+                                    c2size = os.path.getsize(c2)
+                                except Exception:
+                                    c2size = None
+                                if c2size and c2size <= upload_limit:
+                                    with open(c2, 'rb') as cf:
+                                        file_bytes = cf.read()
+                                    out_meta.setdefault("sizes", {})["compressed_bytes"] = c2size
+                        except Exception:
+                            pass
+
+                    # if still too big, try S3
+                    if len(file_bytes) > upload_limit:
+                        if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+                            try:
+                                up_start = time.time()
+                                # prefer candidate compressed file if present
+                                candidate = None
+                                if os.path.exists(c2):
+                                    candidate = c2
+                                elif os.path.exists(c1):
+                                    candidate = c1
+                                else:
+                                    candidate = tmp_in
+                                url = upload_file_and_get_presigned_url(candidate, filename)
+                                up_elapsed = time.time() - up_start
                                 if url:
                                     try:
                                         _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
                                     except Exception:
                                         pass
+                                    out_meta.setdefault("durations", {})["s3_upload_ms"] = int(up_elapsed * 1000)
+                                    out_meta.setdefault("timestamps", {})["s3_upload_end"] = int(time.time())
+                                    out_meta.setdefault("status", "s3_fallback")
+                                    out_meta.setdefault("s3", {})["url"] = url
+                                    try:
+                                        _set_io_keys(unique_key, output_meta=out_meta)
+                                    except Exception:
+                                        pass
                                     return {"s3_url": url}
+                            except Exception:
+                                logger.exception("S3 fallback failed for in-memory file for chat_id=%s", chat_id)
+                        try:
+                            _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
                         except Exception:
-                            logger.exception("S3 fallback failed for in-memory fallback for chat_id=%s", chat_id)
-                    try:
-                        _tg_send_message(None, chat_id, f"File too large to upload via bot and compression is not available on server; size={len(file_bytes)} bytes")
-                    except Exception:
-                        pass
-                    return {"error": "file too large and compression unavailable"}
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+                            pass
+                        out_meta.setdefault("status", "too_large_after_compress")
+                        out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+                        try:
+                            _set_io_keys(unique_key, output_meta=out_meta)
+                        except Exception:
+                            pass
+                        return {"error": "file too large after compression"}
+                finally:
+                    shutil.rmtree(td, ignore_errors=True)
 
-        doc_buf = io.BytesIO(file_bytes)
-        thumb_buf = io.BytesIO(thumb_bytes)
-        doc_buf.seek(0)
-        thumb_buf.seek(0)
+            # send via Telegram
+            send_start = time.time()
+            doc_buf = io.BytesIO(file_bytes)
+            thumb_buf = io.BytesIO(thumb_bytes)
+            doc_buf.seek(0)
+            thumb_buf.seek(0)
+            res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf, caption="Here is your file with an auto-generated cover preview.")
+            send_elapsed = time.time() - send_start
+            out_meta.setdefault("durations", {})["tg_send_ms"] = int(send_elapsed * 1000)
+            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            out_meta.setdefault("status", "done")
+            try:
+                out_meta["tg_response"] = res
+            except Exception:
+                pass
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
+            try:
+                if get_current_job is not None:
+                    job = get_current_job()
+                    if job is not None:
+                        job.meta['tg_response'] = res
+                        job.save_meta()
+            except Exception:
+                pass
+            return res
 
-        # thumbnail caching removed
-
-        res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
-                                caption="Here is your file with an auto-generated cover preview.")
+    except Exception as e:
+        logger.exception("Error while processing document job %s", file_id)
         try:
-            if get_current_job is not None:
-                job = get_current_job()
-                if job is not None:
-                    job.meta['tg_response'] = res
-                    job.save_meta()
+            out_meta.setdefault("status", "error")
+            out_meta.setdefault("error", str(e))
+            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            _set_io_keys(unique_key, output_meta=out_meta)
         except Exception:
             pass
-        return res
-    except Exception as e:
-        logger.exception("Error in in-memory processing for file_id=%s", file_id)
         try:
             _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
         except Exception:
             pass
         return {"error": str(e)}
-
-
-def process_url_job(chat_id: int, url: str, filename: Optional[str] = None) -> None:
-    """RQ job: download a remote URL (PDF), generate thumbnail, and send file back.
-
-    NOTE: Bot token is read from `config.BOT_TOKEN` internally; do NOT pass it as job arg.
-    """
-
-    # Disk-mode when TMP_DIR specified
-    if config.TMP_DIR:
-        tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
+    finally:
         try:
-            if not filename:
-                filename = os.path.basename(url.split('?', 1)[0]) or 'download.pdf'
-            if not filename.lower().endswith('.pdf'):
-                filename = filename + '.pdf'
-            file_path = os.path.join(tmpdir, filename)
-
-            with requests.get(url, stream=True, allow_redirects=True, timeout=60) as r:
-                r.raise_for_status()
-                with open(file_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=64 * 1024):
-                        if chunk:
-                            f.write(chunk)
-
-            thumb_path = os.path.join(tmpdir, "thumb.jpg")
-            create_thumbnail_from_pdf(file_path, thumb_path)
-
-            with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                                       caption="Here is your file with an auto-generated cover preview.")
-                return res
-        except Exception as e:
-            try:
-                _tg_send_message(None, chat_id, f"Error processing URL in background: {e}")
-            except Exception:
-                pass
-            return {"error": str(e)}
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
     # In-memory processing
     try:
         if not filename:
