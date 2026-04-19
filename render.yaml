@@ -41,7 +41,5 @@ services:
         value: "<REPLACE_WITH_BOT_TOKEN>"
       - key: LOG_CHANNEL
         value: ""
-      - key: TMP_DIR
-        value: "/tmp"
       - key: MAX_FILE_SIZE
         value: "52428800"
