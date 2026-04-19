@@ -51,7 +51,8 @@ def enqueue_test_job(bot_token: str, chat_id: int, file_id: str, filename: str, 
   try:
     import tasks
     func = getattr(tasks, "process_document_job")
-    q.enqueue(func, bot_token, chat_id, file_id, filename, mime)
+    # Do NOT pass bot_token into the job; tasks will use config.BOT_TOKEN internally.
+    q.enqueue(func, chat_id, file_id, filename, mime)
     logging.info("Enqueued process_document_job: chat_id=%s file_id=%s filename=%s", chat_id, file_id, filename)
   except Exception:
     logging.exception("Failed to enqueue test job")
@@ -74,7 +75,9 @@ def main():
   numeric_level = getattr(logging, log_level, logging.INFO)
   logging.basicConfig(level=numeric_level)
   logging.getLogger("rq").setLevel(numeric_level)
-  logging.getLogger("httpx").setLevel(numeric_level)
+  # Keep httpx at least INFO to avoid logging full request URLs (which may contain tokens)
+  import logging as _logging
+  logging.getLogger("httpx").setLevel(max(numeric_level, _logging.INFO))
   logging.getLogger("telegram").setLevel(numeric_level)
 
   if args.command == "enqueue":

@@ -50,8 +50,9 @@ def enqueue_job(func_name: str, *args, **kwargs):
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
 logging.basicConfig(level=numeric_level)
-# also set common noisy libraries to the same level
-logging.getLogger("httpx").setLevel(numeric_level)
+# keep httpx at least INFO to avoid leaking full request URLs in DEBUG logs
+import logging as _logging
+logging.getLogger("httpx").setLevel(max(numeric_level, _logging.INFO))
 logging.getLogger("rq").setLevel(numeric_level)
 logging.getLogger("telegram").setLevel(numeric_level)
 logger = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.exception("Cache lookup failed")
 
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
+        ok = enqueue_job('process_document_job', chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
         if ok:
             await msg.reply_text("Queued your file for background processing; I'll send the result when ready.")
             return
@@ -270,7 +271,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.exception("Cache lookup failed")
 
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, photo.file_id, filename, 'image/jpeg', getattr(photo, 'file_unique_id', None))
+        ok = enqueue_job('process_document_job', chat_id, photo.file_id, filename, 'image/jpeg', getattr(photo, 'file_unique_id', None))
         if ok:
             await msg.reply_text("Queued your photo for background processing; I'll send the result when ready.")
             return
@@ -412,7 +413,7 @@ async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # enqueue a single batch job which processes items in order
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_batch_job', config.BOT_TOKEN, chat_id, items)
+        ok = enqueue_job('process_document_batch_job', chat_id, items)
         if ok:
             clear_forward_batch(chat_id, user_id)
             await update.effective_message.reply_text(f"Queued batch with {len(items)} items for processing.")
@@ -424,7 +425,7 @@ async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         import tasks
         # run in executor to avoid blocking
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, tasks.process_document_batch_job, config.BOT_TOKEN, chat_id, items)
+        await loop.run_in_executor(None, tasks.process_document_batch_job, chat_id, items)
         clear_forward_batch(chat_id, user_id)
         await update.effective_message.reply_text(f"Processed batch with {len(items)} items.")
     except Exception as e:
@@ -480,7 +481,12 @@ async def on_startup() -> None:
         webhook_path = f"/webhook/{BOT_TOKEN}"
         full_url = WEBHOOK_URL.rstrip("/") + webhook_path
         await application.bot.set_webhook(full_url)
-        logger.info("Webhook set to %s", full_url)
+        # redact the bot token when logging the webhook URL
+        try:
+            masked_url = full_url.rsplit('/', 1)[0] + '/<REDACTED_BOT_TOKEN>'
+        except Exception:
+            masked_url = '<webhook_url_redacted>'
+        logger.info("Webhook set to %s", masked_url)
     else:
         logger.warning("No WEBHOOK_URL provided and USE_POLLING is false; bot won't receive updates.")
 
@@ -544,7 +550,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
             if not base.lower().endswith('.pdf'):
                 base = base + ".pdf"
             if config.REDIS_URL:
-                ok = enqueue_job('process_url_job', config.BOT_TOKEN, chat_id, url, base)
+                ok = enqueue_job('process_url_job', chat_id, url, base)
                 if ok:
                     await msg.reply_text("Queued your PDF URL for background processing; I'll send the result when ready.")
                     return

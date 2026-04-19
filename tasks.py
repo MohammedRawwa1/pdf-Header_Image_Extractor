@@ -9,7 +9,14 @@ import time
 # Use direct Telegram Bot HTTP API calls in background workers (synchronous)
 
 
-def _tg_get_file_path(bot_token: str, file_id: str) -> str:
+def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
+    # Use provided bot_token or fall back to configured token
+    if not bot_token:
+        try:
+            import config as _config
+            bot_token = _config.BOT_TOKEN
+        except Exception:
+            bot_token = None
     url = f"https://api.telegram.org/bot{bot_token}/getFile"
     r = requests.get(url, params={"file_id": file_id}, timeout=30)
     r.raise_for_status()
@@ -17,7 +24,13 @@ def _tg_get_file_path(bot_token: str, file_id: str) -> str:
     return data["result"]["file_path"]
 
 
-def _tg_download_to_bytes(bot_token: str, tg_file_path: str) -> bytes:
+def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
+    if not bot_token:
+        try:
+            import config as _config
+            bot_token = _config.BOT_TOKEN
+        except Exception:
+            bot_token = None
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -28,7 +41,13 @@ def _tg_download_to_bytes(bot_token: str, tg_file_path: str) -> bytes:
         return buf.getvalue()
 
 
-def _tg_send_document(bot_token: str, chat_id: int, doc_fileobj, filename: str, thumb_fileobj=None, caption: str | None = None):
+def _tg_send_document(bot_token: str | None, chat_id: int, doc_fileobj, filename: str, thumb_fileobj=None, caption: str | None = None):
+    if not bot_token:
+        try:
+            import config as _config
+            bot_token = _config.BOT_TOKEN
+        except Exception:
+            bot_token = None
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
     files = {"document": (filename, doc_fileobj)}
     if thumb_fileobj is not None:
@@ -41,7 +60,13 @@ def _tg_send_document(bot_token: str, chat_id: int, doc_fileobj, filename: str, 
     return r.json()
 
 
-def _tg_send_message(bot_token: str, chat_id: int, text: str):
+def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
+    if not bot_token:
+        try:
+            import config as _config
+            bot_token = _config.BOT_TOKEN
+        except Exception:
+            bot_token = None
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {"chat_id": str(chat_id), "text": text}
     r = requests.post(url, data=data, timeout=30)
@@ -65,16 +90,25 @@ except Exception:
     get_current_job = None
 
 
-def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
-    """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb."""
+def process_document_job(chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
+    """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
+
+    NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
+    """
     # If TMP_DIR is set, fallback to disk-based processing for large files.
     if config.TMP_DIR:
         tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
         try:
             # Fetch Telegram file path and download via HTTP
-            tg_file_path = _tg_get_file_path(bot_token, file_id)
+            tg_file_path = _tg_get_file_path(None, file_id)
+            # resolve bot token from config for file download URL
+            try:
+                import config as _config
+                _bot_token = _config.BOT_TOKEN
+            except Exception:
+                _bot_token = None
             file_path = os.path.join(tmpdir, filename)
-            with requests.get(f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
+            with requests.get(f"https://api.telegram.org/file/bot{_bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
                 r.raise_for_status()
                 with open(file_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
@@ -100,7 +134,7 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
                             pass
                 except Exception:
                     pass
-                res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
                                        caption="Here is your file with an auto-generated cover preview.")
                 # persist response in job meta for debugging
                 try:
@@ -114,7 +148,7 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
                 return res
         except Exception as e:
             try:
-                _tg_send_message(bot_token, chat_id, f"Error processing file in background: {e}")
+                _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
             except Exception:
                 pass
             return {"error": str(e)}
@@ -128,8 +162,8 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
     # In-memory processing (no disk writes)
     try:
         # Get file path and download into memory via HTTP
-        tg_file_path = _tg_get_file_path(bot_token, file_id)
-        file_bytes = _tg_download_to_bytes(bot_token, tg_file_path)
+        tg_file_path = _tg_get_file_path(None, file_id)
+        file_bytes = _tg_download_to_bytes(None, tg_file_path)
 
         if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
             thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
@@ -152,7 +186,7 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
         except Exception:
             pass
 
-        res = _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
+        res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
                                 caption="Here is your file with an auto-generated cover preview.")
         try:
             if get_current_job is not None:
@@ -165,14 +199,17 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
         return res
     except Exception as e:
         try:
-            _tg_send_message(bot_token, chat_id, f"Error processing file in background: {e}")
+            _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
         except Exception:
             pass
         return {"error": str(e)}
 
 
-def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[str] = None) -> None:
-    """RQ job: download a remote URL (PDF), generate thumbnail, and send file back."""
+def process_url_job(chat_id: int, url: str, filename: Optional[str] = None) -> None:
+    """RQ job: download a remote URL (PDF), generate thumbnail, and send file back.
+
+    NOTE: Bot token is read from `config.BOT_TOKEN` internally; do NOT pass it as job arg.
+    """
 
     # Disk-mode when TMP_DIR specified
     if config.TMP_DIR:
@@ -195,12 +232,12 @@ def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[s
             create_thumbnail_from_pdf(file_path, thumb_path)
 
             with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
                                        caption="Here is your file with an auto-generated cover preview.")
                 return res
         except Exception as e:
             try:
-                _tg_send_message(bot_token, chat_id, f"Error processing URL in background: {e}")
+                _tg_send_message(None, chat_id, f"Error processing URL in background: {e}")
             except Exception:
                 pass
             return {"error": str(e)}
@@ -229,12 +266,12 @@ def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[s
         doc_buf.seek(0)
         thumb_buf.seek(0)
 
-        res = _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
+        res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
                                 caption="Here is your file with an auto-generated cover preview.")
         return res
     except Exception as e:
         try:
-            _tg_send_message(bot_token, chat_id, f"Error processing URL in background: {e}")
+            _tg_send_message(None, chat_id, f"Error processing URL in background: {e}")
         except Exception:
             pass
         return {"error": str(e)}
