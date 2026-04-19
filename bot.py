@@ -455,8 +455,8 @@ async def telegram_webhook(token: str, request: Request, background_tasks: Backg
 
     data = await request.json()
     update = Update.de_json(data, application.bot)
-    # Schedule processing in background to avoid webhook timeouts
-    background_tasks.add_task(asyncio.create_task, application.process_update(update))
+    # Schedule processing in the running event loop to avoid threadpool issues
+    asyncio.create_task(application.process_update(update))
     return {"ok": True}
 
 
