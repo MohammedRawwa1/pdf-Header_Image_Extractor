@@ -56,6 +56,12 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
             return data["result"]["file_path"]
         except Exception as e:
             logger.exception("Failed parsing getFile JSON for %s", file_id)
+            # On 400 errors like 'file is too big' record diagnostic info in io:out key
+            try:
+                unique_key = file_id
+                _set_io_keys(unique_key, output_meta={"status": "getfile_failed", "error": str(e), "http_status": r.status_code, "desc": r.text, "timestamp": int(time.time())})
+            except Exception:
+                pass
             raise
 
 
@@ -165,6 +171,20 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
     """
     # If TMP_DIR is set, fallback to disk-based processing for large files.
+    # prepare io keys for tracing (use file_unique_id when available)
+    unique_key = file_unique_id or file_id
+    try:
+        input_meta = {
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "filename": filename,
+            "mime": mime,
+            "chat_id": chat_id,
+            "enqueued_at": int(time.time()),
+        }
+        _set_io_keys(unique_key, input_meta=input_meta)
+    except Exception:
+        logger.exception("Failed to write initial io input key for %s", unique_key)
     if config.TMP_DIR:
         tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
         try:
@@ -236,12 +256,21 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                                         _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
                                     except Exception:
                                         pass
+                                    # write output io key for diagnostics
+                                    try:
+                                        _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
+                                    except Exception:
+                                        pass
                                     return {"s3_url": url}
                         except Exception:
                             logger.exception("S3 fallback failed for file_id=%s", file_id)
 
                     try:
                         _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
+                    except Exception:
+                        pass
+                    try:
+                        _set_io_keys(unique_key, output_meta={"status": "too_large_after_compress", "orig_size": orig_size, "timestamp": int(time.time())})
                     except Exception:
                         pass
                     return {"error": "file too large after compression"}
@@ -325,11 +354,15 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                                             if upload_file_and_get_presigned_url and candidate and os.path.exists(candidate):
                                                 url = upload_file_and_get_presigned_url(candidate, filename)
                                                 if url:
-                                                    try:
-                                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
-                                                    except Exception:
-                                                        pass
-                                                    return {"s3_url": url}
+                                                                            try:
+                                                                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                                                            except Exception:
+                                                                                pass
+                                                                            try:
+                                                                                _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
+                                                                            except Exception:
+                                                                                pass
+                                                                            return {"s3_url": url}
                                         except Exception:
                                             logger.exception("S3 fallback failed for in-memory file for chat_id=%s", chat_id)
                                     try:
@@ -345,11 +378,15 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                                     if upload_file_and_get_presigned_url and os.path.exists(tmp_in):
                                         url = upload_file_and_get_presigned_url(tmp_in, filename)
                                         if url:
-                                            try:
-                                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
-                                            except Exception:
-                                                pass
-                                            return {"s3_url": url}
+                                                try:
+                                                    _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    _set_io_keys(unique_key, output_meta={"status": "s3_fallback", "s3_url": url, "timestamp": int(time.time())})
+                                                except Exception:
+                                                    pass
+                                                return {"s3_url": url}
                                 except Exception:
                                     logger.exception("S3 fallback failed for in-memory compression exception for chat_id=%s", chat_id)
                             try:
