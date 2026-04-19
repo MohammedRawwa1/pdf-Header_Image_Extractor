@@ -116,10 +116,6 @@ from tools import (
 )
 import config
 try:
-    import cache
-except Exception:
-    cache = None
-try:
     from rq import get_current_job
 except Exception:
     get_current_job = None
@@ -218,18 +214,7 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                     return {"error": "file too large after compression"}
 
             with open(upload_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                # cache thumbnail for future use
-                try:
-                    if cache is not None:
-                        key = file_unique_id or file_id
-                        try:
-                            cache.set_thumbnail(key, file_id, f_thumb.read())
-                            # reset file pointer for upload
-                            f_thumb.seek(0)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                # thumbnail caching removed
                 res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
                                        caption="Here is your file with an auto-generated cover preview.")
                 # persist response in job meta for debugging
@@ -366,16 +351,7 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
         doc_buf.seek(0)
         thumb_buf.seek(0)
 
-        # store cache entry if possible
-        try:
-            if cache is not None:
-                key = file_unique_id or file_id
-                try:
-                    cache.set_thumbnail(key, file_id, thumb_bytes)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # thumbnail caching removed
 
         res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
                                 caption="Here is your file with an auto-generated cover preview.")
@@ -469,115 +445,4 @@ def process_url_job(chat_id: int, url: str, filename: Optional[str] = None) -> N
         return {"error": str(e)}
 
 
-def recache_thumbs_job(admin_chat_id: Optional[int] = None, limit: Optional[int] = None, dry_run: bool = False) -> dict:
-    """Scan Redis for thumbnail metadata keys missing the blob and regenerate cached thumb bytes.
-
-    If `admin_chat_id` is provided, sends progress messages to that chat.
-    Returns a dict with counts.
-    """
-    results = {"scanned": 0, "recached": 0, "skipped": 0, "errors": 0}
-    if not getattr(config, 'REDIS_URL', None):
-        return {"error": "no redis configured"}
-    try:
-        from redis import Redis
-        r = Redis.from_url(config.REDIS_URL)
-    except Exception as e:
-        logger.exception("Failed to connect to Redis for recache")
-        return {"error": str(e)}
-
-    try:
-        it = r.scan_iter(match='thumb:*')
-    except Exception:
-        # older redis-py may not have scan_iter on connection; fall back to keys (not recommended)
-        try:
-            it = iter(r.keys('thumb:*'))
-        except Exception:
-            return {"error": "failed enumerating keys"}
-
-    for idx, meta_key in enumerate(it):
-        # meta_key may be bytes
-        try:
-            if isinstance(meta_key, (bytes, bytearray)):
-                meta_key = meta_key.decode('utf-8')
-        except Exception:
-            continue
-        # skip blob keys
-        if meta_key.endswith(':b'):
-            continue
-        results['scanned'] += 1
-        if limit and results['scanned'] > limit:
-            break
-
-        blob_key = meta_key + ':b'
-        try:
-            exists = r.exists(blob_key)
-        except Exception:
-            exists = False
-        if exists:
-            results['skipped'] += 1
-            continue
-
-        # need to recache
-        try:
-            fid = r.hget(meta_key, 'file_id')
-            if not fid:
-                results['errors'] += 1
-                continue
-            if isinstance(fid, (bytes, bytearray)):
-                fid = fid.decode('utf-8', errors='ignore')
-
-            # fetch file bytes from Telegram and generate thumbnail
-            try:
-                tg_path = _tg_get_file_path(None, fid)
-                f_bytes = _tg_download_to_bytes(None, tg_path)
-            except Exception:
-                logger.exception("Failed to download file for recache, file_id=%s", fid)
-                results['errors'] += 1
-                continue
-
-            # try PDF thumbnail first, then image
-            thumb_bytes = None
-            try:
-                thumb_bytes = create_thumbnail_from_pdf_bytes(f_bytes)
-            except Exception:
-                try:
-                    thumb_bytes = create_thumbnail_from_image_bytes(f_bytes)
-                except Exception:
-                    thumb_bytes = None
-
-            if not thumb_bytes:
-                results['errors'] += 1
-                continue
-
-            if not dry_run:
-                try:
-                    # unique id is the meta_key suffix after 'thumb:'
-                    unique_id = meta_key.split(':', 1)[1] if ':' in meta_key else meta_key
-                    cache.set_thumbnail(unique_id, fid, thumb_bytes)
-                    results['recached'] += 1
-                except Exception:
-                    logger.exception("Failed writing cache for %s", meta_key)
-                    results['errors'] += 1
-                    continue
-            else:
-                results['recached'] += 1
-
-        except Exception:
-            logger.exception("Unexpected error while recaching %s", meta_key)
-            results['errors'] += 1
-
-        # optionally notify admin periodically
-        if admin_chat_id and results['scanned'] % 25 == 0:
-            try:
-                _tg_send_message(None, admin_chat_id, f"Recache progress: scanned={results['scanned']} recached={results['recached']} errors={results['errors']}")
-            except Exception:
-                pass
-
-    # final admin notification
-    if admin_chat_id:
-        try:
-            _tg_send_message(None, admin_chat_id, f"Recache finished: scanned={results['scanned']} recached={results['recached']} errors={results['errors']}")
-        except Exception:
-            pass
-
-    return results
+# recache_thumbs_job removed (thumbnail caching disabled)

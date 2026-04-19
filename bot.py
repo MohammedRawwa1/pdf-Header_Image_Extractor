@@ -24,10 +24,6 @@ from telegram.ext import (
 
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
 from io import BytesIO
-try:
-    import cache
-except Exception:
-    cache = None
 import config
 
 # Optional RQ enqueue helper (import only when needed)
@@ -180,41 +176,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
-    # Check thumbnail cache first (by file_unique_id when available), short-circuit send
-    if config.REDIS_URL and cache is not None:
-        try:
-            key = getattr(doc, 'file_unique_id', None) or doc.file_id
-            cached = cache.get_thumbnail(key)
-            if cached:
-                cached_file_id, thumb_bytes = cached
-                thumb_buf = BytesIO(thumb_bytes)
-                # Sending by existing Telegram `file_id` may not support attaching a new thumbnail
-                # at the python-telegram-bot layer (raises TypeError). Send the cached file_id
-                # without a thumb to avoid that error. If a thumbnail must be attached, fall
-                # back to downloading the file and re-uploading it with the thumbnail.
-                try:
-                    await context.bot.send_document(chat_id=chat_id, document=cached_file_id,
-                                                   caption="Here is your file with an auto-generated cover preview. (cached)")
-                except TypeError:
-                    # fallback: download the original file and re-upload with thumbnail
-                    try:
-                        file = await context.bot.get_file(cached_file_id)
-                        local_tmp = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
-                        fpath = os.path.join(local_tmp, filename)
-                        await file.download_to_drive(custom_path=fpath)
-                        with open(fpath, "rb") as f_doc:
-                            await context.bot.send_document(chat_id=chat_id, document=InputFile(f_doc, filename=os.path.basename(fpath)),
-                                                           thumb=InputFile(thumb_buf, filename="thumb.jpg"),
-                                                           caption="Here is your file with an auto-generated cover preview. (cached)")
-                    except Exception:
-                        logger.exception("Failed to send cached document with thumbnail")
-                    finally:
-                        shutil.rmtree(local_tmp, ignore_errors=True)
-                except Exception:
-                    logger.exception("Failed to send cached document")
-                return
-        except Exception:
-            logger.exception("Cache handling failed")
+    # Thumbnail caching disabled
 
     # If Telegram reports a file_size on the Document, check it against the configured
     # upload limit before attempting to enqueue or download. Telegram's Bot API will
@@ -301,19 +263,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(f"Added forwarded photo to batch: {filename}")
         return
 
-    # Check cache for photo
-    if config.REDIS_URL and cache is not None:
-        try:
-            key = getattr(photo, 'file_unique_id', None) or photo.file_id
-            cached = cache.get_thumbnail(key)
-            if cached:
-                cached_file_id, thumb_bytes = cached
-                thumb_buf = BytesIO(thumb_bytes)
-                await context.bot.send_document(chat_id=chat_id, document=photo.file_id, thumb=InputFile(thumb_buf, filename="thumb.jpg"),
-                                               caption="Here is your image with an auto-generated thumbnail. (cached)")
-                return
-        except Exception:
-            logger.exception("Cache lookup failed")
+    # Thumbnail caching disabled
 
     if config.REDIS_URL:
         ok = enqueue_job('process_document_job', chat_id, photo.file_id, filename, 'image/jpeg', getattr(photo, 'file_unique_id', None))

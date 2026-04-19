@@ -48,6 +48,7 @@ AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 S3_REGION: str = os.getenv("S3_REGION", "")
 S3_ENDPOINT: str = os.getenv("S3_ENDPOINT", "")
 S3_PRESIGNED_EXPIRY: int = int(os.getenv("S3_PRESIGNED_EXPIRY", "3600"))
+S3_SIGNATURE_VERSION: str = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
 
 
 def is_admin_user(user_id: int) -> bool:

@@ -40,7 +40,10 @@ def upload_file_and_get_presigned_url(file_path: str, object_name: str | None = 
         client_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY or None
 
     try:
-        s3 = boto3.client('s3', **client_kwargs)
+        from botocore.config import Config as BotoConfig
+        sig = getattr(config, 'S3_SIGNATURE_VERSION', 's3v4')
+        boto_cfg = BotoConfig(signature_version=sig)
+        s3 = boto3.client('s3', config=boto_cfg, **client_kwargs)
     except Exception:
         logger.exception("Failed to create S3 client")
         return None
@@ -112,7 +115,10 @@ def purge_objects_older_than(ttl_seconds: int, prefix: str = 'pdf-bot/') -> int:
         client_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY or None
 
     try:
-        s3 = boto3.client('s3', **client_kwargs)
+        from botocore.config import Config as BotoConfig
+        sig = getattr(config, 'S3_SIGNATURE_VERSION', 's3v4')
+        boto_cfg = BotoConfig(signature_version=sig)
+        s3 = boto3.client('s3', config=boto_cfg, **client_kwargs)
     except Exception:
         logger.exception("Failed to create S3 client for purge")
         return 0
