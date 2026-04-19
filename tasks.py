@@ -124,6 +124,11 @@ try:
 except Exception:
     get_current_job = None
 
+try:
+    from storage import upload_file_and_get_presigned_url
+except Exception:
+    upload_file_and_get_presigned_url = None
+
 
 def process_document_job(chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
@@ -190,8 +195,22 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                                     upload_path = compressed2
                         except Exception:
                             pass
-                # If compression didn't produce an acceptable file, notify user and stop
+                # If compression didn't produce an acceptable file, try S3 fallback (if enabled), otherwise notify and stop
                 if upload_path == file_path and orig_size and orig_size > upload_limit:
+                    # S3 fallback
+                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
+                        try:
+                            if upload_file_and_get_presigned_url:
+                                url = upload_file_and_get_presigned_url(file_path, filename)
+                                if url:
+                                    try:
+                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                    except Exception:
+                                        pass
+                                    return {"s3_url": url}
+                        except Exception:
+                            logger.exception("S3 fallback failed for file_id=%s", file_id)
+
                     try:
                         _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
                     except Exception:
@@ -280,19 +299,60 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
                                     with open(compressed2, 'rb') as cf:
                                         file_bytes = cf.read()
                                 else:
-                                    # still too big
+                                    # still too big: try S3 fallback if enabled
+                                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
+                                        try:
+                                            # prefer the more compressed file if it exists
+                                            candidate = compressed2 if os.path.exists(compressed2) else compressed_tmp
+                                            if upload_file_and_get_presigned_url and candidate and os.path.exists(candidate):
+                                                url = upload_file_and_get_presigned_url(candidate, filename)
+                                                if url:
+                                                    try:
+                                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                                    except Exception:
+                                                        pass
+                                                    return {"s3_url": url}
+                                        except Exception:
+                                            logger.exception("S3 fallback failed for in-memory file for chat_id=%s", chat_id)
                                     try:
                                         _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
                                     except Exception:
                                         pass
                                     return {"error": "file too large after compression"}
                         except Exception:
+                            # Compression attempt failed; try S3 fallback or notify
+                            if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
+                                try:
+                                    # upload original tmp_in
+                                    if upload_file_and_get_presigned_url and os.path.exists(tmp_in):
+                                        url = upload_file_and_get_presigned_url(tmp_in, filename)
+                                        if url:
+                                            try:
+                                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                            except Exception:
+                                                pass
+                                            return {"s3_url": url}
+                                except Exception:
+                                    logger.exception("S3 fallback failed for in-memory compression exception for chat_id=%s", chat_id)
                             try:
                                 _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
                             except Exception:
                                 pass
                             return {"error": "file too large after compression"}
                 else:
+                    # compression not available; try S3 fallback
+                    if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None):
+                        try:
+                            if upload_file_and_get_presigned_url and os.path.exists(tmp_in):
+                                url = upload_file_and_get_presigned_url(tmp_in, filename)
+                                if url:
+                                    try:
+                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                    except Exception:
+                                        pass
+                                    return {"s3_url": url}
+                        except Exception:
+                            logger.exception("S3 fallback failed for in-memory fallback for chat_id=%s", chat_id)
                     try:
                         _tg_send_message(None, chat_id, f"File too large to upload via bot and compression is not available on server; size={len(file_bytes)} bytes")
                     except Exception:
@@ -407,3 +467,117 @@ def process_url_job(chat_id: int, url: str, filename: Optional[str] = None) -> N
         except Exception:
             pass
         return {"error": str(e)}
+
+
+def recache_thumbs_job(admin_chat_id: Optional[int] = None, limit: Optional[int] = None, dry_run: bool = False) -> dict:
+    """Scan Redis for thumbnail metadata keys missing the blob and regenerate cached thumb bytes.
+
+    If `admin_chat_id` is provided, sends progress messages to that chat.
+    Returns a dict with counts.
+    """
+    results = {"scanned": 0, "recached": 0, "skipped": 0, "errors": 0}
+    if not getattr(config, 'REDIS_URL', None):
+        return {"error": "no redis configured"}
+    try:
+        from redis import Redis
+        r = Redis.from_url(config.REDIS_URL)
+    except Exception as e:
+        logger.exception("Failed to connect to Redis for recache")
+        return {"error": str(e)}
+
+    try:
+        it = r.scan_iter(match='thumb:*')
+    except Exception:
+        # older redis-py may not have scan_iter on connection; fall back to keys (not recommended)
+        try:
+            it = iter(r.keys('thumb:*'))
+        except Exception:
+            return {"error": "failed enumerating keys"}
+
+    for idx, meta_key in enumerate(it):
+        # meta_key may be bytes
+        try:
+            if isinstance(meta_key, (bytes, bytearray)):
+                meta_key = meta_key.decode('utf-8')
+        except Exception:
+            continue
+        # skip blob keys
+        if meta_key.endswith(':b'):
+            continue
+        results['scanned'] += 1
+        if limit and results['scanned'] > limit:
+            break
+
+        blob_key = meta_key + ':b'
+        try:
+            exists = r.exists(blob_key)
+        except Exception:
+            exists = False
+        if exists:
+            results['skipped'] += 1
+            continue
+
+        # need to recache
+        try:
+            fid = r.hget(meta_key, 'file_id')
+            if not fid:
+                results['errors'] += 1
+                continue
+            if isinstance(fid, (bytes, bytearray)):
+                fid = fid.decode('utf-8', errors='ignore')
+
+            # fetch file bytes from Telegram and generate thumbnail
+            try:
+                tg_path = _tg_get_file_path(None, fid)
+                f_bytes = _tg_download_to_bytes(None, tg_path)
+            except Exception:
+                logger.exception("Failed to download file for recache, file_id=%s", fid)
+                results['errors'] += 1
+                continue
+
+            # try PDF thumbnail first, then image
+            thumb_bytes = None
+            try:
+                thumb_bytes = create_thumbnail_from_pdf_bytes(f_bytes)
+            except Exception:
+                try:
+                    thumb_bytes = create_thumbnail_from_image_bytes(f_bytes)
+                except Exception:
+                    thumb_bytes = None
+
+            if not thumb_bytes:
+                results['errors'] += 1
+                continue
+
+            if not dry_run:
+                try:
+                    # unique id is the meta_key suffix after 'thumb:'
+                    unique_id = meta_key.split(':', 1)[1] if ':' in meta_key else meta_key
+                    cache.set_thumbnail(unique_id, fid, thumb_bytes)
+                    results['recached'] += 1
+                except Exception:
+                    logger.exception("Failed writing cache for %s", meta_key)
+                    results['errors'] += 1
+                    continue
+            else:
+                results['recached'] += 1
+
+        except Exception:
+            logger.exception("Unexpected error while recaching %s", meta_key)
+            results['errors'] += 1
+
+        # optionally notify admin periodically
+        if admin_chat_id and results['scanned'] % 25 == 0:
+            try:
+                _tg_send_message(None, admin_chat_id, f"Recache progress: scanned={results['scanned']} recached={results['recached']} errors={results['errors']}")
+            except Exception:
+                pass
+
+    # final admin notification
+    if admin_chat_id:
+        try:
+            _tg_send_message(None, admin_chat_id, f"Recache finished: scanned={results['scanned']} recached={results['recached']} errors={results['errors']}")
+        except Exception:
+            pass
+
+    return results

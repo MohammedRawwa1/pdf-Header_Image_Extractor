@@ -712,6 +712,59 @@ async def delete_webhook(admin_token: str | None = Header(default=None)) -> dict
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post('/admin/recache_thumbs')
+async def admin_recache_thumbs(request: Request, admin_token: str | None = Header(default=None)) -> dict:
+    if not admin_token or not _verify_admin_header(admin_token):
+        raise HTTPException(status_code=403, detail='Invalid admin token')
+    body = await request.json()
+    limit = body.get('limit') if isinstance(body, dict) else None
+    dry_run = bool(body.get('dry_run')) if isinstance(body, dict) else False
+    notify_chat = body.get('notify_chat') if isinstance(body, dict) else None
+
+    # try to enqueue via RQ if possible
+    try:
+        ok = enqueue_job('recache_thumbs_job', notify_chat, limit, dry_run)
+        if ok:
+            return {'ok': True, 'queued': True}
+    except Exception:
+        logger.exception('Failed to enqueue recache job')
+
+    # fallback: run inline in background executor
+    try:
+        import tasks
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, tasks.recache_thumbs_job, notify_chat, limit, dry_run)
+        return {'ok': True, 'queued': False, 'result': res}
+    except Exception as e:
+        logger.exception('Failed running recache job inline')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/purge_s3')
+async def admin_purge_s3(request: Request, admin_token: str | None = Header(default=None)) -> dict:
+    if not admin_token or not _verify_admin_header(admin_token):
+        raise HTTPException(status_code=403, detail='Invalid admin token')
+    body = await request.json()
+    ttl = int(body.get('ttl_seconds', 0)) if isinstance(body, dict) else 0
+    prefix = body.get('prefix', 'pdf-bot/') if isinstance(body, dict) else 'pdf-bot/'
+    if ttl <= 0:
+        raise HTTPException(status_code=400, detail='ttl_seconds must be > 0')
+
+    try:
+        from storage import purge_objects_older_than
+    except Exception:
+        raise HTTPException(status_code=500, detail='storage.purge_objects_older_than is unavailable')
+
+    # run in executor to avoid blocking
+    try:
+        loop = asyncio.get_running_loop()
+        deleted = await loop.run_in_executor(None, purge_objects_older_than, ttl, prefix)
+        return {'ok': True, 'deleted': deleted}
+    except Exception as e:
+        logger.exception('Failed purging S3 objects')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/set_commands")
 async def set_commands(request: Request, admin_token: str | None = Header(default=None)) -> dict:
     if not admin_token or not _verify_admin_header(admin_token):

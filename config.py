@@ -36,6 +36,19 @@ MAX_FILE_SIZE: int = int(os.getenv("MAX_FILE_SIZE", str(0)))  # bytes, 0 = unlim
 # Temp directory for downloads (optional)
 TMP_DIR: str = os.getenv("TMP_DIR", "")
 
+# PDF compression quality preset (used by tools.compress_pdf)
+PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
+
+# Optional S3 fallback settings
+ENABLE_S3_FALLBACK: bool = os.getenv("ENABLE_S3_FALLBACK", "false").lower() in ("1", "true", "yes")
+S3_BUCKET: str = os.getenv("S3_BUCKET", "")
+AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+# S3 region variable (use S3_REGION in environment)
+S3_REGION: str = os.getenv("S3_REGION", "")
+S3_ENDPOINT: str = os.getenv("S3_ENDPOINT", "")
+S3_PRESIGNED_EXPIRY: int = int(os.getenv("S3_PRESIGNED_EXPIRY", "3600"))
+
 
 def is_admin_user(user_id: int) -> bool:
     if user_id is None:
