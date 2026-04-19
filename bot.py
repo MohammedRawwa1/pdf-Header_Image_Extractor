@@ -566,15 +566,9 @@ def _verify_admin_header(admin_token: str) -> bool:
 
 
 @app.get("/status")
-async def status(admin_token: str | None = Header(default=None)) -> dict:
-    info: Dict[str, Any] = {"ok": True, "use_polling": USE_POLLING, "webhook_url": WEBHOOK_URL}
-    if admin_token and _verify_admin_header(admin_token):
-        try:
-            webhook_info = await application.bot.get_webhook_info()
-            info["webhook_info"] = webhook_info.to_dict() if webhook_info else None
-        except Exception:
-            info["webhook_info"] = None
-    return info
+async def status(admin_token: str | None = Header(default=None)) -> str:
+    # Return a minimal, non-sensitive status string
+    return "active"
 
 
 @app.get("/commands")
