@@ -188,11 +188,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if cached:
                 cached_file_id, thumb_bytes = cached
                 thumb_buf = BytesIO(thumb_bytes)
-                await context.bot.send_document(chat_id=chat_id, document=doc.file_id, thumb=InputFile(thumb_buf, filename="thumb.jpg"),
-                                               caption="Here is your file with an auto-generated cover preview. (cached)")
+                # Sending by existing Telegram `file_id` may not support attaching a new thumbnail
+                # at the python-telegram-bot layer (raises TypeError). Send the cached file_id
+                # without a thumb to avoid that error. If a thumbnail must be attached, fall
+                # back to downloading the file and re-uploading it with the thumbnail.
+                try:
+                    await context.bot.send_document(chat_id=chat_id, document=cached_file_id,
+                                                   caption="Here is your file with an auto-generated cover preview. (cached)")
+                except TypeError:
+                    # fallback: download the original file and re-upload with thumbnail
+                    try:
+                        file = await context.bot.get_file(cached_file_id)
+                        local_tmp = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
+                        fpath = os.path.join(local_tmp, filename)
+                        await file.download_to_drive(custom_path=fpath)
+                        with open(fpath, "rb") as f_doc:
+                            await context.bot.send_document(chat_id=chat_id, document=InputFile(f_doc, filename=os.path.basename(fpath)),
+                                                           thumb=InputFile(thumb_buf, filename="thumb.jpg"),
+                                                           caption="Here is your file with an auto-generated cover preview. (cached)")
+                    except Exception:
+                        logger.exception("Failed to send cached document with thumbnail")
+                    finally:
+                        shutil.rmtree(local_tmp, ignore_errors=True)
+                except Exception:
+                    logger.exception("Failed to send cached document")
                 return
         except Exception:
-            logger.exception("Cache lookup failed")
+            logger.exception("Cache handling failed")
 
     if config.REDIS_URL:
         ok = enqueue_job('process_document_job', chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
