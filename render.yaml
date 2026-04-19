@@ -7,7 +7,12 @@ services:
     env: docker
     branch: main
     dockerfilePath: Dockerfile
-    startCommand: "uvicorn bot:app --host 0.0.0.0 --port $PORT"
+    # Run both the web server and an in-process worker in the same container.
+    # This avoids paying for a separate worker service by launching the worker
+    # in the background while uvicorn runs in the foreground.
+    # NOTE: This is suitable for low-volume usage. For production or scaling,
+    # run a separate worker service.
+    startCommand: "sh -lc 'python worker.py & exec uvicorn bot:app --host 0.0.0.0 --port $PORT'"
     healthCheckPath: "/health"
     envVars:
       - key: BOT_TOKEN
@@ -33,6 +38,8 @@ services:
     env: docker
     branch: main
     dockerfilePath: Dockerfile
+    # If you prefer a separate worker service, keep this. Otherwise remove
+    # the worker service block and run the worker in the web container.
     startCommand: "python worker.py"
     envVars:
       - key: REDIS_URL

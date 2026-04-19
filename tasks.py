@@ -100,18 +100,18 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
                             pass
                 except Exception:
                     pass
-                        res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                                               caption="Here is your file with an auto-generated cover preview.")
-                        # persist response in job meta for debugging
-                        try:
-                            if get_current_job is not None:
-                                job = get_current_job()
-                                if job is not None:
-                                    job.meta['tg_response'] = res
-                                    job.save_meta()
-                        except Exception:
-                            pass
-                        return res
+                res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                                       caption="Here is your file with an auto-generated cover preview.")
+                # persist response in job meta for debugging
+                try:
+                    if get_current_job is not None:
+                        job = get_current_job()
+                        if job is not None:
+                            job.meta['tg_response'] = res
+                            job.save_meta()
+                except Exception:
+                    pass
+                return res
         except Exception as e:
             try:
                 _tg_send_message(bot_token, chat_id, f"Error processing file in background: {e}")
