@@ -6,6 +6,7 @@ import io
 import requests
 import time
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,38 @@ try:
     from storage import upload_file_and_get_presigned_url
 except Exception:
     upload_file_and_get_presigned_url = None
+
+
+# IO mapping TTL (seconds) for input/output keys stored in Redis
+IO_TTL = 7 * 24 * 3600
+
+
+def _get_redis_client():
+    if not getattr(config, 'REDIS_URL', None):
+        return None
+    try:
+        import redis
+        return redis.from_url(config.REDIS_URL)
+    except Exception:
+        return None
+
+
+def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
+    """Set input and/or output JSON blobs in Redis under `io:in:{id}` and `io:out:{id}`."""
+    r = _get_redis_client()
+    if not r:
+        return False
+    try:
+        if ttl is None:
+            ttl = IO_TTL
+        if input_meta is not None:
+            r.set(f"io:in:{unique_id}", json.dumps(input_meta), ex=ttl)
+        if output_meta is not None:
+            r.set(f"io:out:{unique_id}", json.dumps(output_meta), ex=ttl)
+        return True
+    except Exception:
+        logger.exception("Failed setting IO keys for %s", unique_id)
+        return False
 
 
 def process_document_job(chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
