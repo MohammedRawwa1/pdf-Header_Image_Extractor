@@ -112,6 +112,7 @@ from tools import (
     create_thumbnail_from_image,
     create_thumbnail_from_pdf_bytes,
     create_thumbnail_from_image_bytes,
+    compress_pdf,
 )
 import config
 try:
@@ -155,7 +156,49 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
 
-            with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+            # Check upload limit (use configured MAX_FILE_SIZE if >0, otherwise default 50MB)
+            upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+            try:
+                orig_size = os.path.getsize(file_path)
+            except Exception:
+                orig_size = None
+
+            upload_path = file_path
+            # Attempt compression when file is larger than upload_limit
+            if orig_size and upload_limit and orig_size > upload_limit:
+                # Try default compression (Ghostscript /ebook then /screen)
+                compressed1 = file_path + ".compressed.pdf"
+                tried = False
+                try:
+                    tried = compress_pdf(file_path, compressed1, gs_quality="/ebook")
+                except Exception:
+                    tried = False
+                if tried:
+                    try:
+                        csize = os.path.getsize(compressed1)
+                    except Exception:
+                        csize = None
+                    if csize and csize <= upload_limit:
+                        upload_path = compressed1
+                    else:
+                        # try more aggressive compression and accept only if under the limit
+                        compressed2 = file_path + ".compressed.screen.pdf"
+                        try:
+                            if compress_pdf(file_path, compressed2, gs_quality="/screen"):
+                                c2 = os.path.getsize(compressed2)
+                                if c2 and c2 <= upload_limit:
+                                    upload_path = compressed2
+                        except Exception:
+                            pass
+                # If compression didn't produce an acceptable file, notify user and stop
+                if upload_path == file_path and orig_size and orig_size > upload_limit:
+                    try:
+                        _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
+                    except Exception:
+                        pass
+                    return {"error": "file too large after compression"}
+
+            with open(upload_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                 # cache thumbnail for future use
                 try:
                     if cache is not None:
@@ -204,6 +247,59 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
             thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
         else:
             thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
+
+        # If in-memory buffer is large, attempt compression via a temp file
+        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        if upload_limit and len(file_bytes) > upload_limit:
+            tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
+            try:
+                tmp_in = os.path.join(tmpdir, filename)
+                with open(tmp_in, 'wb') as f:
+                    f.write(file_bytes)
+                compressed_tmp = tmp_in + '.compressed.pdf'
+                compressed_ok = False
+                try:
+                    compressed_ok = compress_pdf(tmp_in, compressed_tmp, gs_quality="/ebook")
+                except Exception:
+                    compressed_ok = False
+                if compressed_ok:
+                    try:
+                        csize = os.path.getsize(compressed_tmp)
+                    except Exception:
+                        csize = None
+                    if csize and csize <= upload_limit:
+                        with open(compressed_tmp, 'rb') as cf:
+                            file_bytes = cf.read()
+                    else:
+                        # try more aggressive
+                        compressed2 = tmp_in + '.compressed.screen.pdf'
+                        try:
+                            if compress_pdf(tmp_in, compressed2, gs_quality="/screen"):
+                                c2 = os.path.getsize(compressed2)
+                                if c2 and c2 <= upload_limit:
+                                    with open(compressed2, 'rb') as cf:
+                                        file_bytes = cf.read()
+                                else:
+                                    # still too big
+                                    try:
+                                        _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
+                                    except Exception:
+                                        pass
+                                    return {"error": "file too large after compression"}
+                        except Exception:
+                            try:
+                                _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
+                            except Exception:
+                                pass
+                            return {"error": "file too large after compression"}
+                else:
+                    try:
+                        _tg_send_message(None, chat_id, f"File too large to upload via bot and compression is not available on server; size={len(file_bytes)} bytes")
+                    except Exception:
+                        pass
+                    return {"error": "file too large and compression unavailable"}
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
         doc_buf = io.BytesIO(file_bytes)
         thumb_buf = io.BytesIO(thumb_bytes)

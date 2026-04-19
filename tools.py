@@ -111,3 +111,58 @@ def _optimize_thumbnail_bytes(im: Image.Image, max_bytes: int = 200 * 1024) -> b
         return buf.read()
     except Exception:
         return b""
+
+
+def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") -> bool:
+    """Try to compress a PDF file.
+
+    Strategy:
+    1. Try Ghostscript (`gs`) with `-dPDFSETTINGS` (fast, effective when available).
+    2. Fallback to PyMuPDF `Document.save(..., deflate=True, garbage=4)` which attempts
+       to compress streams.
+
+    Returns True if `output_path` was created (and may be smaller), False on failure.
+    """
+    import subprocess
+    import os
+    # Remove any existing output
+    try:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    except Exception:
+        pass
+
+    # 1) Ghostscript path
+    gs_cmd = [
+        "gs",
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={gs_quality}",
+        "-dNOPAUSE",
+        "-dQUIET",
+        "-dBATCH",
+        f"-sOutputFile={output_path}",
+        input_path,
+    ]
+    try:
+        subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        return os.path.exists(output_path)
+    except FileNotFoundError:
+        # Ghostscript not installed, continue to PyMuPDF fallback
+        pass
+    except subprocess.CalledProcessError:
+        # Ghostscript failed; continue to fallback
+        pass
+    except Exception:
+        pass
+
+    # 2) PyMuPDF fallback (best-effort)
+    try:
+        import fitz
+        doc = fitz.open(input_path)
+        # Save with stream deflation and garbage collection to reduce size
+        doc.save(output_path, deflate=True, garbage=4, clean=True)
+        doc.close()
+        return os.path.exists(output_path)
+    except Exception:
+        return False

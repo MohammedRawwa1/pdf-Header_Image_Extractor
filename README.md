@@ -58,6 +58,26 @@ Render deployment (high-level)
 Notes
 
 - The project requires `PyMuPDF` (`fitz`) for PDF rendering. The provided `Dockerfile` installs `PyMuPDF` via pip and does not require `poppler`.
+- The project requires `PyMuPDF` (`fitz`) for PDF rendering. The provided `Dockerfile` installs `PyMuPDF` via pip and does not require `poppler`.
+
+System dependency: Ghostscript
+--------------------------------
+
+The PDF compression helper (`tools.compress_pdf`) calls the `gs` (Ghostscript) binary. Ghostscript is a system package (not a Python package) and must be available in the runtime image. The included `Dockerfile` installs Ghostscript; if you build/run locally or on another host, install Ghostscript for your platform:
+
+- Debian/Ubuntu (including Docker images based on `python:<tag>-slim`):
+
+```bash
+apt-get update && apt-get install -y --no-install-recommends ghostscript
+```
+
+- Alpine (if you use an Alpine base):
+
+```bash
+apk add --no-cache ghostscript
+```
+
+No extra Python packages are required for compression beyond the existing `requirements.txt` (it already includes `PyMuPDF` and `Pillow`). If you later add S3 upload fallback, you'll need to add `boto3` to `requirements.txt` and provide AWS credentials in the environment.
 
 Large files and forwarded content
 

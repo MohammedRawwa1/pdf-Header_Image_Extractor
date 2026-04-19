@@ -21,6 +21,13 @@ RUN if [ -n "$PYMUPDF_WHEEL_URL" ]; then \
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install Ghostscript for PDF compression (used by `tools.compress_pdf`).
+# Ghostscript is an OS package (not a Python dependency) and must be available
+# in the runtime image for `gs` to be callable by subprocess.
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ghostscript \
+	&& rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 RUN useradd -m botuser && chown -R botuser /app
