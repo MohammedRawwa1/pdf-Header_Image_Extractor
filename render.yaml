@@ -12,8 +12,11 @@ services:
     # in the background while uvicorn runs in the foreground.
     # NOTE: This is suitable for low-volume usage. For production or scaling,
     # run a separate worker service.
-    # Use LOG_LEVEL env var to control uvicorn log level; default to info
-    startCommand: "sh -lc 'python worker.py & exec uvicorn bot:app --host 0.0.0.0 --port $PORT --log-level ${LOG_LEVEL:-info}'"
+    # Start only the web server here; the in-process worker will be started
+    # from the web app when RUN_WORKER_IN_PROC=true is set. This avoids a
+    # separate paid worker service while ensuring worker logs appear in the
+    # same Render logs stream.
+    startCommand: "sh -lc 'exec uvicorn bot:app --host 0.0.0.0 --port $PORT --log-level ${LOG_LEVEL:-info}'"
     healthCheckPath: "/health"
     envVars:
       - key: BOT_TOKEN
@@ -28,6 +31,10 @@ services:
         value: "<REPLACE_WITH_STRONG_SECRET>"
       - key: REDIS_URL
         value: "redis://localhost:6379/0"
+      - key: LOG_LEVEL
+        value: "DEBUG"
+      - key: RUN_WORKER_IN_PROC
+        value: "true"
       - key: LOG_LEVEL
         value: "DEBUG"
       - key: LOG_CHANNEL

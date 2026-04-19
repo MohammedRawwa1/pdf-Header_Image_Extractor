@@ -455,6 +455,21 @@ async def on_startup() -> None:
     # Initialize application so handlers, bot, and context are ready
     await application.initialize()
 
+    # Optionally start an in-process RQ worker thread to avoid running a separate worker service.
+    # Enable this by setting the environment variable RUN_WORKER_IN_PROC=true
+    try:
+        if os.getenv("RUN_WORKER_IN_PROC", "false").lower() in ("1", "true", "yes"):
+            import threading
+            try:
+                import worker as _worker_module
+                t = threading.Thread(target=_worker_module.run_worker, name="inproc-rq-worker", daemon=True)
+                t.start()
+                logger.info("Started in-process RQ worker thread")
+            except Exception:
+                logger.exception("Failed to import/start in-process worker module")
+    except Exception:
+        logger.exception("Error while attempting to start in-process worker")
+
     if USE_POLLING:
         # start polling in background for local/dev
         await application.start()
