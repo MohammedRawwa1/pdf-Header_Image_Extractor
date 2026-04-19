@@ -23,6 +23,11 @@ from telegram.ext import (
 )
 
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
+from io import BytesIO
+try:
+    import cache
+except Exception:
+    cache = None
 import config
 
 # Optional RQ enqueue helper (import only when needed)
@@ -163,13 +168,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     is_forwarded = bool(getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None) or getattr(msg, "forward_date", None))
     user_id = getattr(update.effective_user, "id", None)
     if is_forwarded and is_batch_active(chat_id, user_id):
-        item = {"file_id": doc.file_id, "filename": filename, "mime": mime}
+        item = {"file_id": doc.file_id, "file_unique_id": getattr(doc, 'file_unique_id', None), "filename": filename, "mime": mime}
         append_forward_item(chat_id, user_id, item)
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
+    # Check thumbnail cache first (by file_unique_id when available), short-circuit send
+    if config.REDIS_URL and cache is not None:
+        try:
+            key = getattr(doc, 'file_unique_id', None) or doc.file_id
+            cached = cache.get_thumbnail(key)
+            if cached:
+                cached_file_id, thumb_bytes = cached
+                thumb_buf = BytesIO(thumb_bytes)
+                await context.bot.send_document(chat_id=chat_id, document=doc.file_id, thumb=InputFile(thumb_buf, filename="thumb.jpg"),
+                                               caption="Here is your file with an auto-generated cover preview. (cached)")
+                return
+        except Exception:
+            logger.exception("Cache lookup failed")
+
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, doc.file_id, filename, mime)
+        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
         if ok:
             await msg.reply_text("Queued your file for background processing; I'll send the result when ready.")
             return
@@ -225,13 +244,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     is_forwarded = bool(getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None) or getattr(msg, "forward_date", None))
     user_id = getattr(update.effective_user, "id", None)
     if is_forwarded and is_batch_active(chat_id, user_id):
-        item = {"file_id": photo.file_id, "filename": filename, "mime": "image/jpeg"}
+        item = {"file_id": photo.file_id, "file_unique_id": getattr(photo, 'file_unique_id', None), "filename": filename, "mime": "image/jpeg"}
         append_forward_item(chat_id, user_id, item)
         await msg.reply_text(f"Added forwarded photo to batch: {filename}")
         return
 
+    # Check cache for photo
+    if config.REDIS_URL and cache is not None:
+        try:
+            key = getattr(photo, 'file_unique_id', None) or photo.file_id
+            cached = cache.get_thumbnail(key)
+            if cached:
+                cached_file_id, thumb_bytes = cached
+                thumb_buf = BytesIO(thumb_bytes)
+                await context.bot.send_document(chat_id=chat_id, document=photo.file_id, thumb=InputFile(thumb_buf, filename="thumb.jpg"),
+                                               caption="Here is your image with an auto-generated thumbnail. (cached)")
+                return
+        except Exception:
+            logger.exception("Cache lookup failed")
+
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, photo.file_id, filename, 'image/jpeg')
+        ok = enqueue_job('process_document_job', config.BOT_TOKEN, chat_id, photo.file_id, filename, 'image/jpeg', getattr(photo, 'file_unique_id', None))
         if ok:
             await msg.reply_text("Queued your photo for background processing; I'll send the result when ready.")
             return

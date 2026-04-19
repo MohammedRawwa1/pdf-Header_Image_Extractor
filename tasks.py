@@ -55,9 +55,13 @@ from tools import (
     create_thumbnail_from_image_bytes,
 )
 import config
+try:
+    import cache
+except Exception:
+    cache = None
 
 
-def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: str, mime: Optional[str] = "") -> None:
+def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb."""
     # If TMP_DIR is set, fallback to disk-based processing for large files.
     if config.TMP_DIR:
@@ -80,13 +84,30 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
                 create_thumbnail_from_image(file_path, thumb_path)
 
             with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                                  caption="Here is your file with an auto-generated cover preview.")
+                # cache thumbnail for future use
+                try:
+                    if cache is not None:
+                        key = file_unique_id or file_id
+                        try:
+                            cache.set_thumbnail(key, file_id, f_thumb.read())
+                            # reset file pointer for upload
+                            f_thumb.seek(0)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                                       caption="Here is your file with an auto-generated cover preview.")
+                return res
         except Exception as e:
             try:
                 _tg_send_message(bot_token, chat_id, f"Error processing file in background: {e}")
             except Exception:
                 pass
+            return {"error": str(e)}
+
+
+        
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
@@ -107,20 +128,32 @@ def process_document_job(bot_token: str, chat_id: int, file_id: str, filename: s
         doc_buf.seek(0)
         thumb_buf.seek(0)
 
-        _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
-                          caption="Here is your file with an auto-generated cover preview.")
+        # store cache entry if possible
+        try:
+            if cache is not None:
+                key = file_unique_id or file_id
+                try:
+                    cache.set_thumbnail(key, file_id, thumb_bytes)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        res = _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
+                                caption="Here is your file with an auto-generated cover preview.")
+        return res
     except Exception as e:
         try:
             _tg_send_message(bot_token, chat_id, f"Error processing file in background: {e}")
         except Exception:
             pass
+        return {"error": str(e)}
 
 
 def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[str] = None) -> None:
     """RQ job: download a remote URL (PDF), generate thumbnail, and send file back."""
-    bot = None
 
-    # If TMP_DIR is set, use disk-based processing
+    # Disk-mode when TMP_DIR specified
     if config.TMP_DIR:
         tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
         try:
@@ -141,41 +174,19 @@ def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[s
             create_thumbnail_from_pdf(file_path, thumb_path)
 
             with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                                  caption="Here is your file with an auto-generated cover preview.")
+                res = _tg_send_document(bot_token, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                                       caption="Here is your file with an auto-generated cover preview.")
+                return res
         except Exception as e:
             try:
                 _tg_send_message(bot_token, chat_id, f"Error processing URL in background: {e}")
             except Exception:
                 pass
+            return {"error": str(e)}
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-
-    def process_document_batch_job(bot_token: str, chat_id: int, items: list) -> None:
-        """Process a list of document items sequentially.
-
-        Each item should be a dict with keys: file_id, filename, mime (optional).
-        """
-        # use HTTP-based helper for background processing
-        bot = None
-        for idx, item in enumerate(items):
-            try:
-                file_id = item.get("file_id")
-                filename = item.get("filename") or f"file_{file_id}"
-                mime = item.get("mime", "")
-                # Reuse existing single-file processor for robustness
-                process_document_job(bot_token, chat_id, file_id, filename, mime)
-                # small pause to avoid flooding Telegram
-                time.sleep(0.8)
-            except Exception as e:
-                try:
-                    _tg_send_message(bot_token, chat_id, f"Error processing item #{idx+1}: {e}")
-                except Exception:
-                    pass
-        return
-
-    # In-memory download and processing
+    # In-memory processing
     try:
         if not filename:
             filename = os.path.basename(url.split('?', 1)[0]) or 'download.pdf'
@@ -197,10 +208,12 @@ def process_url_job(bot_token: str, chat_id: int, url: str, filename: Optional[s
         doc_buf.seek(0)
         thumb_buf.seek(0)
 
-        _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
-                  caption="Here is your file with an auto-generated cover preview.")
+        res = _tg_send_document(bot_token, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
+                                caption="Here is your file with an auto-generated cover preview.")
+        return res
     except Exception as e:
         try:
-            bot.send_message(chat_id=chat_id, text=f"Error processing URL in background: {e}")
+            _tg_send_message(bot_token, chat_id, f"Error processing URL in background: {e}")
         except Exception:
             pass
+        return {"error": str(e)}

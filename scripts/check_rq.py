@@ -80,8 +80,47 @@ try:
         for jid in ids[:10]:
             print(' -', jid)
             try:
-                job = r.hgetall(f'rq:job:{jid}')
-                print('   job fields:', list(job.keys()))
+                # RQ job data can be stored as binary (pickled). Use a binary-safe
+                # redis client to fetch raw fields and avoid UTF-8 decode errors.
+                r_bin = redis.from_url(REDIS_URL, decode_responses=False)
+                job_raw = r_bin.hgetall(f'rq:job:{jid}')
+                if not job_raw:
+                    print('   job not found or empty')
+                else:
+                    fields = []
+                    for kk, vv in job_raw.items():
+                        try:
+                            key_str = kk.decode('utf-8') if isinstance(kk, (bytes, bytearray)) else str(kk)
+                        except Exception:
+                            key_str = repr(kk)
+                        if isinstance(vv, (bytes, bytearray)):
+                            # Try to decode short values for readability, otherwise show size
+                            try:
+                                val_str = vv.decode('utf-8')
+                                # truncate long values
+                                if len(val_str) > 200:
+                                    val_str = val_str[:200] + '...'
+                                fields.append(f'{key_str}: {val_str}')
+                            except Exception:
+                                fields.append(f'{key_str}: <binary {len(vv)} bytes>')
+                        else:
+                            fields.append(f'{key_str}: {vv}')
+                    print('   job fields:')
+                    for f in fields:
+                        print('    -', f)
+                # Try to fetch the job using RQ's Job.fetch to decode pickled data
+                try:
+                    from rq.job import Job
+
+                    # Use a binary-safe redis connection for RQ
+                    r_conn = redis.from_url(REDIS_URL)
+                    job_obj = Job.fetch(jid, connection=r_conn)
+                    print('   RQ Job.fetch:')
+                    print('    - func_name:', job_obj.func_name)
+                    print('    - args:', job_obj.args)
+                    print('    - kwargs:', job_obj.kwargs)
+                except Exception as e:
+                    print('   RQ Job.fetch failed:', e)
             except Exception as e:
                 print('   failed reading job data:', e)
 except ModuleNotFoundError:
