@@ -455,20 +455,22 @@ async def on_startup() -> None:
     # Initialize application so handlers, bot, and context are ready
     await application.initialize()
 
-    # Optionally start an in-process RQ worker thread to avoid running a separate worker service.
+    # Optionally start an external worker subprocess to avoid running a separate
+    # paid worker service while allowing the worker to install signal handlers.
     # Enable this by setting the environment variable RUN_WORKER_IN_PROC=true
     try:
         if os.getenv("RUN_WORKER_IN_PROC", "false").lower() in ("1", "true", "yes"):
-            import threading
             try:
-                import worker as _worker_module
-                t = threading.Thread(target=_worker_module.run_worker, name="inproc-rq-worker", daemon=True)
-                t.start()
-                logger.info("Started in-process RQ worker thread")
+                import sys
+                import subprocess
+                worker_path = os.path.join(os.getcwd(), "worker.py")
+                # Start worker as a separate process so it can register signal handlers
+                proc = subprocess.Popen([sys.executable, worker_path], env=os.environ.copy(), close_fds=True)
+                logger.info("Started worker subprocess pid=%s", proc.pid)
             except Exception:
-                logger.exception("Failed to import/start in-process worker module")
+                logger.exception("Failed to start worker subprocess")
     except Exception:
-        logger.exception("Error while attempting to start in-process worker")
+        logger.exception("Error while attempting to start worker subprocess")
 
     if USE_POLLING:
         # start polling in background for local/dev
