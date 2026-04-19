@@ -47,7 +47,13 @@ def enqueue_job(func_name: str, *args, **kwargs):
         logger.exception("Failed to enqueue job for %s", func_name)
         return False
 
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=numeric_level)
+# also set common noisy libraries to the same level
+logging.getLogger("httpx").setLevel(numeric_level)
+logging.getLogger("rq").setLevel(numeric_level)
+logging.getLogger("telegram").setLevel(numeric_level)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = config.BOT_TOKEN

@@ -50,7 +50,13 @@ def main():
   enq.add_argument("--mime", default="", help="Optional mime type")
 
   args = parser.parse_args()
-  logging.basicConfig(level=logging.INFO)
+  # Respect LOG_LEVEL env var so we can increase verbosity without changing code
+  log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+  numeric_level = getattr(logging, log_level, logging.INFO)
+  logging.basicConfig(level=numeric_level)
+  logging.getLogger("rq").setLevel(numeric_level)
+  logging.getLogger("httpx").setLevel(numeric_level)
+  logging.getLogger("telegram").setLevel(numeric_level)
 
   if args.command == "enqueue":
     if not args.bot_token:
