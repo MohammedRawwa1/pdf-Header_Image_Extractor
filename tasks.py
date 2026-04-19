@@ -138,6 +138,285 @@ except Exception:
     upload_file_and_get_presigned_url = None
 
 
+def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
+    """Download an S3 object (by key) to local `dest_path` using boto3.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except Exception:
+        logger.exception("boto3 not available for downloading S3 key %s", key)
+        return False
+
+    bucket = getattr(config, 'S3_BUCKET', None)
+    if not bucket:
+        logger.error("S3 bucket not configured; cannot download key %s", key)
+        return False
+
+    client_kwargs = {}
+    if getattr(config, 'S3_REGION', None):
+        client_kwargs['region_name'] = config.S3_REGION
+    if getattr(config, 'S3_ENDPOINT', None):
+        client_kwargs['endpoint_url'] = config.S3_ENDPOINT
+    if getattr(config, 'AWS_ACCESS_KEY_ID', None) or getattr(config, 'AWS_SECRET_ACCESS_KEY', None):
+        client_kwargs['aws_access_key_id'] = config.AWS_ACCESS_KEY_ID or None
+        client_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY or None
+
+    try:
+        sig = getattr(config, 'S3_SIGNATURE_VERSION', 's3v4')
+        boto_cfg = BotoConfig(signature_version=sig)
+        s3 = boto3.client('s3', config=boto_cfg, **client_kwargs)
+    except Exception:
+        logger.exception("Failed to create S3 client for download of %s", key)
+        return False
+
+    try:
+        # ensure parent dir exists
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        s3.download_file(bucket, key, dest_path)
+        return True
+    except Exception:
+        logger.exception("Failed to download S3 key %s to %s", key, dest_path)
+        # fallback: try to generate a presigned URL and download via requests
+        try:
+            url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=int(getattr(config, 'S3_PRESIGNED_EXPIRY', 3600)))
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(dest_path, 'wb') as fh:
+                    for chunk in r.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+            return True
+        except Exception:
+            logger.exception("Presigned GET fallback failed for S3 key %s", key)
+            return False
+
+
+def process_input_key_job(job: dict) -> dict:
+    """Process a job dict produced by telethon_ingest._upload_and_enqueue.
+
+    Expected keys: 'job_id', 'input_key' (S3 key), 'original_filename', 'size', 'chat_id', 'message_id', 'cleanup_input'
+    This will download the object to a temp dir and run the disk-mode flow (thumbnail, compress, send).
+    Returns the Telegram send response or an error dict.
+    """
+    job_id = job.get('job_id') or uuid.uuid4().hex
+    input_key = job.get('input_key')
+    filename = job.get('original_filename') or os.path.basename(input_key or '') or f"{job_id}.bin"
+    chat_id = job.get('chat_id')
+    cleanup_input = job.get('cleanup_input', True)
+
+    unique_key = job_id
+
+    # write input metadata for observability
+    try:
+        input_meta = {
+            'job_id': job_id,
+            'input_key': input_key,
+            'filename': filename,
+            'size': job.get('size'),
+            'chat_id': chat_id,
+            'enqueued_at': int(time.time()),
+        }
+        _set_io_keys(unique_key, input_meta=input_meta)
+    except Exception:
+        logger.exception("Failed to write io:in for job %s", unique_key)
+
+    out_meta = {'status': 'processing', 'timestamps': {'start': int(time.time())}, 'durations': {}, 'sizes': {}}
+    try:
+        _set_io_keys(unique_key, output_meta=out_meta)
+    except Exception:
+        pass
+
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None))
+        dest_path = os.path.join(tmpdir, filename)
+
+        dl_start = time.time()
+        ok = False
+        if input_key:
+            ok = _download_s3_key_to_file(input_key, dest_path)
+        if not ok:
+            # nothing to do
+            out_meta.setdefault('status', 'download_failed')
+            out_meta.setdefault('error', 's3_download_failed')
+            out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
+            return {'error': 's3_download_failed'}
+        dl_elapsed = time.time() - dl_start
+        out_meta.setdefault('durations', {})['download_ms'] = int(dl_elapsed * 1000)
+        out_meta.setdefault('timestamps', {})['download_end'] = int(time.time())
+        try:
+            out_meta.setdefault('sizes', {})['orig_bytes'] = os.path.getsize(dest_path)
+        except Exception:
+            pass
+        try:
+            _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:
+            pass
+
+        # Now reuse disk-mode flow: thumbnail, compress, s3-fallback if needed, send
+        thumb_path = os.path.join(tmpdir, 'thumb.jpg')
+        if filename.lower().endswith('.pdf'):
+            create_thumbnail_from_pdf(dest_path, thumb_path)
+        else:
+            create_thumbnail_from_image(dest_path, thumb_path)
+
+        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        upload_path = dest_path
+        try:
+            orig_size = os.path.getsize(dest_path)
+        except Exception:
+            orig_size = None
+
+        compress_total = 0.0
+        if orig_size and upload_limit and orig_size > upload_limit:
+            # first attempt
+            try:
+                a_start = time.time()
+                c1 = dest_path + '.compressed.pdf'
+                ok1 = compress_pdf(dest_path, c1, gs_quality='/ebook')
+                a_elapsed = time.time() - a_start
+                compress_total += a_elapsed
+                out_meta.setdefault('durations', {})['compress_ms'] = int(compress_total * 1000)
+                out_meta.setdefault('timestamps', {})['compress_attempt_1_end'] = int(time.time())
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:
+                    pass
+                if ok1:
+                    try:
+                        csize = os.path.getsize(c1)
+                    except Exception:
+                        csize = None
+                    if csize and csize <= upload_limit:
+                        upload_path = c1
+                        out_meta.setdefault('sizes', {})['compressed_bytes'] = csize
+            except Exception:
+                pass
+
+            if upload_path == dest_path:
+                try:
+                    b_start = time.time()
+                    c2 = dest_path + '.compressed.screen.pdf'
+                    ok2 = compress_pdf(dest_path, c2, gs_quality='/screen')
+                    b_elapsed = time.time() - b_start
+                    compress_total += b_elapsed
+                    out_meta.setdefault('durations', {})['compress_ms'] = int(compress_total * 1000)
+                    out_meta.setdefault('timestamps', {})['compress_attempt_2_end'] = int(time.time())
+                    try:
+                        _set_io_keys(unique_key, output_meta=out_meta)
+                    except Exception:
+                        pass
+                    if ok2:
+                        try:
+                            c2size = os.path.getsize(c2)
+                        except Exception:
+                            c2size = None
+                        if c2size and c2size <= upload_limit:
+                            upload_path = c2
+                            out_meta.setdefault('sizes', {})['compressed_bytes'] = c2size
+                except Exception:
+                    pass
+
+        # If still too large, try S3 fallback (should rarely be needed since input was uploaded already)
+        if upload_path == dest_path and orig_size and upload_limit and orig_size > upload_limit:
+            if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+                try:
+                    up_start = time.time()
+                    url = upload_file_and_get_presigned_url(dest_path, filename)
+                    up_elapsed = time.time() - up_start
+                    if url:
+                        try:
+                            _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                        except Exception:
+                            pass
+                        out_meta.setdefault('durations', {})['s3_upload_ms'] = int(up_elapsed * 1000)
+                        out_meta.setdefault('timestamps', {})['s3_upload_end'] = int(time.time())
+                        out_meta.setdefault('status', 's3_fallback')
+                        out_meta.setdefault('s3', {})['url'] = url
+                        try:
+                            _set_io_keys(unique_key, output_meta=out_meta)
+                        except Exception:
+                            pass
+                        return {'s3_url': url}
+                except Exception:
+                    logger.exception("S3 fallback failed for job %s", job_id)
+
+            # fallback notify and persist
+            try:
+                _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes.")
+            except Exception:
+                pass
+            out_meta.setdefault('status', 'too_large_after_compress')
+            out_meta.setdefault('sizes', {})['orig_bytes'] = orig_size
+            out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:
+                pass
+            return {'error': 'file too large after compression'}
+
+        # send final document via Telegram
+        send_start = time.time()
+        with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
+            res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
+        send_elapsed = time.time() - send_start
+        out_meta.setdefault('durations', {})['tg_send_ms'] = int(send_elapsed * 1000)
+        out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+        out_meta.setdefault('status', 'done')
+        try:
+            out_meta.setdefault('sizes', {})['out_bytes'] = os.path.getsize(upload_path)
+        except Exception:
+            pass
+        try:
+            out_meta['tg_response'] = res
+        except Exception:
+            pass
+        try:
+            _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:
+            pass
+
+        try:
+            if get_current_job is not None:
+                job_obj = get_current_job()
+                if job_obj is not None:
+                    job_obj.meta['tg_response'] = res
+                    job_obj.save_meta()
+        except Exception:
+            pass
+
+        return res
+
+    except Exception as e:
+        logger.exception("Error processing input_key job %s", job_id)
+        out_meta.setdefault('status', 'error')
+        out_meta.setdefault('error', str(e))
+        out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+        try:
+            _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:
+            pass
+        try:
+            _tg_send_message(None, chat_id, f"Error processing uploaded file: {e}")
+        except Exception:
+            pass
+        return {'error': str(e)}
+    finally:
+        try:
+            if tmpdir and os.path.exists(tmpdir):
+                if cleanup_input:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 # IO mapping TTL (seconds) for input/output keys stored in Redis
 IO_TTL = 7 * 24 * 3600
 
