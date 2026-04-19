@@ -216,6 +216,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception:
             logger.exception("Cache handling failed")
 
+    # If Telegram reports a file_size on the Document, check it against the configured
+    # upload limit before attempting to enqueue or download. Telegram's Bot API will
+    # reject downloads for files larger than the bot's allowed size (returns 400 "file is too big").
+    file_size = getattr(doc, 'file_size', None)
+    upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+    if file_size and upload_limit and file_size > upload_limit:
+        # Inform the user with actionable options
+        try:
+            mb_limit = upload_limit // (1024 * 1024)
+            mb_size = file_size // (1024 * 1024)
+            await msg.reply_text(
+                f"I can't download files larger than {mb_limit} MB via the Bot API. "
+                f"Your file is approximately {mb_size} MB.\n\n"
+                "Options:\n"
+                "- Upload a smaller file (under the limit).\n"
+                "- Send a public HTTPS URL to the file (I can download and process URLs).\n"
+                "- Use a user account client (Pyrogram user) which supports larger uploads.\n"
+                "If you want automatic external-hosting fallback, enable S3 fallback in the bot config."
+            )
+        except Exception:
+            logger.exception("Failed to notify user about large file")
+        return
+
     if config.REDIS_URL:
         ok = enqueue_job('process_document_job', chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
         if ok:
