@@ -232,7 +232,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             input_doc = InputFile(f_doc, filename=filename)
             chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb,
+            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
                                            caption="Here is your file with an auto-generated cover preview.")
     except Exception as e:
         logger.exception("Failed to process document")
@@ -282,7 +282,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
             chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb,
+            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
                                            caption="Here is your image with an auto-generated thumbnail.")
     except Exception as e:
         logger.exception("Failed to process photo")
