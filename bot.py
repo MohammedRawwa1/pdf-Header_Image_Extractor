@@ -23,7 +23,7 @@ from telegram.ext import (
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
 import config
 from config import OWNER_ID
-from utils.progress_tracker import progress_tracker, send_progress_update
+from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
 from utils.error_handler import (
     BotErrorHandler,
     get_error_handler,
@@ -32,6 +32,7 @@ from utils.error_handler import (
 )
 from utils.rate_limiter import TelegramAPIRateLimiter
 from utils.bigfile_pipeline import BigFilePipeline
+from utils.userbot_uploader import send_file_via_userbot
 
 # ── Logging configuration (must be before any logger usage) ──
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -82,6 +83,55 @@ def _make_progress_cb(task_id: str, loop: asyncio.AbstractEventLoop):
         except Exception:
             pass
     return _cb
+
+
+async def _send_with_upload_progress(
+    bot, chat_id: int, file_path: str, caption: str,
+    thumb_path: str | None, user_id: int, filename: str, file_size: int,
+    loop: asyncio.AbstractEventLoop,
+) -> bool:
+    """Send a file via userbot with upload progress tracking.
+
+    Creates a progress task, shows 'uploading' status with a progress bar,
+    then calls send_file_via_userbot with a progress callback that updates
+    the task in real time. On success, marks the task as completed and
+    edits the message. On failure, marks as failed and re-raises.
+
+    Returns True on success, raises on failure.
+    """
+    import uuid as _uuid
+    task_id = _uuid.uuid4().hex[:12]
+    task = progress_tracker.create_task(task_id, user_id or 0, filename, file_size)
+    task.status = "uploading"
+    task.start()
+    progress_msg_id = await send_progress_update(chat_id, bot, task)
+    _cb = _make_progress_cb(task.task_id, loop)
+
+    try:
+        success = await send_file_via_userbot(
+            chat_id=chat_id, file_path=file_path,
+            caption=caption, thumb_path=thumb_path,
+            progress_callback=_cb,
+        )
+        if success:
+            await progress_tracker.complete_task(task.task_id)
+            if progress_msg_id:
+                await send_progress_update(chat_id, bot, task, progress_msg_id)
+            logger.info("Upload complete: %s (%s)", filename, _format_size(file_size))
+            return True
+        else:
+            await progress_tracker.fail_task(task.task_id, "Userbot upload returned False")
+            if progress_msg_id:
+                await send_progress_update(chat_id, bot, task, progress_msg_id)
+            raise RuntimeError(f"Userbot upload failed for {filename}")
+    except Exception as e:
+        await progress_tracker.fail_task(task.task_id, str(e))
+        if progress_msg_id:
+            try:
+                await send_progress_update(chat_id, bot, task, progress_msg_id)
+            except Exception:
+                pass
+        raise
 
 
 async def _notify_download_failed(msg, file_size=None):
@@ -588,11 +638,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             im = Image.new('RGB', (320, 320), (240, 240, 240))
             im.save(thumb_path, 'JPEG', quality=85)
 
-        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-            input_doc = InputFile(f_doc, filename=filename)
-            chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
-                                           caption="Here is your file with an auto-generated cover preview.")
+        chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+        _dl_size = os.path.getsize(file_path)
+        _ul_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        if _dl_size > _ul_limit and _check_userbot_available():
+            await _send_with_upload_progress(
+                bot=context.bot, chat_id=chat_id, file_path=file_path,
+                caption="Here is your file with an auto-generated cover preview.",
+                thumb_path=thumb_path,
+                user_id=user_id, filename=filename, file_size=_dl_size,
+                loop=_loop,
+            )
+        else:
+            with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+                input_doc = InputFile(f_doc, filename=filename)
+                await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
+                                               caption="Here is your file with an auto-generated cover preview.")
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
@@ -620,12 +681,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         im = Image.new('RGB', (320, 320), (240, 240, 240))
                         im.save(thumb_path, 'JPEG', quality=85)
 
-                    with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                        input_doc = InputFile(f_doc, filename=filename)
-                        await context.bot.send_document(
-                            chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
-                            caption="Here is your file (downloaded via userbot) with an auto-generated cover preview."
+                    chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat.id
+                    _fb_size = os.path.getsize(file_path)
+                    _fb_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+                    if _fb_size > _fb_limit and _check_userbot_available():
+                        await _send_with_upload_progress(
+                            bot=context.bot, chat_id=chat_id, file_path=file_path,
+                            caption="Here is your file (downloaded via userbot) with an auto-generated cover preview.",
+                            thumb_path=thumb_path,
+                            user_id=user_id, filename=filename, file_size=_fb_size,
+                            loop=_loop,
                         )
+                    else:
+                        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+                            input_doc = InputFile(f_doc, filename=filename)
+                            await context.bot.send_document(
+                                chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
+                                caption="Here is your file (downloaded via userbot) with an auto-generated cover preview."
+                            )
                     return
             except Exception as ub_err:
                 logger.exception("Userbot download fallback also failed: %s", ub_err)
@@ -702,7 +775,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     task = None
     _dl_success = False
     _loop = asyncio.get_running_loop()
-    _userbot_ok = _check_userbot_available()
     try:
         file_path = os.path.join(tmpdir, filename)
 
@@ -710,7 +782,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         photo_size = getattr(photo, 'file_size', None) or 0
         upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
 
-        if photo_size > upload_limit and _userbot_ok:
+        if photo_size > upload_limit and _check_userbot_available():
             # ── Userbot download path for large photos ──
             _dl_result = await _userbot_download_fallback(
                 msg, file_path, filename, "image/jpeg",
@@ -744,18 +816,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         create_thumbnail_from_image(file_path, thumb_path)            # send original image back as document to preserve original bytes, attach thumbnail
-        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-            input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
-            chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-            await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
-                                           caption="Here is your image with an auto-generated thumbnail.")
+        chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+        _ph_size = os.path.getsize(file_path)
+        _ph_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        if _ph_size > _ph_limit and _check_userbot_available():
+            await _send_with_upload_progress(
+                bot=context.bot, chat_id=chat_id, file_path=file_path,
+                caption="Here is your image with an auto-generated thumbnail.",
+                thumb_path=thumb_path,
+                user_id=user_id, filename=filename, file_size=_ph_size,
+                loop=_loop,
+            )
+        else:
+            with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+                input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
+                await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
+                                               caption="Here is your image with an auto-generated thumbnail.")
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
                 await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
     except Exception as e:
         # If Bot API download failed but userbot is available, try fallback
-        if not _dl_success and _userbot_ok:
+        if not _dl_success and _check_userbot_available():
             logger.info("Bot API download failed for photo, falling back to userbot")
             try:
                 _dl_result = await _userbot_download_fallback(
@@ -767,13 +850,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if _dl_result == "local":
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
                     create_thumbnail_from_image(file_path, thumb_path)
-                    with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                        input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
-                        await context.bot.send_document(
-                            chat_id=msg.chat.id,
-                            document=input_doc, thumbnail=f_thumb,
-                            caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail."
+                    _ph_fb_size = os.path.getsize(file_path)
+                    _ph_fb_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+                    if _ph_fb_size > _ph_fb_limit and _check_userbot_available():
+                        await _send_with_upload_progress(
+                            bot=context.bot, chat_id=msg.chat.id, file_path=file_path,
+                            caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail.",
+                            thumb_path=thumb_path,
+                            user_id=user_id, filename=filename, file_size=_ph_fb_size,
+                            loop=_loop,
                         )
+                    else:
+                        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+                            input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
+                            await context.bot.send_document(
+                                chat_id=msg.chat.id,
+                                document=input_doc, thumbnail=f_thumb,
+                                caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail."
+                            )
                     return
             except Exception as ub_err:
                 logger.exception("Userbot download fallback for photo also failed: %s", ub_err)
@@ -1820,6 +1914,8 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
     if not urls:
         return
 
+    _loop = asyncio.get_running_loop()
+
     for url in urls:
         url = url.rstrip('.,;!?)]')
         # quick check by extension
@@ -1843,10 +1939,23 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                 await download_url_to_file(url, file_path)
                 thumb_path = os.path.join(tmpdir, "thumb.jpg")
                 create_thumbnail_from_pdf(file_path, thumb_path)
-                with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-                    input_doc = InputFile(f_doc, filename=base)
-                    chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
+                _url_file_size = os.path.getsize(file_path)
+                _url_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+                if _url_file_size > _url_limit and _check_userbot_available():
+                    await _send_with_upload_progress(
+                        bot=context.bot, chat_id=msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id,
+                        file_path=file_path,
+                        caption="Generated thumbnail from URL",
+                        thumb_path=thumb_path,
+                        user_id=getattr(update.effective_user, "id", None),
+                        filename=base, file_size=_url_file_size,
+                        loop=_loop,
+                    )
+                else:
+                    with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+                        input_doc = InputFile(f_doc, filename=base)
+                        chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
+                        await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
             except Exception as e:
                 error_info = await handle_bot_error(e, "URL PDF Processing", update=update)
                 try:

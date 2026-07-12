@@ -39,9 +39,14 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
 
 async def _send_with_telethon(
     chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    thumb_path: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Send a file using Telethon."""
+    """Send a file using Telethon.
+
+    Args:
+        thumb_path: Optional path to a thumbnail image to attach.
+    """
     if TelegramClient is None:
         return False
 
@@ -58,7 +63,9 @@ async def _send_with_telethon(
             raise RuntimeError("Telethon phone prompt unexpectedly triggered")
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
-        kwargs = {"file": file_path, "caption": caption}
+        kwargs = {"file": file_path, "caption": caption or ""}
+        if thumb_path and os.path.exists(thumb_path):
+            kwargs["thumb"] = thumb_path
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
         await client.send_file(target, **kwargs)
@@ -76,9 +83,14 @@ async def _send_with_telethon(
 
 async def _send_with_pyrogram(
     chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    thumb_path: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Send a file using Pyrogram (session string fallback)."""
+    """Send a file using Pyrogram (session string fallback).
+
+    Args:
+        thumb_path: Optional path to a thumbnail image to attach.
+    """
     if PyrogramClient is None:
         return False
 
@@ -93,6 +105,8 @@ async def _send_with_pyrogram(
         await client.start()
         target = await _normalize_target(chat_id)
         kwargs = {"caption": caption or ""}
+        if thumb_path and os.path.exists(thumb_path):
+            kwargs["thumb"] = thumb_path
         if progress_callback is not None:
             kwargs["progress"] = progress_callback
 
@@ -111,12 +125,16 @@ async def _send_with_pyrogram(
 
 async def send_file_via_userbot(
     chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
+    thumb_path: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
     """Send a file using a user account.
 
     Tries Telethon first (when a session is available), then falls back to
     Pyrogram if a session string is configured.
+
+    Args:
+        thumb_path: Optional path to a thumbnail image to attach.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -130,7 +148,7 @@ async def send_file_via_userbot(
 
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            result = await _send_with_telethon(chat_id, file_path, caption, progress_callback=progress_callback)
+            result = await _send_with_telethon(chat_id, file_path, caption, thumb_path, progress_callback=progress_callback)
             if result:
                 return True
             logger.info("userbot: Telethon send failed; trying Pyrogram fallback")
@@ -140,7 +158,7 @@ async def send_file_via_userbot(
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
 
     if PyrogramClient is not None:
-        result = await _send_with_pyrogram(chat_id, file_path, caption, progress_callback=progress_callback)
+        result = await _send_with_pyrogram(chat_id, file_path, caption, thumb_path, progress_callback=progress_callback)
         if result:
             return True
 
