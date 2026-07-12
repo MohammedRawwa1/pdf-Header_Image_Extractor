@@ -544,7 +544,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     _loop = asyncio.get_running_loop()
     try:
         file_path = os.path.join(tmpdir, filename)
-        file = await context.bot.get_file(doc.file_id)
 
         if use_userbot_download:
             # ── Big file download: forward source → relay → direct → pipeline ──
@@ -560,6 +559,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
         else:
             # ── Normal Bot API download ──
+            file = await context.bot.get_file(doc.file_id)
             if file_size and file_size > 1024 * 1024:  # only show progress for files >1MB
                 import uuid as _uuid
                 task_id = _uuid.uuid4().hex[:12]
@@ -601,8 +601,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if progress_msg_id:
                 await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
     except Exception as e:
-        # If Bot API download failed but userbot is available, try fallback
-        if not use_userbot_download and _check_userbot_available() and not _dl_success:
+        # Try userbot fallback if Bot API download failed
+        if not _dl_success and _check_userbot_available():
             logger.info("Bot API download failed, falling back to userbot download for %s", filename)
             try:
                 _dl_result = await _userbot_download_fallback(
@@ -708,7 +708,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _userbot_ok = _check_userbot_available()
     try:
         file_path = os.path.join(tmpdir, filename)
-        file = await context.bot.get_file(photo.file_id)
 
         # Check if photo is too large for Bot API
         photo_size = getattr(photo, 'file_size', None) or 0
@@ -728,6 +727,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
         else:
             # ── Normal Bot API download ──
+            file = await context.bot.get_file(photo.file_id)
             if photo_size > 1024 * 1024:
                 import uuid as _uuid
                 task_id = _uuid.uuid4().hex[:12]
