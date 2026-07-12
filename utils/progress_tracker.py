@@ -1,13 +1,40 @@
 # utils/progress_tracker.py
-"""Progress tracker for PDF download/upload operations with visual progress bar."""
+"""Progress tracker for PDF download/upload operations with visual progress bar.
+
+Now includes Redis persistence so progress survives process restarts,
+and MongoDB backup for durable job history.
+"""
 
 import asyncio
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+PREFIX_PROGRESS = "progress:"
+
+
+_sync_redis_client = None
+
+
+def _get_sync_redis():
+    """Return a cached sync Redis client (best-effort)."""
+    global _sync_redis_client
+    if _sync_redis_client is not None:
+        return _sync_redis_client
+    try:
+        import redis
+        url = os.getenv("REDIS_URL", "")
+        if not url:
+            return None
+        _sync_redis_client = redis.from_url(url, decode_responses=True)
+        return _sync_redis_client
+    except Exception:
+        return None
 
 
 @dataclass
@@ -79,37 +106,83 @@ class TaskProgress:
 
 
 class ProgressTracker:
-    """Manage multiple task progress trackers."""
+    """Manage multiple task progress trackers with Redis persistence."""
 
     def __init__(self):
         self.tasks: Dict[str, TaskProgress] = {}
         self.callbacks: Dict[str, Callable] = {}
 
+    def _persist_to_redis(self, task: TaskProgress):
+        """Best-effort write progress to Redis for survival across restarts."""
+        try:
+            r = _get_sync_redis()
+            if r is None:
+                return
+            key = f"{PREFIX_PROGRESS}{task.task_id}"
+            data = json.dumps(task.to_dict(), default=str)
+            # Active tasks get 1h TTL, completed/failed get 5min
+            ttl = 3600 if task.status not in ("completed", "failed") else 300
+            r.setex(key, ttl, data)
+        except Exception:
+            pass
+
     def create_task(self, task_id: str, user_id: int, file_name: str, total_size: int) -> TaskProgress:
         task = TaskProgress(task_id=task_id, user_id=user_id, file_name=file_name, total_size=total_size)
         self.tasks[task_id] = task
+        self._persist_to_redis(task)
         logger.info("Created task tracker: %s", task_id)
         return task
 
     def get_task(self, task_id: str) -> Optional[TaskProgress]:
-        return self.tasks.get(task_id)
+        # Try in-memory first
+        task = self.tasks.get(task_id)
+        if task:
+            return task
+        # Fall back to Redis
+        try:
+            r = _get_sync_redis()
+            if r:
+                raw = r.get(f"{PREFIX_PROGRESS}{task_id}")
+                if raw:
+                    data = json.loads(raw)
+                    task = TaskProgress(
+                        task_id=data["task_id"],
+                        user_id=data["user_id"],
+                        file_name=data["file_name"],
+                        total_size=data["total_size"],
+                        processed_size=data.get("processed_size", 0),
+                        status=data.get("status", "pending"),
+                        start_time=data.get("start_time"),
+                        end_time=data.get("end_time"),
+                        error_message=data.get("error_message"),
+                    )
+                    self.tasks[task_id] = task
+                    return task
+        except Exception:
+            pass
+        return None
 
     async def update_task_progress(self, task_id: str, processed_size: int):
         task = self.tasks.get(task_id)
         if task:
             task.update_progress(processed_size)
+            self._persist_to_redis(task)
             await self._notify_callbacks(task_id, task)
 
     def start_task(self, task_id: str):
         task = self.tasks.get(task_id)
         if task:
             task.start()
+            self._persist_to_redis(task)
             logger.info("Started task: %s", task_id)
 
     async def complete_task(self, task_id: str):
         task = self.tasks.get(task_id)
         if task:
             task.complete()
+            self._persist_to_redis(task)
+            # Save to MongoDB for durable history
+            await self._save_to_mongodb(task)
             logger.info("Completed task: %s", task_id)
             await self._notify_callbacks(task_id, task)
 
@@ -117,12 +190,39 @@ class ProgressTracker:
         task = self.tasks.get(task_id)
         if task:
             task.fail(error_message)
+            self._persist_to_redis(task)
+            # Save to MongoDB for durable history
+            await self._save_to_mongodb(task)
             logger.error("Task failed: %s - %s", task_id, error_message)
             await self._notify_callbacks(task_id, task)
+
+    async def _save_to_mongodb(self, task: TaskProgress):
+        """Best-effort save completed/failed task to MongoDB for history."""
+        try:
+            from utils.db import save_job_metadata
+            await save_job_metadata(task.task_id, {
+                "type": "progress",
+                "user_id": task.user_id,
+                "file_name": task.file_name,
+                "total_size": task.total_size,
+                "processed_size": task.processed_size,
+                "status": task.status,
+                "elapsed_time": task.elapsed_time,
+                "error_message": task.error_message,
+            })
+        except Exception:
+            pass
 
     def remove_task(self, task_id: str):
         if task_id in self.tasks:
             del self.tasks[task_id]
+            # Clean up Redis
+            try:
+                r = _get_sync_redis()
+                if r:
+                    r.delete(f"{PREFIX_PROGRESS}{task_id}")
+            except Exception:
+                pass
             logger.info("Removed task: %s", task_id)
 
     def register_callback(self, task_id: str, callback: Callable):
@@ -190,30 +290,30 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
     """Send or update progress message with visual progress bar."""
     try:
         filled = int(task.progress_percentage / 10)
-        bar = "🟩" * filled + "⬜" * (10 - filled)
+        bar = "\U0001f7e9" * filled + "\u2b1c" * (10 - filled)
 
         processed = _format_size(task.processed_size)
         total = _format_size(task.total_size)
 
         status_emoji = {
-            "pending": "⏳",
-            "downloading": "📥",
-            "processing": "⚙️",
-            "uploading": "📤",
-            "completed": "✅",
-            "failed": "❌",
-        }.get(task.status, "❓")
+            "pending": "\u23f3",
+            "downloading": "\U0001f4e5",
+            "processing": "\u2699\ufe0f",
+            "uploading": "\U0001f4e4",
+            "completed": "\u2705",
+            "failed": "\u274c",
+        }.get(task.status, "\u2753")
 
         message_text = (
-            f"📊 **PDF Processing Progress**\n\n"
-            f"📁 File: `{task.file_name}`\n"
-            f"📏 Size: {processed} / {total}\n"
-            f"📈 Progress: {task.progress_percentage:.1f}%\n"
+            f"\U0001f4ca **PDF Processing Progress**\n\n"
+            f"\U0001f4c1 File: `{task.file_name}`\n"
+            f"\U0001f4cf Size: {processed} / {total}\n"
+            f"\U0001f4c8 Progress: {task.progress_percentage:.1f}%\n"
             f"{bar}\n\n"
-            f"⏱️ Elapsed: {_format_time(task.elapsed_time)}\n"
-            f"⏳ Remaining: {_format_time(task.estimated_time_remaining)}\n"
+            f"\u23f1\ufe0f Elapsed: {_format_time(task.elapsed_time)}\n"
+            f"\u23f3 Remaining: {_format_time(task.estimated_time_remaining)}\n"
             f"{status_emoji} Status: {task.status.title()}\n\n"
-            f"🆔 Task: `{task.task_id[:8]}`"
+            f"\U0001f194 Task: `{task.task_id[:8]}`"
         )
 
         if message_id:

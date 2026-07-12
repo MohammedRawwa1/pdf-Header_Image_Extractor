@@ -28,6 +28,65 @@ import config
 from config import OWNER_ID
 from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
 
+# ── User session tracking (Redis + MongoDB) ──────────────────
+# Cached imports for _track_user_session (avoids re-importing on every call)
+_cache_get_cache = None
+_db_save_user_session = None
+
+
+def _init_session_imports():
+    global _cache_get_cache, _db_save_user_session
+    try:
+        from utils.cache import get_cache as _gc
+        _cache_get_cache = _gc
+    except Exception:
+        pass
+    try:
+        from utils.db import save_user_session as _ss
+        _db_save_user_session = _ss
+    except Exception:
+        pass
+
+
+_init_session_imports()
+
+
+async def _track_user_session(update: Update, action: str = "message"):
+    """Best-effort record user session data in Redis and MongoDB."""
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        uid = user.id
+        chat = update.effective_chat
+        session_data = {
+            "user_id": uid,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "chat_id": chat.id if chat else None,
+            "chat_type": chat.type if chat else "",
+            "last_action": action,
+            "last_seen": time.time(),
+            "is_owner": config.is_owner(uid),
+            "is_admin": config.is_admin_user(uid),
+        }
+        # Redis cache (fast lookups)
+        if _cache_get_cache is not None:
+            try:
+                cache = await _cache_get_cache()
+                await cache.cache_user_session(str(uid), session_data)
+            except Exception:
+                pass
+        # MongoDB (durable history)
+        if _db_save_user_session is not None:
+            try:
+                await _db_save_user_session(uid, session_data)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 # Optional RQ enqueue helper (import only when needed)
 def enqueue_job(func_name: str, *args, **kwargs):
     try:
@@ -160,6 +219,7 @@ def is_batch_active(chat_id: int, user_id: int) -> bool:
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "document")
     msg = update.effective_message
     if not msg or not msg.document:
         return
@@ -226,17 +286,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             task.start()
             task.status = "downloading"
 
-            # Download with progress callback
-            downloaded = 0
-            async def _progress_cb(current, total):
-                nonlocal downloaded
-                downloaded = current
-                task.update_progress(current)
-                # Throttle updates to max once per 2 seconds
-                if task._last_update is None or time.time() - task._last_update >= 2.0:
-                    task._last_update = time.time()
-                    await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
-            file._file_size = file_size  # hint for progress
             await file.download_to_drive(custom_path=file_path, read_timeout=300, write_timeout=300)
             task.update_progress(file_size or os.path.getsize(file_path))
             if progress_msg_id:
@@ -286,6 +335,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "photo")
     msg = update.effective_message
     if not msg or not msg.photo:
         return
@@ -368,12 +418,14 @@ application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/start")
     await update.effective_message.reply_text(
         "Hello! Send me a PDF or image and I'll return a thumbnail (PDF first page as cover)."
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/help")
     text = (
         "/start - start\n"
         "/help - this help\n"
@@ -386,11 +438,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/status")
     # Minimal, non-sensitive status reply
     await update.effective_message.reply_text("active")
 
 
 async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/setwebhook")
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
@@ -412,6 +466,7 @@ async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/delwebhook")
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
@@ -426,6 +481,7 @@ async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/setcommands")
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
@@ -456,6 +512,7 @@ application.add_handler(CommandHandler("setcommands", cmd_setcommands))
 
 
 async def cmd_startbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/startbatch")
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -467,6 +524,7 @@ async def cmd_startbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/endbatch")
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -501,6 +559,7 @@ async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_cancelbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "/cancelbatch")
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -534,6 +593,18 @@ async def on_startup() -> None:
             pass
     # Initialize application so handlers, bot, and context are ready
     await application.initialize()
+
+    # ── Log cached user sessions on startup ──
+    try:
+        from utils.cache import get_cache
+        cache = await get_cache()
+        # Log how many user sessions are cached in Redis
+        client = await cache._get_client()
+        if client:
+            keys = await client.keys("cache:user:*")
+            logger.info("Startup: %d user sessions loaded from Redis cache", len(keys) if keys else 0)
+    except Exception:
+        logger.debug("Could not enumerate cached user sessions on startup")
 
     # Optionally start an external worker subprocess to avoid running a separate
     # paid worker service while allowing the worker to install signal handlers.
@@ -648,6 +719,12 @@ async def on_shutdown() -> None:
                 await _worker_task
             except asyncio.CancelledError:
                 pass
+        # Close MongoDB connections
+        try:
+            from utils.db import close_db
+            await close_db()
+        except Exception:
+            pass
         # CRITICAL: Do NOT delete the webhook on shutdown.
         # On Render free tier, the webhook must persist so Telegram can
         # wake the service back up on the next incoming message.
@@ -687,6 +764,7 @@ async def download_url_to_file(url: str, dest_path: str) -> None:
 
 
 async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _track_user_session(update, "url")
     msg = update.effective_message
     if not msg or not msg.text:
         return
@@ -720,7 +798,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                 with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                     input_doc = InputFile(f_doc, filename=base)
                     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
+                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
             except Exception as e:
                 logger.exception("Failed to process PDF URL")
                 try:
@@ -750,7 +828,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                                 with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                                     input_doc = InputFile(f_doc, filename=base)
                                     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-                                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumb=f_thumb, caption=f"Generated thumbnail from URL")
+                                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
                             except Exception as e:
                                 logger.exception("Failed to process PDF URL")
                                 try:
@@ -829,30 +907,10 @@ async def delete_webhook(request: Request, admin_token: str | None = Header(defa
 
 @app.post('/admin/recache_thumbs')
 async def admin_recache_thumbs(request: Request, admin_token: str | None = Header(default=None)) -> dict:
+    """Thumbnail recache endpoint — disabled. Thumbnail caching was removed."""
     if not admin_token or not _verify_admin_header(admin_token):
         raise HTTPException(status_code=403, detail='Invalid admin token')
-    body = await request.json()
-    limit = body.get('limit') if isinstance(body, dict) else None
-    dry_run = bool(body.get('dry_run')) if isinstance(body, dict) else False
-    notify_chat = body.get('notify_chat') if isinstance(body, dict) else None
-
-    # try to enqueue via RQ if possible
-    try:
-        ok = enqueue_job('recache_thumbs_job', notify_chat, limit, dry_run)
-        if ok:
-            return {'ok': True, 'queued': True}
-    except Exception:
-        logger.exception('Failed to enqueue recache job')
-
-    # fallback: run inline in background executor
-    try:
-        import tasks
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, tasks.recache_thumbs_job, notify_chat, limit, dry_run)
-        return {'ok': True, 'queued': False, 'result': res}
-    except Exception as e:
-        logger.exception('Failed running recache job inline')
-        raise HTTPException(status_code=500, detail=str(e))
+    return {'ok': False, 'error': 'Thumbnail caching is disabled. This endpoint is no-op.'}
 
 
 @app.post('/admin/purge_s3')

@@ -7,6 +7,7 @@ import requests
 import time
 import logging
 import json
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -431,22 +432,77 @@ def _get_redis_client():
         return None
 
 
-def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
-    """Set input and/or output JSON blobs in Redis under `io:in:{id}` and `io:out:{id}`."""
-    r = _get_redis_client()
-    if not r:
-        return False
+_pymongo_client = None
+_pymongo_db = None
+
+
+def _get_mongo_db():
+    """Return a cached pymongo database (best-effort, for RQ worker sync path).
+
+    Uses centralized URI and db_name from utils.db to stay consistent.
+    """
+    global _pymongo_client, _pymongo_db
+    if _pymongo_db is not None:
+        return _pymongo_db
     try:
-        if ttl is None:
-            ttl = IO_TTL
-        if input_meta is not None:
-            r.set(f"io:in:{unique_id}", json.dumps(input_meta), ex=ttl)
-        if output_meta is not None:
-            r.set(f"io:out:{unique_id}", json.dumps(output_meta), ex=ttl)
-        return True
+        from utils.db import get_mongo_uri, get_db_name
+        mongo_uri = get_mongo_uri()
+        if not mongo_uri:
+            return None
+        import pymongo
+        _pymongo_client = pymongo.MongoClient(
+            mongo_uri, serverSelectionTimeoutMS=3000
+        )
+        _pymongo_db = _pymongo_client[get_db_name()]
+        return _pymongo_db
+    except Exception:
+        _pymongo_client = None
+        _pymongo_db = None
+        return None
+
+
+def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
+    """Set input and/or output JSON blobs in Redis under `io:in:{id}` and `io:out:{id}`.
+
+    Also writes a best-effort backup to MongoDB (sync) so
+    metadata survives Redis key expiry or restarts.
+    """
+    r = _get_redis_client()
+    redis_ok = False
+    try:
+        if r:
+            if ttl is None:
+                ttl = IO_TTL
+            if input_meta is not None:
+                r.set(f"io:in:{unique_id}", json.dumps(input_meta), ex=ttl)
+            if output_meta is not None:
+                r.set(f"io:out:{unique_id}", json.dumps(output_meta), ex=ttl)
+            redis_ok = True
     except Exception:
         logger.exception("Failed setting IO keys for %s", unique_id)
-        return False
+
+    # Best-effort MongoDB backup (sync, cached client)
+    try:
+        mongo_meta = {}
+        if input_meta is not None:
+            mongo_meta["io_in"] = input_meta
+        if output_meta is not None:
+            mongo_meta["io_out"] = output_meta
+        if mongo_meta:
+            mongo_meta["unique_id"] = unique_id
+            mongo_meta["type"] = "io_metadata"
+            mongo_meta["created_at"] = time.time()
+            mongo_db = _get_mongo_db()
+            if mongo_db is not None:
+                mongo_db.job_metadata.update_one(
+                    {"job_id": f"io:{unique_id}"},
+                    {"$set": mongo_meta},
+                    upsert=True,
+                )
+    except Exception:
+        pass
+
+    return redis_ok
 
 
 def process_document_job(chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
@@ -865,4 +921,61 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
         return {"error": str(e)}
 
 
-# recache_thumbs_job removed (thumbnail caching disabled)
+
+
+def process_document_batch_job(chat_id: int, items: list) -> None:
+    """RQ job: process a batch of forwarded document items in order.
+
+    Each item dict is expected to have: file_id, filename, mime.
+    """
+    results = []
+    for item in items:
+        file_id = item.get('file_id')
+        filename = item.get('filename', 'unknown')
+        mime = item.get('mime', '')
+        if not file_id:
+            logger.warning('Skipping batch item with no file_id: %s', item)
+            continue
+        try:
+            res = process_document_job(chat_id, file_id, filename, mime)
+            results.append(res)
+        except Exception:
+            logger.exception('Failed processing batch item %s', filename)
+            results.append({'error': f'failed: {filename}'})
+    _tg_send_message(None, chat_id, f'Batch processing complete: {len(results)} items processed.')
+    return results
+
+
+def process_url_job(chat_id: int, url: str, filename: str) -> None:
+    """RQ job: download a PDF from URL, create thumbnail, and send back."""
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None) or None)
+        file_path = os.path.join(tmpdir, filename)
+
+        # download
+        with requests.get(url, stream=True, allow_redirects=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(file_path, 'wb') as fh:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+
+        thumb_path = os.path.join(tmpdir, 'thumb.jpg')
+        if filename.lower().endswith('.pdf'):
+            create_thumbnail_from_pdf(file_path, thumb_path)
+        else:
+            create_thumbnail_from_image(file_path, thumb_path)
+
+        with open(file_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
+            _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
+                             caption='Here is your file with an auto-generated cover preview.')
+    except Exception as e:
+        logger.exception('Failed processing URL job: %s', url)
+        try:
+            _tg_send_message(None, chat_id, f'Error processing URL: {e}')
+        except Exception:
+            pass
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)

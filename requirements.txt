@@ -13,4 +13,4 @@ boto3>=1.26.0
 # Uncomment one or both for userbot fallback:
 # telethon>=1.28.0
 # pyrogram>=2.0.0
-aioboto3>=12.0.0
+aioboto3>=12.0.0motor>=3.3.0
