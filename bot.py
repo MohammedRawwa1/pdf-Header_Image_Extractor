@@ -123,10 +123,19 @@ async def _userbot_download_fallback(
     user_id,
     chat_id,
     loop,
+    forward_info: dict | None = None,
 ):
-    """Try relay group -> direct chat -> BigFilePipeline for userbot download.
+    """Try relay group -> forward source -> direct chat -> BigFilePipeline for userbot download.
+
+    Follows the reference pattern from media_conersion_bot: tries the original
+    forward source (when available) before relay/direct chat, since the userbot
+    may have access to the original chat.
 
     Creates a progress task and tries each download method in sequence.
+
+    Args:
+        forward_info: Dict with keys 'chat_id', 'message_id', 'user_id' from forwarded messages.
+                      When available, the userbot tries the original forward source first.
 
     Returns:
         "local"    -> file downloaded to file_path, caller should thumbnail + send
@@ -145,30 +154,50 @@ async def _userbot_download_fallback(
 
     dl_ok = False
 
-    # 1) Relay group: forward to relay chat -> download via userbot
-    relay_chat = config.RELAY_CHAT_ID
-    if relay_chat:
-        try:
-            relay_chat_id = int(relay_chat)
-            _forwarded = await msg.get_bot().forward_message(
-                chat_id=relay_chat_id,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-            )
-            if _forwarded and getattr(_forwarded, "message_id", None):
-                relay_msg_id = _forwarded.message_id
+    # 0) Forward source (original chat, if available and different from current chat)
+    if forward_info:
+        fwd_chat_id = forward_info.get("chat_id")
+        fwd_msg_id = forward_info.get("message_id")
+        if fwd_chat_id and fwd_msg_id and fwd_chat_id != msg.chat.id:
+            try:
                 logger.info(
-                    "relay: forwarded %s/%s to %s/%s",
-                    msg.chat.id, msg.message_id, relay_chat_id, relay_msg_id,
+                    "forward source: trying userbot download from %s/%s",
+                    fwd_chat_id, fwd_msg_id,
                 )
                 dl_ok = await download_forward_via_userbot(
-                    chat_id=relay_chat_id,
-                    message_id=relay_msg_id,
+                    chat_id=fwd_chat_id,
+                    message_id=fwd_msg_id,
                     dest_path=file_path,
                     progress_callback=_cb,
                 )
-        except Exception as relay_err:
-            logger.warning("relay: forward or download failed: %s", relay_err)
+            except Exception as fwd_err:
+                logger.warning("forward source download failed: %s", fwd_err)
+
+    # 1) Relay group: forward to relay chat -> download via userbot
+    if not dl_ok:
+        relay_chat = config.RELAY_CHAT_ID
+        if relay_chat:
+            try:
+                relay_chat_id = int(relay_chat)
+                _forwarded = await msg.get_bot().forward_message(
+                    chat_id=relay_chat_id,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                )
+                if _forwarded and getattr(_forwarded, "message_id", None):
+                    relay_msg_id = _forwarded.message_id
+                    logger.info(
+                        "relay: forwarded %s/%s to %s/%s",
+                        msg.chat.id, msg.message_id, relay_chat_id, relay_msg_id,
+                    )
+                    dl_ok = await download_forward_via_userbot(
+                        chat_id=relay_chat_id,
+                        message_id=relay_msg_id,
+                        dest_path=file_path,
+                        progress_callback=_cb,
+                    )
+            except Exception as relay_err:
+                logger.warning("relay: forward or download failed: %s", relay_err)
 
     # 2) Direct chat download (group chat where userbot is a member)
     if not dl_ok:
@@ -442,7 +471,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
-    # Thumbnail caching disabled
+    # ── Capture forward metadata (for userbot fallback) ──────────────
+    forward_info = None
+    try:
+        fch = getattr(msg, "forward_from_chat", None)
+        f_msg_id = getattr(msg, "forward_from_message_id", None)
+        f_user = getattr(msg, "forward_from", None)
+        if fch or f_msg_id or f_user:
+            forward_info = {}
+            if fch:
+                forward_info["chat_id"] = fch.id
+            if f_msg_id:
+                forward_info["message_id"] = f_msg_id
+            if f_user:
+                forward_info["user_id"] = f_user.id
+    except Exception:
+        pass
 
     # If Telegram reports a file_size on the Document, check it against the configured
     # upload limit before attempting to enqueue or download. Telegram's Bot API will
@@ -477,11 +521,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', chat_id, doc.file_id, filename, mime, getattr(doc, 'file_unique_id', None))
-        if ok:
-            await msg.reply_text("Queued your file for background processing; I'll send the result when ready.")
-            return
-        # fall through to inline processing on enqueue failure
+        # When file is too large (>50MB) and userbot is available, route through
+        # userbot/BigFilePipeline instead. process_document_job uses the Bot API
+        # (getFile) which cannot handle files >50MB and will fail with "file is too big".
+        if not use_userbot_download:
+            # Pass message_id + forward_info so the worker has context for userbot fallback
+            ok = enqueue_job(
+                'process_document_job',
+                chat_id, doc.file_id, filename, mime,
+                getattr(doc, 'file_unique_id', None),
+                msg.message_id, forward_info,
+            )
+            if ok:
+                await msg.reply_text("Queued your file for background processing; I'll send the result when ready.")
+                return
+            # fall through to inline processing on enqueue failure
 
     tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
     progress_msg_id = None
@@ -493,11 +547,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file = await context.bot.get_file(doc.file_id)
 
         if use_userbot_download:
-            # ── Big file download: relay group → direct chat → pipeline ──
+            # ── Big file download: forward source → relay → direct → pipeline ──
             _dl_result = await _userbot_download_fallback(
                 msg, file_path, filename, mime,
                 file_size or 0, getattr(doc, 'file_unique_id', None),
                 user_id, chat_id, _loop,
+                forward_info=forward_info,
             )
             if _dl_result == "pipeline":
                 return
@@ -554,6 +609,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     msg, file_path, filename, mime,
                     file_size or 0, getattr(doc, 'file_unique_id', None),
                     user_id, chat_id, _loop,
+                    forward_info=forward_info,
                 )
                 if _dl_result == "local":
                     # Retry thumbnail + send
@@ -614,10 +670,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(f"Added forwarded photo to batch: {filename}")
         return
 
+    # ── Capture forward metadata (for userbot fallback) ──────────────
+    photo_forward_info = None
+    try:
+        fch = getattr(msg, "forward_from_chat", None)
+        f_msg_id = getattr(msg, "forward_from_message_id", None)
+        f_user = getattr(msg, "forward_from", None)
+        if fch or f_msg_id or f_user:
+            photo_forward_info = {}
+            if fch:
+                photo_forward_info["chat_id"] = fch.id
+            if f_msg_id:
+                photo_forward_info["message_id"] = f_msg_id
+            if f_user:
+                photo_forward_info["user_id"] = f_user.id
+    except Exception:
+        pass
+
     # Thumbnail caching disabled
 
     if config.REDIS_URL:
-        ok = enqueue_job('process_document_job', chat_id, photo.file_id, filename, 'image/jpeg', getattr(photo, 'file_unique_id', None))
+        ok = enqueue_job(
+            'process_document_job',
+            chat_id, photo.file_id, filename, 'image/jpeg',
+            getattr(photo, 'file_unique_id', None),
+            msg.message_id, photo_forward_info,
+        )
         if ok:
             await msg.reply_text("Queued your photo for background processing; I'll send the result when ready.")
             return
@@ -642,6 +720,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 msg, file_path, filename, "image/jpeg",
                 photo_size, getattr(photo, 'file_unique_id', None),
                 user_id, chat_id, _loop,
+                forward_info=photo_forward_info,
             )
             if _dl_result == "pipeline":
                 return
@@ -686,6 +765,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     msg, file_path, filename, "image/jpeg",
                     photo_size or 0, getattr(photo, 'file_unique_id', None),
                     user_id, chat_id, _loop,
+                    forward_info=photo_forward_info,
                 )
                 if _dl_result == "local":
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
@@ -1450,12 +1530,15 @@ app = FastAPI()
 # Background tasks references for graceful shutdown
 _keep_alive_task = None
 _worker_task = None
+_worker_proc = None       # subprocess.Popen handle for the RQ worker
+_cleanup_task = None
+_longpoll_task = None
 _shutdown_event = asyncio.Event()
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global _keep_alive_task, _worker_task
+    global _keep_alive_task, _worker_task, _worker_proc, _cleanup_task, _longpoll_task
     # Ensure storage directories exist
     for d in (config.STORAGE_PATH, config.INPUT_PATH, config.OUTPUT_PATH, config.TEMP_PATH, config.THUMBNAIL_PATH):
         try:
@@ -1469,40 +1552,102 @@ async def on_startup() -> None:
     try:
         from utils.cache import get_cache
         cache = await get_cache()
-        # Log how many user sessions are cached in Redis
-        client = await cache._get_client()
-        if client:
-            keys = await client.keys("cache:user:*")
-            logger.info("Startup: %d user sessions loaded from Redis cache", len(keys) if keys else 0)
+        if cache:
+            client = await cache._get_client()
+            if client:
+                keys = await client.keys("cache:user:*")
+                logger.info("Startup: %d user sessions loaded from Redis cache", len(keys) if keys else 0)
     except Exception:
         logger.debug("Could not enumerate cached user sessions on startup")
 
-    # Optionally start an external worker subprocess to avoid running a separate
-    # paid worker service while allowing the worker to install signal handlers.
-    # Enable this by setting the environment variable RUN_WORKER_IN_PROC=true
-    try:
-        if os.getenv("RUN_WORKER_IN_PROC", "false").lower() in ("1", "true", "yes"):
-            try:
-                import sys
-                import subprocess
-                worker_path = os.path.join(os.getcwd(), "worker.py")
-                # Start worker as a separate process so it can register signal handlers
-                proc = subprocess.Popen([sys.executable, worker_path], env=os.environ.copy(), close_fds=True)
-                logger.info("Started worker subprocess pid=%s", proc.pid)
-            except Exception:
-                logger.exception("Failed to start worker subprocess")
-    except Exception:
-        logger.exception("Error while attempting to start worker subprocess")
+    # ── Background worker subprocess (with auto-restart supervision) ──
+    _worker_proc = None
+    if os.getenv("RUN_WORKER_IN_PROC", "false").lower() in ("1", "true", "yes"):
+        async def _worker_supervisor():
+            """Monitor the RQ worker subprocess and restart it if it crashes."""
+            import sys as _sys
+            import subprocess as _sub
+            worker_path = os.path.join(os.getcwd(), "worker.py")
+            restart_delay = 5
 
+            while not _shutdown_event.is_set():
+                try:
+                    global _worker_proc
+                    _worker_proc = _sub.Popen(
+                        [_sys.executable, worker_path],
+                        env=os.environ.copy(),
+                        close_fds=True,
+                    )
+                    logger.info("Worker subprocess started pid=%s", _worker_proc.pid)
+                    loop = asyncio.get_running_loop()
+                    rc = await loop.run_in_executor(None, _worker_proc.wait)
+                    logger.warning(
+                        "Worker subprocess exited (rc=%s), restarting in %ds...",
+                        rc, restart_delay,
+                    )
+                except Exception as e:
+                    logger.exception("Worker supervisor error: %s", e)
+
+                if _shutdown_event.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(
+                        _shutdown_event.wait(), timeout=restart_delay,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+        _worker_task = asyncio.create_task(_worker_supervisor())
+        logger.info("Worker supervisor started")
+
+    # ── Long-poller (when USE_POLLING=true and no webhook) ──
     if USE_POLLING:
-        # start polling in background for local/dev
         await application.start()
         logger.info("Started polling mode")
+
+        async def _longpoll_loop():
+            """Background long-poller: fetch updates via getUpdates and dispatch."""
+            offset = None
+            poll_interval = int(os.getenv("LONGPOLL_INTERVAL", "1"))
+            logger.info("Long-poller started (interval=%ds)", poll_interval)
+
+            while not _shutdown_event.is_set():
+                try:
+                    updates = await application.bot.get_updates(
+                        offset=offset,
+                        timeout=30,
+                        allowed_updates=["message", "callback_query", "edited_message"],
+                    )
+                    if updates:
+                        for u in updates:
+                            if getattr(u, "update_id", None) is not None:
+                                offset = int(u.update_id) + 1
+                            try:
+                                await application.process_update(u)
+                            except Exception:
+                                logger.exception("Failed to dispatch polled update")
+                except asyncio.TimeoutError:
+                    # Normal timeout — no updates, keep polling
+                    pass
+                except Exception as e:
+                    logger.warning("Long-poller error: %s", e)
+                    try:
+                        await asyncio.wait_for(
+                            _shutdown_event.wait(), timeout=poll_interval,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+
+            logger.info("Long-poller stopped")
+
+        _longpoll_task = asyncio.create_task(_longpoll_loop())
+
     elif WEBHOOK_URL:
         webhook_path = f"/webhook/{BOT_TOKEN}"
         full_url = WEBHOOK_URL.rstrip("/") + webhook_path
         await application.bot.set_webhook(full_url)
-        # redact the bot token when logging the webhook URL
         try:
             masked_url = full_url.rsplit('/', 1)[0] + '/<REDACTED_BOT_TOKEN>'
         except Exception:
@@ -1521,8 +1666,19 @@ async def on_startup() -> None:
         except Exception as _wh_err:
             logger.debug("Webhook monitor not started: %s", _wh_err)
 
+    # ── Periodic cleanup task ──
+    try:
+        from utils.cleanup import cleanup_manager as _cm
+
+        async def _cleanup_loop():
+            await _cm.start()
+
+        _cleanup_task = asyncio.create_task(_cleanup_loop())
+        logger.info("Cleanup manager started (interval=%ds)", _cm.cleanup_interval)
+    except Exception as e:
+        logger.warning("Cleanup manager not started: %s", e)
+
     # ── Keep-alive heartbeat to prevent Render free-tier spin-down ──
-    # Periodically pings /health so the service stays awake.
     try:
         _ka_disabled = os.getenv("KEEP_ALIVE_DISABLED", "").lower() in ("1", "true", "yes")
         if not _ka_disabled:
@@ -1575,27 +1731,51 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    global _keep_alive_task, _worker_task
+    global _keep_alive_task, _worker_task, _worker_proc, _cleanup_task, _longpoll_task
     _shutdown_event.set()
     try:
-        if _keep_alive_task and not _keep_alive_task.done():
-            _keep_alive_task.cancel()
+        # Cancel background tasks
+        for task, name in [
+            (_keep_alive_task, "keep-alive"),
+            (_worker_task, "worker-supervisor"),
+            (_cleanup_task, "cleanup"),
+            (_longpoll_task, "long-poller"),
+        ]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Shutdown: %s task stopped", name)
+
+        # Terminate worker subprocess
+        if _worker_proc is not None:
             try:
-                await _keep_alive_task
-            except asyncio.CancelledError:
+                _worker_proc.terminate()
+                try:
+                    _worker_proc.wait(timeout=5)
+                except Exception:
+                    _worker_proc.kill()
+                    _worker_proc.wait(timeout=3)
+                logger.info("Shutdown: worker subprocess terminated")
+            except Exception:
                 pass
-        if _worker_task and not _worker_task.done():
-            _worker_task.cancel()
-            try:
-                await _worker_task
-            except asyncio.CancelledError:
-                pass
+
+        # Stop cleanup manager
+        try:
+            from utils.cleanup import cleanup_manager as _cm
+            _cm.stop()
+        except Exception:
+            pass
+
         # Close MongoDB connections
         try:
             from utils.db import close_db
             await close_db()
         except Exception:
             pass
+
         # CRITICAL: Do NOT delete the webhook on shutdown.
         # On Render free tier, the webhook must persist so Telegram can
         # wake the service back up on the next incoming message.

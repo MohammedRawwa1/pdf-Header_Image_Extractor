@@ -20,7 +20,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
-# Files up to this size (200MB) get streamed through memory instead of temp disk
+# Files up to this size get streamed through memory instead of temp disk.
+# Default is 200MB — safe for Render free tier (512MB RAM).
+# Increase via BIGFILE_IN_MEMORY_MAX_MB (e.g., 1024 for 1GB) if your server has more RAM.
+# Files above this threshold fall back to disk-based download → S3 upload.
+#
+# Memory usage during in-memory streaming: downloaded_bytes * 2 (buffer + S3 upload),
+# so a 200MB file uses ~400MB RAM.  Stay under ~40% of total RAM to avoid OOM.
 IN_MEMORY_MAX_BYTES = int(os.getenv("BIGFILE_IN_MEMORY_MAX_MB", "200")) * 1024 * 1024
 
 try:

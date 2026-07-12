@@ -505,7 +505,15 @@ def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: di
     return redis_ok
 
 
-def process_document_job(chat_id: int, file_id: str, filename: str, mime: Optional[str] = "", file_unique_id: Optional[str] = None) -> None:
+def process_document_job(
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    mime: Optional[str] = "",
+    file_unique_id: Optional[str] = None,
+    message_id: Optional[int] = None,
+    forward_info: Optional[dict] = None,
+) -> None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
 
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
@@ -520,6 +528,8 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
             "filename": filename,
             "mime": mime,
             "chat_id": chat_id,
+            "message_id": message_id,
+            "forward_info": forward_info,
             "enqueued_at": int(time.time()),
         }
         _set_io_keys(unique_key, input_meta=input_meta)
@@ -534,10 +544,33 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
         pass
 
     tmpdir = None
+    # Flag for userbot fallback data (large files that Bot API can't handle)
+    _userbot_dl_data = None
     try:
-        # 1) getFile (path)
+        # 1) getFile (path) — with userbot fallback for files >50MB
         gf_start = time.time()
-        tg_file_path = _tg_get_file_path(None, file_id)
+        try:
+            tg_file_path = _tg_get_file_path(None, file_id)
+        except requests.HTTPError as _gf_err:
+            _gf_err_str = str(_gf_err)
+            if "file is too big" in _gf_err_str.lower():
+                logger.info("Bot API getFile failed (file too big); falling back to userbot by file_id")
+                try:
+                    import asyncio as _asyncio
+                    from utils.userbot_downloader import download_bytes_by_file_id_via_userbot as _dl_file_id
+                    _ub_data = _asyncio.run(_dl_file_id(file_id))
+                    if _ub_data and len(_ub_data) > 0:
+                        logger.info("Userbot file_id download succeeded: %d bytes", len(_ub_data))
+                        _userbot_dl_data = _ub_data
+                        # Use a sentinel path so downstream code knows not to call Bot API download
+                        tg_file_path = "__userbot_fallback__"
+                    else:
+                        raise
+                except Exception as _ub_inner:
+                    logger.exception("Userbot download fallback also failed for file_id=%s", file_id)
+                    raise _gf_err from _ub_inner
+            else:
+                raise
         gf_elapsed = time.time() - gf_start
         out_meta.setdefault("durations", {})["getfile_ms"] = int(gf_elapsed * 1000)
         out_meta.setdefault("timestamps", {})["getfile_end"] = int(time.time())
@@ -554,20 +587,26 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
             tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
             file_path = os.path.join(tmpdir, filename)
 
-            # download file
-            try:
-                import config as _conf
-                bot_token = _conf.BOT_TOKEN
-            except Exception:
-                bot_token = None
-
+            # download file (via Bot API or userbot fallback)
             dl_start = time.time()
-            with requests.get(f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
-                r.raise_for_status()
+            if _userbot_dl_data is not None:
+                # Already downloaded via userbot; write bytes to disk
                 with open(file_path, 'wb') as fh:
-                    for chunk in r.iter_content(chunk_size=64 * 1024):
-                        if chunk:
-                            fh.write(chunk)
+                    fh.write(_userbot_dl_data)
+                logger.info("Used userbot-fallback data for file_id=%s (%d bytes written)", file_id, len(_userbot_dl_data))
+            else:
+                try:
+                    import config as _conf
+                    bot_token = _conf.BOT_TOKEN
+                except Exception:
+                    bot_token = None
+
+                with requests.get(f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(file_path, 'wb') as fh:
+                        for chunk in r.iter_content(chunk_size=64 * 1024):
+                            if chunk:
+                                fh.write(chunk)
             dl_elapsed = time.time() - dl_start
             out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
             out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
@@ -718,7 +757,11 @@ def process_document_job(chat_id: int, file_id: str, filename: str, mime: Option
         else:
             # in-memory pathway
             dl_start = time.time()
-            file_bytes = _tg_download_to_bytes(None, tg_file_path)
+            if _userbot_dl_data is not None:
+                file_bytes = _userbot_dl_data
+                logger.info("Used userbot-fallback data for in-memory path (%d bytes)", len(file_bytes))
+            else:
+                file_bytes = _tg_download_to_bytes(None, tg_file_path)
             dl_elapsed = time.time() - dl_start
             out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
             out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
