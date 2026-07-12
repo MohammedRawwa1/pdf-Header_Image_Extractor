@@ -36,6 +36,16 @@ from utils.error_handler import (
 from utils.rate_limiter import TelegramAPIRateLimiter
 from utils.bigfile_pipeline import BigFilePipeline
 
+# ── Logging configuration (must be before any logger usage) ──
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=numeric_level)
+# keep httpx at least INFO to avoid leaking full request URLs in DEBUG logs
+logging.getLogger("httpx").setLevel(max(numeric_level, logging.INFO))
+logging.getLogger("rq").setLevel(numeric_level)
+logging.getLogger("telegram").setLevel(numeric_level)
+logger = logging.getLogger(__name__)
+
 # Global error handler and rate limiter instances
 bot_error_handler = get_error_handler()
 telegram_api_limiter = TelegramAPIRateLimiter()
@@ -307,16 +317,6 @@ def enqueue_job(func_name: str, *args, **kwargs):
     except Exception:
         logger.exception("Failed to enqueue job for %s", func_name)
         return False
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
-logging.basicConfig(level=numeric_level)
-# keep httpx at least INFO to avoid leaking full request URLs in DEBUG logs
-import logging as _logging
-logging.getLogger("httpx").setLevel(max(numeric_level, _logging.INFO))
-logging.getLogger("rq").setLevel(numeric_level)
-logging.getLogger("telegram").setLevel(numeric_level)
-logger = logging.getLogger(__name__)
 
 BOT_TOKEN = config.BOT_TOKEN
 if not BOT_TOKEN:
