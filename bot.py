@@ -42,6 +42,11 @@ logging.basicConfig(level=numeric_level)
 logging.getLogger("httpx").setLevel(max(numeric_level, logging.INFO))
 logging.getLogger("rq").setLevel(numeric_level)
 logging.getLogger("telegram").setLevel(numeric_level)
+# Suppress Pyrogram's noisy transport retries (BrokenPipe, timeout, etc.)
+# These are benign retries that Pyrogram handles automatically.
+logging.getLogger("pyrogram.session.session").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Global error handler and rate limiter instances
@@ -2119,6 +2124,11 @@ async def set_commands(request: Request, admin_token: str | None = Header(defaul
     except Exception as e:
         logger.exception("Failed to set commands")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/")
+async def root() -> str:
+    return "active"
 
 
 @app.get("/health")

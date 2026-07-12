@@ -79,6 +79,10 @@ def main():
   import logging as _logging
   logging.getLogger("httpx").setLevel(max(numeric_level, _logging.INFO))
   logging.getLogger("telegram").setLevel(numeric_level)
+  # Suppress Pyrogram's noisy transport retries (BrokenPipe, timeout, etc.)
+  logging.getLogger("pyrogram.session.session").setLevel(_logging.WARNING)
+  logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(_logging.WARNING)
+  logging.getLogger("pyrogram.connection.connection").setLevel(_logging.WARNING)
 
   if args.command == "enqueue":
     if not args.bot_token:
