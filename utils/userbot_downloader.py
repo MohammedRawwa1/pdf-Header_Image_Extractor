@@ -38,6 +38,67 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
         return chat_id
 
 
+async def _resolve_pyrogram_peer(client, peer_id: Union[int, str]) -> int:
+    """Resolve a peer ID to get Pyrogram's cached entity (with access_hash).
+
+    Pyrogram needs the ``access_hash`` for a peer before it can call
+    ``get_messages()`` or similar.  For user IDs the userbot has never
+    interacted with, Pyrogram raises ``[400 PEER_ID_INVALID]`` because
+    it lacks the hash.  This function resolves the peer via
+    ``get_chat()`` / ``get_users()``, which fetches and caches the hash.
+
+    Adapted from the media_conersion_bot reference implementation.
+
+    Args:
+        client: An active Pyrogram Client.
+        peer_id: Numeric chat/user ID or @username.
+
+    Returns:
+        The resolved peer (usually the same numeric ID, now cached).
+    """
+    if not isinstance(peer_id, int):
+        return peer_id
+
+    # Try get_chat first (covers groups, channels, and users)
+    try:
+        resolved = await client.get_chat(peer_id)
+        if resolved is not None:
+            cached_id = getattr(resolved, "id", None)
+            if cached_id is not None:
+                logger.debug(
+                    "resolve_pyrogram_peer: get_chat(%s) -> id=%s type=%s",
+                    peer_id, cached_id,
+                    getattr(resolved, "_", type(resolved).__name__),
+                )
+                return cached_id
+    except Exception as e:
+        logger.debug(
+            "resolve_pyrogram_peer: get_chat(%s) failed: %s", peer_id, e,
+        )
+
+    # Fall back to get_users (only works for users, not groups/channels)
+    try:
+        resolved = await client.get_users(peer_id)
+        if resolved is not None:
+            cached_id = getattr(resolved, "id", None)
+            if cached_id is not None:
+                logger.debug(
+                    "resolve_pyrogram_peer: get_users(%s) -> id=%s",
+                    peer_id, cached_id,
+                )
+                return cached_id
+    except Exception as e:
+        logger.debug(
+            "resolve_pyrogram_peer: get_users(%s) failed: %s", peer_id, e,
+        )
+
+    # Could not resolve; return original ID (get_messages will fail gracefully)
+    logger.info(
+        "resolve_pyrogram_peer: could not resolve %s, will try as-is", peer_id,
+    )
+    return peer_id
+
+
 async def _download_with_telethon(
     chat_id: Union[int, str],
     message_id: int,
@@ -149,15 +210,8 @@ async def _download_bytes_with_pyrogram(
 
         target = await _normalize_target(chat_id)
 
-        _candidates = [target]
-        _bot_token = os.getenv("BOT_TOKEN", "")
-        if _bot_token and ":" in _bot_token:
-            try:
-                _bot_id = int(_bot_token.split(":")[0])
-                if _bot_id != target:
-                    _candidates.append(_bot_id)
-            except (ValueError, IndexError):
-                pass
+        # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
+        _candidates = [await _resolve_pyrogram_peer(client, target)]
 
         for _peer in _candidates:
             try:
@@ -219,15 +273,10 @@ async def _download_with_pyrogram(
 
         target = await _normalize_target(chat_id)
 
-        _candidates = [target]
-        _bot_token = os.getenv("BOT_TOKEN", "")
-        if _bot_token and ":" in _bot_token:
-            try:
-                _bot_id = int(_bot_token.split(":")[0])
-                if _bot_id != target:
-                    _candidates.append(_bot_id)
-            except (ValueError, IndexError):
-                pass
+        # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
+        # Note: userbots cannot interact with bot peers, so we only resolve
+        # the original chat_id (skip the bot's user ID entirely).
+        _candidates = [await _resolve_pyrogram_peer(client, target)]
 
         for _peer in _candidates:
             try:

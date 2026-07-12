@@ -2,8 +2,6 @@ import os
 import logging
 import tempfile
 import shutil
-from typing import Dict, Any
-
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 import asyncio
 import re
@@ -23,10 +21,9 @@ from telegram.ext import (
 )
 
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
-from io import BytesIO
 import config
 from config import OWNER_ID
-from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
+from utils.progress_tracker import progress_tracker, send_progress_update
 from utils.error_handler import (
     BotErrorHandler,
     get_error_handler,
