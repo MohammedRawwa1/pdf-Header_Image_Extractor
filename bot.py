@@ -25,6 +25,8 @@ from telegram.ext import (
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
 from io import BytesIO
 import config
+from config import OWNER_ID
+from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
 
 # Optional RQ enqueue helper (import only when needed)
 def enqueue_job(func_name: str, *args, **kwargs):
@@ -209,10 +211,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # fall through to inline processing on enqueue failure
 
     tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
+    progress_msg_id = None
+    task = None
     try:
         file_path = os.path.join(tmpdir, filename)
         file = await context.bot.get_file(doc.file_id)
-        await file.download_to_drive(custom_path=file_path)
+
+        # Set up progress tracking for download
+        if file_size and file_size > 1024 * 1024:  # only show progress for files >1MB
+            import uuid as _uuid
+            task_id = _uuid.uuid4().hex[:12]
+            task = progress_tracker.create_task(task_id, user_id or 0, filename, file_size)
+            progress_msg_id = await send_progress_update(msg.chat.id, context.bot, task)
+            task.start()
+            task.status = "downloading"
+
+            # Download with progress callback
+            downloaded = 0
+            async def _progress_cb(current, total):
+                nonlocal downloaded
+                downloaded = current
+                task.update_progress(current)
+                # Throttle updates to max once per 2 seconds
+                if task._last_update is None or time.time() - task._last_update >= 2.0:
+                    task._last_update = time.time()
+                    await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
+            file._file_size = file_size  # hint for progress
+            await file.download_to_drive(custom_path=file_path, read_timeout=300, write_timeout=300)
+            task.update_progress(file_size or os.path.getsize(file_path))
+            if progress_msg_id:
+                await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
+        else:
+            await file.download_to_drive(custom_path=file_path)
 
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         lower = filename.lower()
@@ -234,8 +264,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
             await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
                                            caption="Here is your file with an auto-generated cover preview.")
+        if task:
+            await progress_tracker.complete_task(task.task_id)
+            if progress_msg_id:
+                await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
     except Exception as e:
         logger.exception("Failed to process document")
+        if task:
+            await progress_tracker.fail_task(task.task_id, str(e))
+            if progress_msg_id:
+                try:
+                    await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
+                except Exception:
+                    pass
         try:
             await msg.reply_text(f"Error processing file: {e}")
         except Exception:
@@ -272,20 +313,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
     tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
+    progress_msg_id = None
+    task = None
     try:
         file_path = os.path.join(tmpdir, filename)
         file = await context.bot.get_file(photo.file_id)
+
+        # Progress tracking for photos >1MB
+        photo_size = getattr(photo, 'file_size', None) or 0
+        if photo_size > 1024 * 1024:
+            import uuid as _uuid
+            task_id = _uuid.uuid4().hex[:12]
+            task = progress_tracker.create_task(task_id, user_id or 0, filename, photo_size)
+            progress_msg_id = await send_progress_update(msg.chat.id, context.bot, task)
+            task.start()
+            task.status = "downloading"
         await file.download_to_drive(custom_path=file_path)
+        if task:
+            task.update_progress(os.path.getsize(file_path))
+            task.status = "processing"
+            if progress_msg_id:
+                await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
+
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
-        create_thumbnail_from_image(file_path, thumb_path)
-        # send original image back as document to preserve original bytes, attach thumbnail
+        create_thumbnail_from_image(file_path, thumb_path)            # send original image back as document to preserve original bytes, attach thumbnail
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             input_doc = InputFile(f_doc, filename=os.path.basename(file_path))
             chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
             await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb,
                                            caption="Here is your image with an auto-generated thumbnail.")
+        if task:
+            await progress_tracker.complete_task(task.task_id)
+            if progress_msg_id:
+                await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
     except Exception as e:
         logger.exception("Failed to process photo")
+        if task:
+            await progress_tracker.fail_task(task.task_id, str(e))
+            if progress_msg_id:
+                try:
+                    await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
+                except Exception:
+                    pass
         try:
             await msg.reply_text(f"Error processing photo: {e}")
         except Exception:
@@ -323,8 +392,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not config.is_admin_user(getattr(user, "id", None)):
-        await update.effective_message.reply_text("You are not authorized to run this command.")
+    uid = getattr(user, "id", None)
+    if not config.is_owner(uid):
+        await update.effective_message.reply_text("⛔ Only the bot owner can run this command.")
         return
     args = context.args or []
     if not args:
@@ -343,8 +413,9 @@ async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not config.is_admin_user(getattr(user, "id", None)):
-        await update.effective_message.reply_text("You are not authorized to run this command.")
+    uid = getattr(user, "id", None)
+    if not config.is_owner(uid):
+        await update.effective_message.reply_text("⛔ Only the bot owner can run this command.")
         return
     try:
         await context.bot.delete_webhook()
@@ -356,8 +427,9 @@ async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not config.is_admin_user(getattr(user, "id", None)):
-        await update.effective_message.reply_text("You are not authorized to run this command.")
+    uid = getattr(user, "id", None)
+    if not config.is_owner(uid):
+        await update.effective_message.reply_text("⛔ Only the bot owner can run this command.")
         return
     # Default command set
     commands = [
@@ -445,9 +517,21 @@ application.add_handler(CommandHandler("cancelbatch", cmd_cancelbatch))
 
 app = FastAPI()
 
+# Background tasks references for graceful shutdown
+_keep_alive_task = None
+_worker_task = None
+_shutdown_event = asyncio.Event()
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    global _keep_alive_task, _worker_task
+    # Ensure storage directories exist
+    for d in (config.STORAGE_PATH, config.INPUT_PATH, config.OUTPUT_PATH, config.TEMP_PATH, config.THUMBNAIL_PATH):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
     # Initialize application so handlers, bot, and context are ready
     await application.initialize()
 
@@ -485,14 +569,90 @@ async def on_startup() -> None:
     else:
         logger.warning("No WEBHOOK_URL provided and USE_POLLING is false; bot won't receive updates.")
 
+    # ── Webhook health monitor (optional) ──
+    if WEBHOOK_URL:
+        try:
+            from utils.webhook_monitor import WebhookRecoveryManager
+            _webhook_recovery = WebhookRecoveryManager(application, WEBHOOK_URL)
+            await _webhook_recovery.start()
+            logger.info("Webhook recovery monitor started")
+        except Exception as _wh_err:
+            logger.debug("Webhook monitor not started: %s", _wh_err)
+
+    # ── Keep-alive heartbeat to prevent Render free-tier spin-down ──
+    # Periodically pings /health so the service stays awake.
+    try:
+        _ka_disabled = os.getenv("KEEP_ALIVE_DISABLED", "").lower() in ("1", "true", "yes")
+        if not _ka_disabled:
+            _ka_url = (
+                os.getenv("KEEP_ALIVE_URL")
+                or os.getenv("RENDER_EXTERNAL_URL")
+                or ""
+            )
+            if not _ka_url and WEBHOOK_URL:
+                try:
+                    parsed_ka = urlparse(WEBHOOK_URL)
+                    if parsed_ka.netloc:
+                        _ka_url = f"{parsed_ka.scheme}://{parsed_ka.netloc}"
+                except Exception:
+                    pass
+
+            if _ka_url:
+                _ka_url = _ka_url.rstrip("/")
+                _health_url = f"{_ka_url}/health"
+                _ka_interval = max(60, min(840, int(os.getenv("KEEP_ALIVE_INTERVAL", "600"))))
+
+                async def _keep_alive_loop():
+                    logger.info("Keep-alive heartbeat started: pinging %s every %ds", _health_url, _ka_interval)
+                    try:
+                        async with aiohttp.ClientSession() as _session:
+                            while True:
+                                try:
+                                    async with _session.get(_health_url, timeout=aiohttp.ClientTimeout(total=10)) as _resp:
+                                        logger.debug("Keep-alive ping: %s", _resp.status)
+                                except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
+                                    logger.debug("Keep-alive ping failed (harmless): %s", _e)
+                                try:
+                                    await asyncio.wait_for(_shutdown_event.wait(), timeout=_ka_interval)
+                                    break
+                                except asyncio.TimeoutError:
+                                    continue
+                                except asyncio.CancelledError:
+                                    break
+                    except asyncio.CancelledError:
+                        pass
+                    logger.info("Keep-alive heartbeat stopped")
+
+                _keep_alive_task = asyncio.create_task(_keep_alive_loop())
+                logger.info("Keep-alive heartbeat scheduled")
+            else:
+                logger.info("Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, RENDER_EXTERNAL_URL, or WEBHOOK_URL)")
+    except Exception as _ka_err:
+        logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
+
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    global _keep_alive_task, _worker_task
+    _shutdown_event.set()
     try:
+        if _keep_alive_task and not _keep_alive_task.done():
+            _keep_alive_task.cancel()
+            try:
+                await _keep_alive_task
+            except asyncio.CancelledError:
+                pass
+        if _worker_task and not _worker_task.done():
+            _worker_task.cancel()
+            try:
+                await _worker_task
+            except asyncio.CancelledError:
+                pass
+        # CRITICAL: Do NOT delete the webhook on shutdown.
+        # On Render free tier, the webhook must persist so Telegram can
+        # wake the service back up on the next incoming message.
         if USE_POLLING:
             await application.stop()
-        if WEBHOOK_URL:
-            await application.bot.delete_webhook()
         await application.shutdown()
     except Exception:
         logger.exception("Error during shutdown")
@@ -633,7 +793,10 @@ async def get_commands(admin_token: str | None = Header(default=None)) -> dict:
 
 
 @app.post("/set_webhook")
-async def set_webhook(request: Request, admin_token: str | None = Header(default=None)) -> dict:
+async def set_webhook(request: Request, admin_token: str | None = Header(default=None), owner_id: str | None = Header(default=None)) -> dict:
+    # OWNER_ID header check: only the bot owner can call this endpoint
+    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+        raise HTTPException(status_code=403, detail="Only the bot owner can set the webhook")
     if not admin_token or not _verify_admin_header(admin_token):
         raise HTTPException(status_code=403, detail="Invalid admin token")
     body = await request.json()
@@ -651,7 +814,9 @@ async def set_webhook(request: Request, admin_token: str | None = Header(default
 
 
 @app.post("/delete_webhook")
-async def delete_webhook(admin_token: str | None = Header(default=None)) -> dict:
+async def delete_webhook(request: Request, admin_token: str | None = Header(default=None), owner_id: str | None = Header(default=None)) -> dict:
+    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+        raise HTTPException(status_code=403, detail="Only the bot owner can delete the webhook")
     if not admin_token or not _verify_admin_header(admin_token):
         raise HTTPException(status_code=403, detail="Invalid admin token")
     try:
@@ -716,7 +881,10 @@ async def admin_purge_s3(request: Request, admin_token: str | None = Header(defa
 
 
 @app.post("/set_commands")
-async def set_commands(request: Request, admin_token: str | None = Header(default=None)) -> dict:
+async def set_commands(request: Request, admin_token: str | None = Header(default=None), owner_id: str | None = Header(default=None)) -> dict:
+    # OWNER_ID header check: only the bot owner can call this endpoint
+    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+        raise HTTPException(status_code=403, detail="Only the bot owner can set commands")
     if not admin_token or not _verify_admin_header(admin_token):
         raise HTTPException(status_code=403, detail="Invalid admin token")
     body = await request.json()

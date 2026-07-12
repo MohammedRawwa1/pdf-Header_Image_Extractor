@@ -213,6 +213,12 @@ def get_storage_backend_sync():
             copy_source = {'Bucket': self.bucket, 'Key': src_key}
             self.s3.copy_object(Bucket=self.bucket, CopySource=copy_source, Key=dest_key)
 
+        def _upload_bytes_sync(self, data: bytes, dest_key: str) -> str:
+            import os as _os
+            extra = {'Metadata': {'orig_size': str(len(data))}}
+            self.s3.put_object(Bucket=self.bucket, Key=dest_key, Body=data, ExtraArgs=extra)
+            return dest_key
+
     return _S3BackendSync(s3, bucket)
 
 
@@ -238,5 +244,10 @@ async def get_storage_backend():
             import asyncio
 
             return await asyncio.to_thread(self._b.copy_key, src_key, dest_key)
+
+        async def upload_bytes(self, data: bytes, dest_key: str) -> str:
+            import asyncio
+
+            return await asyncio.to_thread(self._b._upload_bytes_sync, data, dest_key)
 
     return _AsyncBackend(backend)

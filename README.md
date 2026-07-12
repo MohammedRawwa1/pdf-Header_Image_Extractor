@@ -1,115 +1,275 @@
 # PDF Header / Cover Image Extractor Bot
 
-This repository provides a Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. It runs as a FastAPI webhook service (or polling for local development) and is packaged with Docker for deployment on Render or similar platforms.
+A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>50MB) via userbot fallback and runs as a FastAPI webhook service on Render.
 
-**Files added**
-- `bot.py` — FastAPI app + Telegram `Dispatcher` and webhook endpoint.
-- `tools.py` — utilities for creating thumbnails from PDF/image files (PyMuPDF required).
-- `Dockerfile` — Docker image using `PyMuPDF` (no poppler required).
-- `render.yaml` — sample Render service manifest (replace placeholders).
-- `python-version.txt` — chosen Python version for this project.
+## Features
 
-**Environment variables**
-- `BOT_TOKEN` (required) — Telegram bot token.
-- `WEBHOOK_URL` (optional) — public URL (e.g. https://my-app.onrender.com) used to set Telegram webhook on startup.
-- `USE_POLLING` (optional) — set to `true` to use long-polling instead of webhooks (useful for local/dev).
-- `PORT` (optional) — service port (default 8000).
-- `HOST` (optional) — host to bind the server to (default `0.0.0.0`).
-- `ADMIN_USERS` (optional) — comma-separated Telegram user IDs allowed to run admin bot commands (e.g. `12345,67890`). If empty, use `ADMIN_SECRET` to secure HTTP admin endpoints.
-- `ADMIN_SECRET` (optional) — HTTP admin secret used to protect REST admin endpoints (set a strong random value).
-- `LOG_CHANNEL` (optional) — Telegram channel ID to send logs/messages to.
-- `SENTRY_DSN` (optional) — Sentry DSN for error reporting.
-- `REDIS_URL` (optional) — Redis URL used for background queues (e.g. `redis://redis:6379/0`).
-- `MAX_FILE_SIZE` (optional) — maximum allowed upload size in bytes (default `52428800` = 50MB).
-- `TMP_DIR` (optional) — directory to use for temporary downloads (defaults to system temp dir).
+- **PDF Thumbnail Extraction** — Automatically selects the best page as cover image
+- **Automatic Thumb Detection** — Uses visual entropy to pick the most relevant page
+- **Big PDF Support** — Handles files >50MB via Telethon/Pyrogram userbot download
+- **Progress Tracking** — Real-time download/upload progress bars
+- **Keep-Alive Heartbeat** — Prevents Render free-tier spin-down (15min inactivity)
+- **Background Worker** — In-process RQ worker for job processing
+- **S3/R2 Storage** — Optional cloud storage fallback for large files
+- **Owner-Only Security** — `/s` webhook commands protected by `OWNER_ID`
 
-Local development
+## Environment Variables
 
-1. Install deps in a virtualenv:
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `BOT_TOKEN` | Telegram bot token |
+| `WEBHOOK_URL` | Public URL for webhook (e.g. `https://your-app.onrender.com`) |
+
+### Optional — Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_POLLING` | `false` | Use long-polling instead of webhooks (local dev) |
+| `PORT` | `8000` | Service port |
+| `HOST` | `0.0.0.0` | Bind host |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `TMP_DIR` | (system) | Temp directory for downloads |
+
+### Optional — Security
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OWNER_ID` | (empty) | Telegram user ID with full control over `/s` commands |
+| `ADMIN_USERS` | (empty) | Comma-separated Telegram user IDs for admin access |
+| `ADMIN_SECRET` | (empty) | HTTP admin secret for API endpoints |
+
+### Optional — Big PDF Pipeline
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STORAGE_BACKEND` | `local` | Storage backend: `local`, `s3`, or `r2` |
+| `STORAGE_PATH` | `./storage` | Local storage root |
+| `S3_BUCKET` | (empty) | S3/R2 bucket name |
+| `S3_ENDPOINT` | (empty) | S3-compatible endpoint URL |
+| `S3_REGION` | (empty) | AWS region |
+| `AWS_ACCESS_KEY_ID` | (empty) | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | (empty) | AWS secret key |
+| `BOT_API_MAX_MB` | `50` | Telegram Bot API max file size in MB |
+
+### Optional — Userbot (for files >50MB)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_ID` | (empty) | Telegram API ID for userbot |
+| `API_HASH` | (empty) | Telegram API hash for userbot |
+| `PYROGRAM_SESSION` | (empty) | Pyrogram session string (preferred) |
+| `TELETHON_SESSION` | (empty) | Telethon string session |
+
+### Optional — Background Processing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_URL` | (empty) | Redis URL for job queue and caching |
+| `RUN_WORKER_IN_PROC` | `false` | Run RQ worker inside web process |
+
+### Optional — Keep-Alive
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KEEP_ALIVE_URL` | (empty) | URL to ping for keep-alive (defaults to `WEBHOOK_URL`) |
+| `KEEP_ALIVE_INTERVAL` | `600` | Seconds between pings (60–840) |
+| `KEEP_ALIVE_DISABLED` | `false` | Disable keep-alive heartbeat |
+
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Show welcome message |
+| `/help` | Show help and available commands |
+| `/status` | Get bot status |
+| `/setwebhook <url>` | **Owner-only** — Set webhook URL |
+| `/delwebhook` | **Owner-only** — Delete webhook |
+| `/setcommands` | **Owner-only** — Set bot command list |
+| `/startbatch` | Start collecting forwarded files |
+| `/endbatch` | Process collected batch |
+| `/cancelbatch` | Cancel batch collection |
+
+## HTTP API Endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | None | Health check |
+| `/status` | GET | Admin | Bot status |
+| `/webhook/{token}` | POST | Telegram | Webhook endpoint |
+| `/set_webhook` | POST | Owner + Admin | Set webhook URL |
+| `/delete_webhook` | POST | Owner + Admin | Delete webhook |
+| `/set_commands` | POST | Owner + Admin | Set bot commands |
+| `/commands` | GET | Admin | List bot commands |
+| `/admin/recache_thumbs` | POST | Admin | Recache thumbnails |
+| `/admin/purge_s3` | POST | Admin | Purge old S3 objects |
+
+### Owner-Only Headers
+
+For `/set_webhook`, `/delete_webhook`, and `/set_commands`, include the header:
+```
+owner-id: <OWNER_ID>
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  FastAPI (bot.py)                           │
+│  ├── Telegram webhook endpoint              │
+│  ├── Health / status endpoints              │
+│  ├── Keep-alive heartbeat task              │
+│  └── Background RQ worker (optional)        │
+├─────────────────────────────────────────────┤
+│  Telegram Bot API (python-telegram-bot)     │
+│  ├── Document handler → thumbnail extract   │
+│  ├── Photo handler → thumbnail              │
+│  └── URL handler → download & extract       │
+├─────────────────────────────────────────────┤
+│  PDF Processing (tools.py)                  │
+│  ├── PyMuPDF page rendering (300-600 DPI)   │
+│  ├── Visual entropy page selection          │
+│  └── Ghostscript compression (optional)     │
+├─────────────────────────────────────────────┤
+│  Big File Pipeline (utils/)                 │
+│  ├── userbot_downloader (Telethon/Pyrogram) │
+│  ├── userbot_uploader                       │
+│  ├── bigfile_pipeline (S3 → Redis → Worker) │
+│  └── storage (local / S3 / R2)              │
+├─────────────────────────────────────────────┤
+│  Background Worker (worker.py + tasks.py)   │
+│  ├── RQ job queue (Redis)                   │
+│  └── process_document_job                   │
+└─────────────────────────────────────────────┘
+```
+
+## Local Development
 
 ```bash
+# Install dependencies
 python -m pip install -r requirements.txt
-export BOT_TOKEN="<your-bot-token>"
+
+# Set environment
+export BOT_TOKEN="your-bot-token"
 export USE_POLLING=true
+
+# Run the bot
 python bot.py
+# or
+uvicorn bot:app --host 127.0.0.1 --port 8000
 ```
 
-2. Alternatively run with `uvicorn` directly:
-
-```bash
-uvicorn bot:app --host 0.0.0.0 --port 8000
-```
-
-Docker (build & run)
+## Docker
 
 ```bash
 docker build -t pdf-bot:latest .
-docker run -e BOT_TOKEN="<your-bot-token>" -e USE_POLLING=true -p 8000:8000 pdf-bot:latest
+docker run \
+  -e BOT_TOKEN="your-bot-token" \
+  -e USE_POLLING=true \
+  -p 8000:8000 \
+  pdf-bot:latest
 ```
 
-Render deployment (high-level)
+## Render Deployment
 
-1. Push this repo to GitHub.
-2. In Render: Create a new service → select **Web Service** → connect your GitHub repo.
-3. Choose **Docker** as the environment (Render will use `Dockerfile`).
-4. Set environment variables in Render: `BOT_TOKEN` (secret), `WEBHOOK_URL` (your service URL without trailing `/webhook/...`), and optionally `USE_POLLING`.
-5. Deploy. The app will set the webhook to `${WEBHOOK_URL}/webhook/${BOT_TOKEN}` on startup when `WEBHOOK_URL` is provided.
+1. Push to GitHub
+2. Create Web Service → Docker environment
+3. Set env vars: `BOT_TOKEN`, `WEBHOOK_URL`, `USE_POLLING=false`
+4. Deploy — webhook auto-set on startup
 
-Notes
+### Render Environment Variables
 
-- The project requires `PyMuPDF` (`fitz`) for PDF rendering. The provided `Dockerfile` installs `PyMuPDF` via pip and does not require `poppler`.
-- The project requires `PyMuPDF` (`fitz`) for PDF rendering. The provided `Dockerfile` installs `PyMuPDF` via pip and does not require `poppler`.
+```yaml
+envVars:
+  - key: BOT_TOKEN
+    sync: false  # secret
+  - key: WEBHOOK_URL
+    value: "https://your-app.onrender.com"
+  - key: OWNER_ID
+    sync: false  # your Telegram user ID
+  - key: REDIS_URL
+    sync: false  # from Render Redis addon
+  - key: RUN_WORKER_IN_PROC
+    value: "true"
+  - key: KEEP_ALIVE_INTERVAL
+    value: "600"
+```
 
-System dependency: Ghostscript
---------------------------------
+## Big PDF Pipeline
 
-The PDF compression helper (`tools.compress_pdf`) calls the `gs` (Ghostscript) binary. Ghostscript is a system package (not a Python package) and must be available in the runtime image. The included `Dockerfile` installs Ghostscript; if you build/run locally or on another host, install Ghostscript for your platform:
+For files exceeding Telegram's 50MB Bot API limit:
 
-- Debian/Ubuntu (including Docker images based on `python:<tag>-slim`):
+1. Bot detects file size > `BOT_API_MAX_MB`
+2. Routes through `BigFilePipeline` in `utils/bigfile_pipeline.py`
+3. Downloads via Telethon/Pyrogram userbot
+4. Uploads to S3/R2 storage
+5. Enqueues Redis job for background processing
+6. Worker extracts thumbnail and sends result
+
+### Setup
 
 ```bash
-apt-get update && apt-get install -y --no-install-recommends ghostscript
+# Set userbot credentials
+export API_ID="12345"
+export API_HASH="your-api-hash"
+export PYROGRAM_SESSION="your-session-string"
+
+# Set storage backend
+export STORAGE_BACKEND="s3"
+export S3_BUCKET="your-bucket"
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
 ```
 
-- Alpine (if you use an Alpine base):
+## Progress Tracking
 
-```bash
-apk add --no-cache ghostscript
+The bot shows real-time progress bars for download/upload operations:
+
+```
+📊 PDF Processing Progress
+
+📁 File: document.pdf
+📏 Size: 12.5 MB / 50.0 MB
+📈 Progress: 25.0%
+🟩🟩⬜⬜⬜⬜⬜⬜⬜⬜
+
+⏱️ Elapsed: 15s
+⏳ Remaining: 45s
+📥 Status: Downloading
+
+🆔 Task: a1b2c3d4
 ```
 
-No extra Python packages are required for compression beyond the existing `requirements.txt` (it already includes `PyMuPDF` and `Pillow`). If you later add S3 upload fallback, you'll need to add `boto3` to `requirements.txt` and provide AWS credentials in the environment.
+## File Structure
 
-Large files and forwarded content
+```
+├── bot.py              # FastAPI app + Telegram handlers
+├── config.py           # Environment configuration
+├── tools.py            # PDF thumbnail extraction (PyMuPDF)
+├── tasks.py            # Background job processing (RQ)
+├── worker.py           # RQ worker process
+├── storage.py          # S3/local storage backend
+├── requirements.txt    # Python dependencies
+├── Dockerfile          # Docker build
+├── render.yaml         # Render deployment config
+├── utils/
+│   ├── __init__.py
+│   ├── telethon_session.py    # Telethon/Pyrogram session mgmt
+│   ├── userbot_downloader.py  # Big file download via userbot
+│   ├── userbot_uploader.py    # Big file upload via userbot
+│   ├── bigfile_pipeline.py    # Orchestrates big file flow
+│   ├── cache.py               # Redis async cache
+│   ├── job_queue.py           # Redis job queue
+│   ├── progress_tracker.py    # Download/upload progress bars
+│   ├── webhook_monitor.py     # Webhook health monitoring
+│   ├── forward_store.py       # Forward metadata storage
+│   └── telethon_mongo.py      # Telethon-MongoDB bridge
+├── scripts/
+│   └── telethon_ingest.py     # Standalone Telethon ingestion
+└── media_conersion_bot/       # Reference implementation (not used)
+```
 
-- The bot streams downloads directly to disk (using `aiohttp` + `aiofiles`), so it can handle very large PDFs without loading them fully into memory. There is no hard upper limit in code — limits are determined by available disk space and platform.
-- Forwarded messages containing documents are handled automatically (the `Document` field is detected even when forwarded).
-- If a forwarded message contains a link to a PDF (or you send a message with a PDF URL), the bot will attempt to download and extract the first page as a thumbnail.
+## License
 
-Webhook behavior
-
-- The webhook endpoint schedules update processing in the background so webhook requests return quickly (prevents Telegram webhook timeouts). Heavy work (downloads, rendering) runs asynchronously off the request path.
-
-
-API Endpoints
-
-- `POST /webhook/{token}` — Telegram webhook endpoint (used by Telegram to POST updates). The token path segment must match `BOT_TOKEN`.
-- `GET /health` — simple health check, returns `{ "ok": true }`.
-- `GET /status` — returns bot status; include header `X-ADMIN-TOKEN` with `ADMIN_SECRET` to get webhook info.
-- `GET /commands` — admin-only (use `X-ADMIN-TOKEN`) — list current bot commands.
-- `POST /set_webhook` — admin-only, JSON body `{ "url": "https://example.com" }` — sets webhook to `${url}/webhook/${BOT_TOKEN}`.
-- `POST /delete_webhook` — admin-only — deletes webhook.
-- `POST /set_commands` — admin-only, JSON body `{ "commands": [{"command":"start","description":"..."}] }` — sets bot command list.
-
-Bot commands (Telegram)
-
-- `/start` — start the bot and receive usage info.
-- `/help` — display help and available commands.
-- `/status` — returns basic status (admin users see webhook info).
-- `/setwebhook <url>` — admin-only, set webhook URL (equivalent to `POST /set_webhook`).
-- `/delwebhook` — admin-only, delete webhook (equivalent to `POST /delete_webhook`).
-- `/setcommands` — admin-only, set default command list on Telegram.
-
-Helper scripts
-
-- `manage_commands.py` — CLI helper to set the default bot commands. Run with `BOT_TOKEN` in env to push the command list to Telegram.
-
+See [LICENSE](LICENSE) for details.

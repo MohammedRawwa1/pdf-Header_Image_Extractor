@@ -9,3 +9,8 @@ redis>=4.5.5
 rq>=1.2.0
 requests>=2.31.0
 boto3>=1.26.0
+# Optional: userbot support for big PDF files (>50MB)
+# Uncomment one or both for userbot fallback:
+# telethon>=1.28.0
+# pyrogram>=2.0.0
+aioboto3>=12.0.0

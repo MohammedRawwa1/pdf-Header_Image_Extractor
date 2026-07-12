@@ -41,13 +41,13 @@ try:
         sys.path.insert(0, str(project_root))
 
     # Prefer async factory but also import sync helper for robustness
-    from utils.storage import get_storage_backend, get_storage_backend_sync
+    from storage import get_storage_backend, get_storage_backend_sync
 except Exception as e:
     # Surface import failures for diagnostics and fall back to None
-    print("Failed to import storage factories from utils.storage:", e)
+    print("Failed to import storage factories from storage:", e)
     get_storage_backend = None
     try:
-        from utils.storage import get_storage_backend_sync
+        from storage import get_storage_backend_sync
     except Exception:
         get_storage_backend_sync = None
 
@@ -202,7 +202,7 @@ async def _get_backend_instance():
             pass
     # Last-ditch: attempt on-the-fly import
     try:
-        from utils.storage import get_storage_backend as _g, get_storage_backend_sync as _gs
+        from storage import get_storage_backend as _g, get_storage_backend_sync as _gs
 
         get_storage_backend = _g
         get_storage_backend_sync = _gs
