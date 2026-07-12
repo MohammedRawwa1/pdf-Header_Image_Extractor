@@ -82,6 +82,11 @@ target/
 profile_default/
 ipython_config.py
 
+# Pyrogram session export files (contain full login tokens — DO NOT COMMIT)
+*_session.txt
+*_exported.txt
+pyrogram_session.txt
+
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
