@@ -287,33 +287,64 @@ def _format_time(seconds: float) -> str:
 
 
 async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: Optional[int] = None):
-    """Send or update progress message with visual progress bar."""
+    """Send or update progress message with visual progress bar.
+
+    Uses Unicode block characters for maximum cross-client compatibility.
+    Bar uses 3 shades: █ (filled), ▓ (partial), ░ (remaining)
+    20 segments = 5% each for smooth granularity.
+    """
     try:
-        filled = int(task.progress_percentage / 10)
-        bar = "\U0001f7e9" * filled + "\u2b1c" * (10 - filled)
+        segments = 20
+        total_progress = task.progress_percentage
+        filled = int(total_progress / (100 / segments))
+        filled = max(0, min(segments, filled))
+
+        # Build a clean progress bar using Unicode block characters
+        full_block = "\u2588"  # Full block █
+        empty = "\u2591"  # Light shade ░
+
+        if filled >= segments:
+            bar = full_block * segments
+        elif filled <= 0:
+            bar = empty * segments
+        else:
+            bar = full_block * filled + empty * (segments - filled)
+
+        # Surround bar with brackets for clarity
+        bar = "[" + bar + "]"
 
         processed = _format_size(task.processed_size)
         total = _format_size(task.total_size)
 
-        status_emoji = {
+        status_emojis = {
             "pending": "\u23f3",
             "downloading": "\U0001f4e5",
             "processing": "\u2699\ufe0f",
             "uploading": "\U0001f4e4",
             "completed": "\u2705",
             "failed": "\u274c",
-        }.get(task.status, "\u2753")
+        }
+        status_emoji = status_emojis.get(task.status, "\u2753")
+
+        # Speed calculation (best-effort)
+        speed_str = ""
+        if task.start_time and task.processed_size > 0:
+            elapsed = task.elapsed_time
+            if elapsed > 0:
+                bytes_per_sec = task.processed_size / elapsed
+                speed_str = f"\U0001f680 Speed: {_format_size(int(bytes_per_sec))}/s\n"
 
         message_text = (
-            f"\U0001f4ca **PDF Processing Progress**\n\n"
+            f"\U0001f4ca **File Processing Progress**\n\n"
             f"\U0001f4c1 File: `{task.file_name}`\n"
             f"\U0001f4cf Size: {processed} / {total}\n"
-            f"\U0001f4c8 Progress: {task.progress_percentage:.1f}%\n"
-            f"{bar}\n\n"
-            f"\u23f1\ufe0f Elapsed: {_format_time(task.elapsed_time)}\n"
-            f"\u23f3 Remaining: {_format_time(task.estimated_time_remaining)}\n"
-            f"{status_emoji} Status: {task.status.title()}\n\n"
-            f"\U0001f194 Task: `{task.task_id[:8]}`"
+            f"\U0001f4c8 Progress: `{total_progress:.1f}%`\n"
+            f"`{bar}`\n\n"
+            f"{speed_str}"
+            f"\u23f1 Elapsed: `{_format_time(task.elapsed_time)}`\n"
+            f"\u23f3 Remaining: `{_format_time(task.estimated_time_remaining)}`\n"
+            f"{status_emoji} Status: **{task.status.title()}**\n\n"
+            f"\U0001f194 ID: `{task.task_id[:8]}`"
         )
 
         if message_id:

@@ -12,7 +12,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,7 @@ class BigFilePipeline:
         file_unique_id: Optional[str] = None,
         user_id: Optional[int] = None,
         original_filename: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> IngestResult:
         """Download a large PDF file via userbot, upload to S3, enqueue a processing job.
 
@@ -87,6 +88,7 @@ class BigFilePipeline:
             file_unique_id: Telegram file_unique_id for caching/dedup.
             user_id: User who sent the file.
             original_filename: Original filename if known.
+            progress_callback: Optional callable(current_bytes, total_bytes) for download progress.
 
         Returns:
             IngestResult with job_id and s3_key on success.
@@ -121,7 +123,7 @@ class BigFilePipeline:
                     "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
                     chat_id, message_id, file_size // (1024 * 1024),
                 )
-                data = await download_bytes_via_userbot(chat_id, message_id)
+                data = await download_bytes_via_userbot(chat_id, message_id, progress_callback=progress_callback)
                 if data is not None and len(data) > 0:
                     actual_size = len(data)
                     await self._storage.upload_bytes(data, s3_key)
@@ -163,7 +165,8 @@ class BigFilePipeline:
 
                 from utils.userbot_downloader import download_forward_via_userbot
                 download_ok = await download_forward_via_userbot(
-                    chat_id, message_id, temp_path
+                    chat_id, message_id, temp_path,
+                    progress_callback=progress_callback,
                 )
                 if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                     return IngestResult(ok=False, error="Userbot download failed")

@@ -27,3 +27,14 @@ from .cache import (
     close_cache,
     RedisCache,
 )
+from .error_handler import (
+    BotErrorHandler,
+    get_error_handler,
+    handle_bot_error,
+    async_error_handler,
+)
+from .rate_limiter import (
+    RateLimiter,
+    TelegramAPIRateLimiter,
+    ConversionRateLimiter,
+)

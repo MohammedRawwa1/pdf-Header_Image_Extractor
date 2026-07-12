@@ -8,7 +8,7 @@ import io
 import os
 import logging
 import shutil
-from typing import Union, Optional
+from typing import Union, Optional, Callable
 from datetime import datetime
 import asyncio
 import json
@@ -44,8 +44,13 @@ async def _download_with_telethon(
     dest_path: str,
     msg_date: Optional[str] = None,
     file_unique_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Download using Telethon client."""
+    """Download using Telethon client.
+
+    If ``progress_callback`` is provided, it will be called with
+    ``(current_bytes, total_bytes)`` during download.
+    """
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
         return False
@@ -77,7 +82,10 @@ async def _download_with_telethon(
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
                 for attempt in range(3):
                     try:
-                        await client.download_media(msg, file=dest_path)
+                        kwargs = {"file": dest_path}
+                        if progress_callback is not None:
+                            kwargs["progress_callback"] = progress_callback
+                        await client.download_media(msg, **kwargs)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             return True
                         logger.warning("userbot: downloaded file empty (attempt %s) %s", attempt + 1, dest_path)
@@ -94,7 +102,10 @@ async def _download_with_telethon(
                 if getattr(m, "media", None):
                     for attempt in range(3):
                         try:
-                            await client.download_media(m, file=dest_path)
+                            kwargs = {"file": dest_path}
+                            if progress_callback is not None:
+                                kwargs["progress_callback"] = progress_callback
+                            await client.download_media(m, **kwargs)
                             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                 return True
                         except Exception:
@@ -113,8 +124,13 @@ async def _download_with_telethon(
 async def _download_bytes_with_pyrogram(
     chat_id: Union[int, str],
     message_id: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[bytes]:
-    """Download a message's media into memory (bytes) using Pyrogram."""
+    """Download a message's media into memory (bytes) using Pyrogram.
+
+    If ``progress_callback`` is provided, it will be called with
+    ``(current_bytes, total_bytes)`` during download.
+    """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; cannot do in-memory download")
         return None
@@ -149,7 +165,10 @@ async def _download_bytes_with_pyrogram(
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg and getattr(msg, "media", None):
-                        data = await client.download_media(msg, in_memory=True)
+                        kwargs = {"in_memory": True}
+                        if progress_callback is not None:
+                            kwargs["progress"] = progress_callback
+                        data = await client.download_media(msg, **kwargs)
                         if data is not None and isinstance(data, bytes) and len(data) > 0:
                             logger.info("userbot: Pyrogram in-memory download succeeded: %d bytes", len(data))
                             return data
@@ -168,8 +187,13 @@ async def _download_with_pyrogram(
     chat_id: Union[int, str],
     message_id: int,
     dest_path: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
-    """Download using Pyrogram client (session string fallback)."""
+    """Download using Pyrogram client (session string fallback).
+
+    If ``progress_callback`` is provided, it will be called with
+    ``(current_bytes, total_bytes)`` during download.
+    """
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
         return False
@@ -211,7 +235,10 @@ async def _download_with_pyrogram(
                 if messages:
                     msg = messages[0] if isinstance(messages, list) else messages
                     if msg and getattr(msg, "media", None):
-                        _dl = await client.download_media(msg, file_name=dest_path)
+                        kwargs = {"file_name": dest_path}
+                        if progress_callback is not None:
+                            kwargs["progress"] = progress_callback
+                        _dl = await client.download_media(msg, **kwargs)
                         if _dl:
                             _dl_path = str(_dl)
                             _abs_dest = os.path.abspath(dest_path)
@@ -237,11 +264,15 @@ async def download_forward_via_userbot(
     dest_path: str,
     msg_date: Optional[str] = None,
     file_unique_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bool:
     """Download a message media using a user account.
 
     Tries Telethon first (with string session or file-based session),
     then falls back to Pyrogram if a session string is configured.
+
+    If ``progress_callback`` is provided, it will be forwarded to the
+    underlying download method for real-time progress updates.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -260,7 +291,7 @@ async def download_forward_via_userbot(
 
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
-            result = await _download_with_pyrogram(chat_id, message_id, dest_path)
+            result = await _download_with_pyrogram(chat_id, message_id, dest_path, progress_callback=progress_callback)
             if result:
                 return True
             logger.info("userbot: Pyrogram download failed; trying Telethon fallback")
@@ -270,7 +301,9 @@ async def download_forward_via_userbot(
     if TelegramClient is not None and has_usable_telethon_session():
         try:
             result = await _download_with_telethon(
-                chat_id, message_id, dest_path, msg_date, file_unique_id
+                chat_id, message_id, dest_path,
+                msg_date, file_unique_id,
+                progress_callback=progress_callback,
             )
             if result:
                 return True
@@ -286,11 +319,15 @@ async def download_forward_via_userbot(
 async def download_bytes_via_userbot(
     chat_id: Union[int, str],
     message_id: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[bytes]:
     """Download a message media into memory (bytes) using userbot.
 
     Tries Pyrogram with ``in_memory=True`` first.
     Falls back to Telethon (BytesIO) if Pyrogram fails.
+
+    If ``progress_callback`` is provided, it will be forwarded to the
+    underlying download method for real-time progress updates.
     """
     if TelegramClient is None and PyrogramClient is None:
         raise RuntimeError(
@@ -307,7 +344,7 @@ async def download_bytes_via_userbot(
 
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
-            data = await _download_bytes_with_pyrogram(chat_id, message_id)
+            data = await _download_bytes_with_pyrogram(chat_id, message_id, progress_callback=progress_callback)
             if data is not None:
                 return data
         except Exception as e:
@@ -327,7 +364,10 @@ async def download_bytes_via_userbot(
                     msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
                     if getattr(msg, "media", None):
                         buf = io.BytesIO()
-                        await _client.download_media(msg, file=buf)
+                        kwargs = {"file": buf}
+                        if progress_callback is not None:
+                            kwargs["progress_callback"] = progress_callback
+                        await _client.download_media(msg, **kwargs)
                         data = buf.getvalue()
                         if data and len(data) > 0:
                             return data
