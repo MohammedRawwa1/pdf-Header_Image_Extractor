@@ -53,10 +53,14 @@ def build_telethon_client(api_id: int, api_hash: str):
 
     # Read timeout/retry config from env, with sensible defaults for large-file downloads
     # that may span multiple DCs (e.g., "File lives in another DC" scenario).
-    _timeout = int(os.getenv("TELETHON_TIMEOUT", "60"))          # per-request timeout (seconds)
-    _req_retries = int(os.getenv("TELETHON_REQUEST_RETRIES", "5")) # retries on request failure
+    # Defaults tuned for large file downloads (50MB+).
+    # Timeout per-request: 120s handles cross-DC file access delays.
+    # Retries: 10 request + 5 connection = plenty of room for transient DC issues.
+    # Retry delay: 3s backoff gives Telegram DCs time to recover.
+    _timeout = int(os.getenv("TELETHON_TIMEOUT", "120"))          # per-request timeout (seconds)
+    _req_retries = int(os.getenv("TELETHON_REQUEST_RETRIES", "10")) # retries on request failure
     _conn_retries = int(os.getenv("TELETHON_CONNECTION_RETRIES", "5"))  # retries on connection failure
-    _retry_delay = int(os.getenv("TELETHON_RETRY_DELAY", "2"))     # seconds between retries
+    _retry_delay = int(os.getenv("TELETHON_RETRY_DELAY", "3"))     # seconds between retries
 
     session_str = _get_env_value(
         "API_SESSION",

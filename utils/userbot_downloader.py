@@ -321,6 +321,169 @@ async def _download_bytes_from_raw_channel(
     return None
 
 
+async def _download_file_by_file_id(
+    file_id: str,
+    dest_path: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> bool:
+    """Download a file directly by Bot API file_id using Telethon's resolve_bot_file_id.
+
+    This bypasses chat/message resolution entirely and is the fastest path for
+    downloading files. Works regardless of whether the userbot has joined the
+    source chat, because it uses the raw file location embedded in the Bot API
+    file_id.
+
+    Args:
+        file_id: Telegram Bot API file_id.
+        dest_path: Local path to save the downloaded file.
+        progress_callback: Optional callable(current_bytes, total_bytes).
+
+    Returns:
+        True on success, False on failure.
+    """
+    if TelegramClient is None:
+        logger.debug("userbot: Telethon not installed; cannot download by file_id")
+        return False
+
+    from telethon.utils import resolve_bot_file_id
+
+    from utils.telethon_session import build_telethon_client, get_userbot_credentials
+    api_id, api_hash = get_userbot_credentials()
+
+    client = build_telethon_client(api_id, api_hash)
+    try:
+        await client.start()
+    except Exception as e:
+        logger.warning("userbot: failed to start Telethon client for file_id download: %s", e)
+        return False
+
+    try:
+        resolved = resolve_bot_file_id(file_id)
+        if resolved is None:
+            logger.warning("userbot: resolve_bot_file_id returned None for file_id (may be unsupported version)")
+            return False
+
+        location, file_size = resolved
+        logger.info(
+            "userbot: file_id resolved to location (size=%s), downloading to %s",
+            file_size, dest_path,
+        )
+
+        _dest_dir = os.path.dirname(dest_path)
+        if _dest_dir:
+            try:
+                os.makedirs(_dest_dir, exist_ok=True)
+            except Exception as e:
+                logger.warning("userbot: could not create dest dir %s: %s", _dest_dir, e)
+
+        # download_file writes directly to the file path
+        dl_kwargs = {"file": dest_path}
+        if progress_callback is not None:
+            dl_kwargs["progress_callback"] = progress_callback
+
+        await client.download_file(location, **dl_kwargs)
+
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            # Validate PDF files to catch corrupted/incomplete downloads
+            if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
+                logger.warning("userbot: file_id-downloaded PDF is corrupted/invalid, removing")
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+                return False
+            logger.info(
+                "userbot: file_id download succeeded: %s (%d bytes)",
+                dest_path, os.path.getsize(dest_path),
+            )
+            return True
+
+        logger.warning("userbot: file_id download produced empty file at %s", dest_path)
+        return False
+    except Exception as e:
+        logger.warning("userbot: file_id download error: %s", e)
+        return False
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _resolve_telethon_entity(client, chat_id: Union[int, str]):
+    """Resolve a chat/peer entity for Telethon with multiple fallback strategies.
+
+    Telethon needs a cached entity (from ``get_entity`` or dialog iteration)
+    to download messages from a chat. This function tries several approaches:
+    1. Direct ``client.get_entity()`` with the original ID
+    2. For channel IDs, try with ``-100`` prefix normalization
+    3. Iterate through recent dialogs and match by ID
+
+    Args:
+        client: An active Telethon client.
+        chat_id: Numeric chat ID or @username.
+
+    Returns:
+        Resolved entity on success, or None on failure.
+    """
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        try:
+            return await client.get_entity(chat_id)
+        except Exception as e:
+            logger.debug("userbot: get_entity(@) failed for %s: %s", chat_id, e)
+            return None
+
+    # Strategy 1: Try direct get_entity with the raw ID
+    try:
+        return await client.get_entity(chat_id)
+    except ValueError as e:
+        err_str = str(e)
+        if "Could not find the input entity" in err_str:
+            logger.debug("userbot: get_entity(%s) entity not found, trying alternative strategies", chat_id)
+        else:
+            logger.debug("userbot: get_entity(%s) failed: %s", chat_id, e)
+    except Exception as e:
+        logger.debug("userbot: get_entity(%s) failed: %s", chat_id, e)
+
+    # Strategy 2: For Bot API channel IDs (e.g. -100xxxxxxxxx), try resolving
+    # by constructing the canonical peer and using raw API
+    if isinstance(chat_id, int) and chat_id < 0:
+        s = str(chat_id)
+        if s.startswith("-100"):
+            raw_id = abs(chat_id) - 1000000000000
+            try:
+                from telethon import types as t_types
+                from telethon.tl.functions.channels import GetChannelsRequest
+                peer = t_types.InputChannel(channel_id=raw_id, access_hash=0)
+                result = await client(GetChannelsRequest(id=[peer]))
+                if result and result.chats:
+                    entity = result.chats[0]
+                    logger.info(
+                        "userbot: resolved channel via raw API: %s (id=%s)",
+                        type(entity).__name__, getattr(entity, "id", None),
+                    )
+                    return entity
+            except Exception as e2:
+                logger.debug("userbot: raw channel resolution failed for %s: %s", chat_id, e2)
+
+    # Strategy 3: Scan recent dialogs for a matching entity
+    try:
+        async for dialog in client.iter_dialogs(limit=200):
+            if dialog and dialog.entity:
+                eid = getattr(dialog.entity, "id", None)
+                if eid and eid == abs(chat_id):
+                    logger.info(
+                        "userbot: resolved entity via dialog scan: %s (id=%s)",
+                        type(dialog.entity).__name__, eid,
+                    )
+                    return dialog.entity
+    except Exception as e3:
+        logger.debug("userbot: dialog scan failed: %s", e3)
+
+    logger.warning("userbot: could not resolve entity for chat_id=%s", chat_id)
+    return None
+
+
 async def _download_with_telethon(
     chat_id: Union[int, str],
     message_id: int,
@@ -328,8 +491,14 @@ async def _download_with_telethon(
     msg_date: Optional[str] = None,
     file_unique_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    file_id: Optional[str] = None,
 ) -> bool:
     """Download using Telethon client.
+
+    If ``file_id`` is provided, tries direct file_id-based download first
+    (fastest path, bypasses chat resolution entirely). Falls back to
+    chat-based download with smart entity resolution if file_id is not
+    available or fails.
 
     If ``progress_callback`` is provided, it will be called with
     ``(current_bytes, total_bytes)`` during download.
@@ -353,24 +522,77 @@ async def _download_with_telethon(
         logger.exception("userbot: failed to start Telethon client: %s", e)
         return False
 
+    # ── Path 0: Try file_id-based download first (fastest, no chat resolution needed) ──
+    if file_id:
+        logger.info("userbot: trying file_id-based download first")
+        # Reuse the _download_file_by_file_id logic with this client instead of creating a new one
+        from telethon.utils import resolve_bot_file_id
+        resolved = resolve_bot_file_id(file_id)
+        if resolved is not None:
+            location, file_size = resolved
+            logger.info(
+                "userbot: file_id resolved to location (size=%s), downloading to %s",
+                file_size, dest_path,
+            )
+            _dest_dir = os.path.dirname(dest_path)
+            if _dest_dir:
+                try:
+                    os.makedirs(_dest_dir, exist_ok=True)
+                except Exception:
+                    pass
+            try:
+                dl_kwargs = {"file": dest_path}
+                if progress_callback is not None:
+                    dl_kwargs["progress_callback"] = progress_callback
+                await client.download_file(location, **dl_kwargs)
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                    if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
+                        logger.warning("userbot: file_id-downloaded PDF is corrupted/invalid, removing")
+                        try:
+                            os.remove(dest_path)
+                        except Exception:
+                            pass
+                    else:
+                        logger.info("userbot: file_id download succeeded: %s", dest_path)
+                        return True
+                logger.warning("userbot: file_id download produced empty file, falling back to chat-based")
+            except Exception as e:
+                logger.warning("userbot: file_id download failed (%s), falling back to chat-based", e)
+        else:
+            logger.warning("userbot: resolve_bot_file_id returned None (unsupported file_id version), falling back to chat-based")
+
     # Cap total download attempts to prevent infinite retry storms.
-    # Each attempt that times out or produces a corrupt file counts.
-    # Note: the direct-message for-loop (range(3)) always runs to completion
-    # (corrupt files use ``continue`` instead of ``break``), so the budget
-    # is consumed deterministically: 3 for direct + up to MAX_TOTAL_ATTEMPTS-3
-    # for scan-fallback.
-    MAX_TOTAL_ATTEMPTS = int(os.getenv("TELETHON_MAX_RETRY_ATTEMPTS", "12"))
+    MAX_TOTAL_ATTEMPTS = int(os.getenv("TELETHON_MAX_RETRY_ATTEMPTS", "20"))
+    _dest_dir = os.path.dirname(dest_path)
+    if _dest_dir:
+        try:
+            os.makedirs(_dest_dir, exist_ok=True)
+        except Exception:
+            pass
 
     try:
         target = await _normalize_target(chat_id, client)
 
         total_attempts = 0
 
-        try:
-            msgs = await client.get_messages(target, ids=message_id)
-        except Exception as e:
-            logger.exception("userbot: get_messages direct by id failed: %s", e)
+        # Use smart entity resolution for better channel/chat handling
+        resolved_entity = await _resolve_telethon_entity(client, chat_id)
+        if resolved_entity is not None:
+            try:
+                msgs = await client.get_messages(resolved_entity, ids=message_id)
+            except Exception as e:
+                logger.warning("userbot: get_messages via resolved entity failed: %s; trying raw target", e)
+                msgs = None
+        else:
             msgs = None
+
+        # If entity resolution didn't work, fall back to direct get_messages
+        if msgs is None:
+            try:
+                msgs = await client.get_messages(target, ids=message_id)
+            except Exception as e:
+                logger.warning("userbot: get_messages direct by id failed: %s", e)
+                msgs = None
 
         if msgs:
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
@@ -390,7 +612,6 @@ async def _download_with_telethon(
                             kwargs["progress_callback"] = progress_callback
                         await client.download_media(msg, **kwargs)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                            # Validate PDF files to catch corrupted/incomplete downloads
                             if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                 logger.warning(
                                     "userbot: downloaded PDF is corrupted/invalid (attempt %s), removing and retrying",
@@ -400,7 +621,7 @@ async def _download_with_telethon(
                                     os.remove(dest_path)
                                 except Exception:
                                     pass
-                                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                                await asyncio.sleep(2 ** attempt)
                                 continue
                             return True
                         logger.warning("userbot: downloaded file empty (attempt %s) %s", attempt + 1, dest_path)
@@ -408,12 +629,12 @@ async def _download_with_telethon(
                             os.remove(dest_path)
                         except Exception:
                             pass
-                        await asyncio.sleep(2 ** attempt)  # exponential backoff
+                        await asyncio.sleep(2 ** attempt)
                     except Exception as e:
                         logger.exception("userbot: download attempt %s failed: %s", attempt + 1, e)
-                        await asyncio.sleep(2 ** attempt)  # exponential backoff
+                        await asyncio.sleep(2 ** attempt)
 
-        # Scan recent messages as fallback (only if we haven't exhausted our budget)
+        # Scan recent messages as fallback
         try:
             async for m in client.iter_messages(target, limit=200):
                 if total_attempts > MAX_TOTAL_ATTEMPTS:
@@ -437,7 +658,6 @@ async def _download_with_telethon(
                                 kwargs["progress_callback"] = progress_callback
                             await client.download_media(m, **kwargs)
                             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                                # Validate PDF files to catch corrupted/incomplete downloads
                                 if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                     logger.warning(
                                         "userbot: scan-fallback downloaded PDF is corrupted/invalid, removing",
@@ -446,12 +666,12 @@ async def _download_with_telethon(
                                         os.remove(dest_path)
                                     except Exception:
                                         pass
-                                    await asyncio.sleep(2 ** attempt)  # exponential backoff
+                                    await asyncio.sleep(2 ** attempt)
                                     continue
                                 return True
-                            await asyncio.sleep(2 ** attempt)  # exponential backoff
+                            await asyncio.sleep(2 ** attempt)
                         except Exception:
-                            await asyncio.sleep(2 ** attempt)  # exponential backoff
+                            await asyncio.sleep(2 ** attempt)
         except Exception:
             pass
 
@@ -786,11 +1006,17 @@ async def download_forward_via_userbot(
     msg_date: Optional[str] = None,
     file_unique_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    file_id: Optional[str] = None,
 ) -> bool:
     """Download a message media using a user account.
 
-    Tries Telethon first (with string session or file-based session),
-    then falls back to Pyrogram if a session string is configured.
+    Tries file_id-based download first (if ``file_id`` provided, this bypasses
+    chat resolution entirely and is the fastest path), then Telethon, then
+    Pyrogram session string fallback.
+
+    When called with ``chat_id=0, message_id=0`` (sentinel values used when
+    only ``file_id`` is available), the chat-based fallbacks are skipped
+    entirely to avoid wasting time on invalid IDs.
 
     If ``progress_callback`` is provided, it will be forwarded to the
     underlying download method for real-time progress updates.
@@ -808,6 +1034,28 @@ async def download_forward_via_userbot(
         has_usable_telethon_session,
     )
 
+    # ── 0) File_id-based download (fastest path, no chat resolution needed) ──
+    if file_id and TelegramClient is not None and has_usable_telethon_session():
+        logger.info("userbot: trying file_id-based download as primary method")
+        try:
+            result = await _download_file_by_file_id(
+                file_id, dest_path, progress_callback=progress_callback,
+            )
+            if result:
+                return True
+            logger.info("userbot: file_id download failed; trying chat-based Telethon download")
+        except Exception as e:
+            logger.warning("userbot: file_id download error (%s); trying chat-based Telethon", e)
+
+    # ── Sentinel check: if chat_id=0 and message_id=0, file_id was the only
+    # option available — skip chat-based downloads to avoid wasting time on
+    # invalid IDs.
+    _only_file_id = (chat_id == 0 or str(chat_id) == "0") and (message_id == 0 or str(message_id) == "0")
+    if _only_file_id:
+        logger.info("userbot: sentinel chat_id/message_id detected (file_id-only mode), skipping chat-based fallbacks")
+        logger.warning("userbot: all download methods failed for file_id (no chat fallback available)")
+        return False
+
     # ── 1) Telethon (preferred: faster, better large-file support) ──
     if TelegramClient is not None and has_usable_telethon_session():
         try:
@@ -815,6 +1063,7 @@ async def download_forward_via_userbot(
                 chat_id, message_id, dest_path,
                 msg_date, file_unique_id,
                 progress_callback=progress_callback,
+                file_id=file_id,
             )
             if result:
                 return True
@@ -824,7 +1073,7 @@ async def download_forward_via_userbot(
     elif TelegramClient is not None:
         logger.info("userbot: Telethon session not configured; skipping Telethon download")
 
-    # ── 2) Pyrogram fallback ──
+    # ── 2) Pyrogram fallback (if configured) ──
     pyrogram_session_configured = bool(get_pyrogram_session_string())
     if PyrogramClient is not None and pyrogram_session_configured:
         try:

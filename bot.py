@@ -176,18 +176,26 @@ async def _userbot_download_fallback(
     chat_id,
     loop,
     forward_info: dict | None = None,
+    file_id: str | None = None,
 ):
-    """Try relay group -> forward source -> direct chat -> BigFilePipeline for userbot download.
+    """Try file_id -> forward source -> relay group -> direct chat -> BigFilePipeline.
 
-    Follows the reference pattern from media_conersion_bot: tries the original
-    forward source (when available) before relay/direct chat, since the userbot
-    may have access to the original chat.
+    Order of attempts:
+    0. File_id-based download (fastest, no chat resolution needed)
+    1. Forward source (original chat, when available)
+    2. Relay group (forward to relay chat -> download via userbot)
+    3. Direct chat download (userbot in same chat)
+    4. BigFilePipeline (S3 pipeline)
+
+    ``file_id`` is the Telegram Bot API ``file_id`` from the document. When provided,
+    Telethon's ``resolve_bot_file_id`` is used to download directly by file location,
+    bypassing chat/message resolution entirely.
 
     Creates a progress task and tries each download method in sequence.
 
     Args:
         forward_info: Dict with keys 'chat_id', 'message_id', 'user_id' from forwarded messages.
-                      When available, the userbot tries the original forward source first.
+        file_id: Telegram Bot API ``file_id`` for direct file location download.
 
     Returns:
         "local"    -> file downloaded to file_path, caller should thumbnail + send
@@ -206,8 +214,34 @@ async def _userbot_download_fallback(
 
     dl_ok = False
 
-    # 0) Forward source (original chat, if available and different from current chat)
-    if forward_info:
+    # 0) File_id-based download (fastest path, bypasses chat resolution entirely)
+    if not dl_ok and file_id:
+        try:
+            logger.info(
+                "file_id: trying direct file_id-based download (bypasses chat resolution)"
+            )
+            dl_ok = await download_forward_via_userbot(
+                chat_id=0,  # not used when file_id is provided
+                message_id=0,  # not used when file_id is provided
+                dest_path=file_path,
+                progress_callback=_cb,
+                file_id=file_id,
+            )
+            if dl_ok and filename.lower().endswith('.pdf'):
+                if not is_valid_pdf(file_path):
+                    logger.warning(
+                        "file_id: downloaded PDF is corrupted, removing and trying next method"
+                    )
+                    dl_ok = False
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+        except Exception as fid_err:
+            logger.warning("file_id download failed: %s", fid_err)
+
+    # 1) Forward source (original chat, if available and different from current chat)
+    if not dl_ok and forward_info:
         fwd_chat_id = forward_info.get("chat_id")
         fwd_msg_id = forward_info.get("message_id")
         if fwd_chat_id and fwd_msg_id and fwd_chat_id != msg.chat.id:
@@ -221,8 +255,8 @@ async def _userbot_download_fallback(
                     message_id=fwd_msg_id,
                     dest_path=file_path,
                     progress_callback=_cb,
+                    file_id=file_id,
                 )
-                # Validate PDF after successful download
                 if dl_ok and filename.lower().endswith('.pdf'):
                     if not is_valid_pdf(file_path):
                         logger.warning(
@@ -236,7 +270,7 @@ async def _userbot_download_fallback(
             except Exception as fwd_err:
                 logger.warning("forward source download failed: %s", fwd_err)
 
-    # 1) Relay group: forward to relay chat -> download via userbot
+    # 2) Relay group: forward to relay chat -> download via userbot
     if not dl_ok:
         relay_chat = config.RELAY_CHAT_ID
         if relay_chat:
@@ -258,8 +292,8 @@ async def _userbot_download_fallback(
                         message_id=relay_msg_id,
                         dest_path=file_path,
                         progress_callback=_cb,
+                        file_id=file_id,
                     )
-                    # Validate PDF after successful download
                     if dl_ok and filename.lower().endswith('.pdf'):
                         if not is_valid_pdf(file_path):
                             logger.warning(
@@ -273,7 +307,7 @@ async def _userbot_download_fallback(
             except Exception as relay_err:
                 logger.warning("relay: forward or download failed: %s", relay_err)
 
-    # 2) Direct chat download (group chat where userbot is a member)
+    # 3) Direct chat download (group chat where userbot is a member)
     if not dl_ok:
         logger.info("relay failed or not configured, trying direct chat download")
         dl_ok = await download_forward_via_userbot(
@@ -281,8 +315,8 @@ async def _userbot_download_fallback(
             message_id=msg.message_id,
             dest_path=file_path,
             progress_callback=_cb,
+            file_id=file_id,
         )
-        # Validate PDF after successful download (no more fallbacks available beyond BigFilePipeline)
         if dl_ok and filename.lower().endswith('.pdf'):
             if not is_valid_pdf(file_path):
                 logger.warning(
@@ -294,7 +328,7 @@ async def _userbot_download_fallback(
                 except Exception:
                     pass
 
-    # 3) BigFilePipeline (S3 pipeline)
+    # 4) BigFilePipeline (S3 pipeline)
     if not dl_ok and _bigfile_pipeline is not None:
         logger.info("direct download failed, trying BigFilePipeline")
         try:
@@ -637,6 +671,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 file_size or 0, getattr(doc, 'file_unique_id', None),
                 user_id, chat_id, _loop,
                 forward_info=forward_info,
+                file_id=doc.file_id,
             )
             if _dl_result == "pipeline":
                 return
@@ -718,6 +753,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     file_size or 0, getattr(doc, 'file_unique_id', None),
                     user_id, chat_id, _loop,
                     forward_info=forward_info,
+                    file_id=doc.file_id,
                 )
                 if _dl_result == "local":
                     # Retry thumbnail + send
@@ -839,6 +875,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 photo_size, getattr(photo, 'file_unique_id', None),
                 user_id, chat_id, _loop,
                 forward_info=photo_forward_info,
+                file_id=photo.file_id,
             )
             if _dl_result == "pipeline":
                 return
@@ -896,6 +933,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     photo_size or 0, getattr(photo, 'file_unique_id', None),
                     user_id, chat_id, _loop,
                     forward_info=photo_forward_info,
+                    file_id=photo.file_id,
                 )
                 if _dl_result == "local":
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
