@@ -38,6 +38,39 @@ except ImportError:
     _FITZ_AVAILABLE = False
 
 
+def _get_bot_user_id() -> Optional[int]:
+    """Extract the bot's user ID from the BOT_TOKEN environment variable.
+
+    When the Bot API reports ``chat_id == user_id`` (i.e. the user's ID in a DM),
+    MTProto clients (Telethon/Pyrogram) need the **bot's user ID** to access
+    those same messages from the bot's chat.  This helper extracts the bot's
+    numeric ID from the first segment of the BOT_TOKEN.
+
+    Returns:
+        The bot user ID (int), or None if BOT_TOKEN is not set or malformed.
+    """
+    token = os.getenv("BOT_TOKEN", "")
+    if ":" in token:
+        try:
+            return int(token.split(":")[0])
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+def _is_user_dm_chat(chat_id: Union[int, str]) -> bool:
+    """Return True if ``chat_id`` looks like a user-to-bot DM chat.
+
+    In the Bot API, DMs use the user's Telegram ID as the ``chat_id``,
+    which is always a positive integer.  Negative IDs are groups/channels.
+    """
+    try:
+        cid = int(chat_id)
+        return cid > 0
+    except (TypeError, ValueError):
+        return False
+
+
 async def _normalize_target(chat_id: Union[int, str], client=None):
     """Return a compatible target entity for ``chat_id``."""
     if isinstance(chat_id, str) and chat_id.startswith("@"):
@@ -558,6 +591,26 @@ async def _download_with_telethon(
                 logger.warning("userbot: get_messages direct by id failed: %s", e)
                 msgs = None
 
+        # ── DM fallback: Bot API chat_id maps to user ID in DMs, but MTProto
+        # needs the **bot's** user ID.  Try resolving the bot from BOT_TOKEN.
+        if msgs is None and _is_user_dm_chat(chat_id):
+            bot_user_id = _get_bot_user_id()
+            if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+                try:
+                    logger.info(
+                        "userbot: DM chat detected (chat_id=%s), trying bot entity (bot_id=%s)",
+                        chat_id, bot_user_id,
+                    )
+                    bot_entity = await client.get_entity(bot_user_id)
+                    if bot_entity is not None:
+                        logger.info(
+                            "userbot: resolved bot entity, trying get_messages from bot DM"
+                        )
+                        msgs = await client.get_messages(bot_entity, ids=message_id)
+                except Exception as e:
+                    logger.warning("userbot: bot entity resolution failed: %s", e)
+                    msgs = None
+
         if msgs:
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
             if getattr(msg, "media", None):
@@ -690,6 +743,19 @@ async def _download_bytes_with_pyrogram(
         # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
         _candidates = [await _resolve_pyrogram_peer(client, target)]
 
+        # ── DM fallback: if chat_id looks like a user ID (Bot API DM),
+        # also try the bot's user ID so Pyrogram can access the bot's chat.
+        if _is_user_dm_chat(chat_id):
+            bot_user_id = _get_bot_user_id()
+            if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+                bot_resolved = await _resolve_pyrogram_peer(client, bot_user_id)
+                if bot_resolved not in _candidates:
+                    _candidates.append(bot_resolved)
+                    logger.info(
+                        "userbot: added bot user ID %s as candidate for in-memory DM download",
+                        bot_user_id,
+                    )
+
         total_attempts = 0
 
         for _peer in _candidates:
@@ -717,7 +783,6 @@ async def _download_bytes_with_pyrogram(
                                 )
                                 return data
                         else:
-                            # Message has no media — won't change on retry, exit loop
                             break
                 except ValueError as e:
                     err_str = str(e)
@@ -798,9 +863,20 @@ async def _download_with_pyrogram(
         target = await _normalize_target(chat_id)
 
         # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
-        # Note: userbots cannot interact with bot peers, so we only resolve
-        # the original chat_id (skip the bot's user ID entirely).
         _candidates = [await _resolve_pyrogram_peer(client, target)]
+
+        # ── DM fallback: if chat_id looks like a user ID (Bot API DM),
+        # also try the bot's user ID so Pyrogram can access the bot's chat.
+        if await _is_user_dm_chat(chat_id):
+            bot_user_id = _get_bot_user_id()
+            if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+                bot_resolved = await _resolve_pyrogram_peer(client, bot_user_id)
+                if bot_resolved not in _candidates:
+                    _candidates.append(bot_resolved)
+                    logger.info(
+                        "userbot: added bot user ID %s as candidate for DM download",
+                        bot_user_id,
+                    )
 
         total_attempts = 0
 
@@ -829,7 +905,6 @@ async def _download_with_pyrogram(
                                     if os.path.exists(_dl_path):
                                         shutil.move(_dl_path, _abs_dest)
                                 if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
-                                    # Validate PDF files to catch corrupted/incomplete downloads
                                     if _is_likely_pdf(_abs_dest) and not _validate_downloaded_pdf(_abs_dest):
                                         logger.warning(
                                             "userbot: Pyrogram downloaded PDF is corrupted/invalid "
@@ -843,14 +918,12 @@ async def _download_with_pyrogram(
                                         await asyncio.sleep(2 ** attempt)
                                         continue
                                     return True
-                            # Not valid — clean up and retry with backoff
                             if os.path.exists(dest_path):
                                 try:
                                     os.remove(dest_path)
                                 except Exception:
                                     pass
                         else:
-                            # Message has no media — won't change on retry, exit loop
                             break
                 except ValueError as e:
                     err_str = str(e)
@@ -1085,6 +1158,23 @@ async def download_bytes_via_userbot(
                     except Exception as e:
                         logger.warning("userbot: Telethon in-memory get_messages failed: %s", e)
                         msgs = None
+
+                    # ── DM fallback: try bot entity for in-memory download too
+                    if not msgs and _is_user_dm_chat(chat_id):
+                        bot_user_id = _get_bot_user_id()
+                        if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
+                            try:
+                                bot_entity = await _client.get_entity(bot_user_id)
+                                if bot_entity is not None:
+                                    logger.info(
+                                        "userbot: in-memory DM fallback, trying bot entity %s",
+                                        bot_user_id,
+                                    )
+                                    msgs = await _client.get_messages(bot_entity, ids=message_id)
+                            except Exception as e:
+                                logger.warning("userbot: in-memory bot entity resolution failed: %s", e)
+                                msgs = None
+
                     if msgs:
                         msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
                         if getattr(msg, "media", None):
