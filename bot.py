@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from tools import create_thumbnail_from_pdf, create_thumbnail_from_image
+from tools import create_thumbnail_from_pdf, create_thumbnail_from_image, is_valid_pdf
 import config
 from config import OWNER_ID
 from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
@@ -222,6 +222,17 @@ async def _userbot_download_fallback(
                     dest_path=file_path,
                     progress_callback=_cb,
                 )
+                # Validate PDF after successful download
+                if dl_ok and filename.lower().endswith('.pdf'):
+                    if not is_valid_pdf(file_path):
+                        logger.warning(
+                            "forward source: downloaded PDF is corrupted, trying next method"
+                        )
+                        dl_ok = False
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
             except Exception as fwd_err:
                 logger.warning("forward source download failed: %s", fwd_err)
 
@@ -248,6 +259,17 @@ async def _userbot_download_fallback(
                         dest_path=file_path,
                         progress_callback=_cb,
                     )
+                    # Validate PDF after successful download
+                    if dl_ok and filename.lower().endswith('.pdf'):
+                        if not is_valid_pdf(file_path):
+                            logger.warning(
+                                "relay: downloaded PDF is corrupted, trying next method"
+                            )
+                            dl_ok = False
+                            try:
+                                os.remove(file_path)
+                            except Exception:
+                                pass
             except Exception as relay_err:
                 logger.warning("relay: forward or download failed: %s", relay_err)
 
@@ -260,6 +282,17 @@ async def _userbot_download_fallback(
             dest_path=file_path,
             progress_callback=_cb,
         )
+        # Validate PDF after successful download (no more fallbacks available beyond BigFilePipeline)
+        if dl_ok and filename.lower().endswith('.pdf'):
+            if not is_valid_pdf(file_path):
+                logger.warning(
+                    "direct chat: downloaded PDF is corrupted, will try BigFilePipeline"
+                )
+                dl_ok = False
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
 
     # 3) BigFilePipeline (S3 pipeline)
     if not dl_ok and _bigfile_pipeline is not None:
@@ -627,6 +660,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 await file.download_to_drive(custom_path=file_path)
             _dl_success = True
+
+        # Validate PDF downloaded via Bot API — catch corrupted files before thumbnail creation
+        if (filename.lower().endswith('.pdf') or mime == 'application/pdf') and not is_valid_pdf(file_path):
+            logger.warning(
+                "Bot API download: downloaded PDF is corrupted/invalid, will retry via userbot"
+            )
+            _dl_success = False
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+            raise RuntimeError("Bot API download produced invalid PDF, falling back to userbot")
 
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         lower = filename.lower()

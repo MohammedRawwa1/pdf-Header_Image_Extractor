@@ -9,6 +9,20 @@ except Exception as e:
     raise ImportError("PyMuPDF (fitz) is required. Install with 'pip install PyMuPDF'") from e
 
 
+def is_valid_pdf(file_path: str) -> bool:
+    """Check if a file is a valid PDF by attempting to open it with PyMuPDF.
+
+    Returns True if the file opens successfully as a PDF, False otherwise.
+    Does NOT raise exceptions.
+    """
+    try:
+        doc = fitz.open(file_path)
+        doc.close()
+        return True
+    except Exception:
+        return False
+
+
 def create_thumbnail_from_pdf(pdf_path: str, thumb_path: str) -> None:
     doc = fitz.open(pdf_path)
     page = doc.load_page(0)

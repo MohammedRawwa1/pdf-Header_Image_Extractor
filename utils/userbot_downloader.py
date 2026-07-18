@@ -27,6 +27,16 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# Check if PyMuPDF (fitz) is available for PDF validation after download.
+# If not installed, PDF validation is skipped and all downloads are accepted
+# at the file-exists level (graceful degradation — the error will surface later
+# when thumbnail creation is attempted).
+try:
+    import fitz as _fitz
+    _FITZ_AVAILABLE = True
+except ImportError:
+    _FITZ_AVAILABLE = False
+
 
 async def _normalize_target(chat_id: Union[int, str], client=None):
     """Return a compatible target entity for ``chat_id``."""
@@ -106,6 +116,33 @@ async def _resolve_pyrogram_peer(client, peer_id: Union[int, str]) -> int:
 # ``Peer id invalid`` BEFORE any network request is made.
 # The helpers below bypass this via raw MTProto API.
 # Adapted from the media_conersion_bot reference implementation.
+
+def _is_likely_pdf(path: str) -> bool:
+    """Return True if the file path has a .pdf extension."""
+    return path.lower().endswith(".pdf")
+
+
+def _validate_downloaded_pdf(path: str) -> bool:
+    """Validate a downloaded PDF file by attempting to open it with PyMuPDF.
+
+    Returns True if the file is a valid PDF, False otherwise.
+    Logs a warning if validation fails.
+
+    If PyMuPDF (fitz) is not installed, skips validation and returns True
+    (assumes valid — the error will surface later during thumbnail creation).
+    """
+    if not os.path.exists(path):
+        return False
+    if not _FITZ_AVAILABLE:
+        return True  # can't validate, assume valid
+    try:
+        doc = _fitz.open(path)
+        doc.close()
+        return True
+    except Exception as e:
+        logger.warning("userbot: downloaded PDF validation failed for %s: %s", path, e)
+        return False
+
 
 def _is_large_bot_api_channel(peer_id) -> bool:
     """Return True if ``peer_id`` is a Bot API channel ID whose raw
@@ -290,6 +327,17 @@ async def _download_with_telethon(
                             kwargs["progress_callback"] = progress_callback
                         await client.download_media(msg, **kwargs)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                            # Validate PDF files to catch corrupted/incomplete downloads
+                            if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
+                                logger.warning(
+                                    "userbot: downloaded PDF is corrupted/invalid (attempt %s), removing and retrying",
+                                    attempt + 1,
+                                )
+                                try:
+                                    os.remove(dest_path)
+                                except Exception:
+                                    pass
+                                continue
                             return True
                         logger.warning("userbot: downloaded file empty (attempt %s) %s", attempt + 1, dest_path)
                         try:
@@ -310,6 +358,16 @@ async def _download_with_telethon(
                                 kwargs["progress_callback"] = progress_callback
                             await client.download_media(m, **kwargs)
                             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                                # Validate PDF files to catch corrupted/incomplete downloads
+                                if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
+                                    logger.warning(
+                                        "userbot: scan-fallback downloaded PDF is corrupted/invalid, removing",
+                                    )
+                                    try:
+                                        os.remove(dest_path)
+                                    except Exception:
+                                        pass
+                                    continue
                                 return True
                         except Exception:
                             pass
