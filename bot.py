@@ -214,31 +214,10 @@ async def _userbot_download_fallback(
 
     dl_ok = False
 
-    # 0) File_id-based download (fastest path, bypasses chat resolution entirely)
-    if not dl_ok and file_id:
-        try:
-            logger.info(
-                "file_id: trying direct file_id-based download (bypasses chat resolution)"
-            )
-            dl_ok = await download_forward_via_userbot(
-                chat_id=0,  # not used when file_id is provided
-                message_id=0,  # not used when file_id is provided
-                dest_path=file_path,
-                progress_callback=_cb,
-                file_id=file_id,
-            )
-            if dl_ok and filename.lower().endswith('.pdf'):
-                if not is_valid_pdf(file_path):
-                    logger.warning(
-                        "file_id: downloaded PDF is corrupted, removing and trying next method"
-                    )
-                    dl_ok = False
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-        except Exception as fid_err:
-            logger.warning("file_id download failed: %s", fid_err)
+    # Note: file_id-based download (via resolve_bot_file_id) was removed because
+    # modern Bot API file_id formats (v4+) are not supported by Telethon's
+    # resolve_bot_file_id utility.  The file_id parameter is still accepted and
+    # passed to chat-based download methods as a fallback hint.
 
     # 1) Forward source (original chat, if available and different from current chat)
     if not dl_ok and forward_info:

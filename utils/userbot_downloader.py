@@ -522,47 +522,11 @@ async def _download_with_telethon(
         logger.exception("userbot: failed to start Telethon client: %s", e)
         return False
 
-    # ── Path 0: Try file_id-based download first (fastest, no chat resolution needed) ──
-    if file_id:
-        logger.info("userbot: trying file_id-based download first")
-        # Reuse the _download_file_by_file_id logic with this client instead of creating a new one
-        from telethon.utils import resolve_bot_file_id
-        resolved = resolve_bot_file_id(file_id)
-        if resolved is not None:
-            location, file_size = resolved
-            logger.info(
-                "userbot: file_id resolved to location (size=%s), downloading to %s",
-                file_size, dest_path,
-            )
-            _dest_dir = os.path.dirname(dest_path)
-            if _dest_dir:
-                try:
-                    os.makedirs(_dest_dir, exist_ok=True)
-                except Exception:
-                    pass
-            try:
-                dl_kwargs = {"file": dest_path}
-                if progress_callback is not None:
-                    dl_kwargs["progress_callback"] = progress_callback
-                await client.download_file(location, **dl_kwargs)
-                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                    if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
-                        logger.warning("userbot: file_id-downloaded PDF is corrupted/invalid, removing")
-                        try:
-                            os.remove(dest_path)
-                        except Exception:
-                            pass
-                    else:
-                        logger.info("userbot: file_id download succeeded: %s", dest_path)
-                        return True
-                logger.warning("userbot: file_id download produced empty file, falling back to chat-based")
-            except Exception as e:
-                logger.warning("userbot: file_id download failed (%s), falling back to chat-based", e)
-        else:
-            logger.warning("userbot: resolve_bot_file_id returned None (unsupported file_id version), falling back to chat-based")
-
     # Cap total download attempts to prevent infinite retry storms.
     MAX_TOTAL_ATTEMPTS = int(os.getenv("TELETHON_MAX_RETRY_ATTEMPTS", "20"))
+    # Total timeout for the entire download operation (passed to download_media).
+    # 600s = 10 minutes for files up to ~200MB. Adjust via env for faster/slower connections.
+    DOWNLOAD_TOTAL_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
     _dest_dir = os.path.dirname(dest_path)
     if _dest_dir:
         try:
@@ -610,7 +574,9 @@ async def _download_with_telethon(
                         kwargs = {"file": dest_path}
                         if progress_callback is not None:
                             kwargs["progress_callback"] = progress_callback
-                        await client.download_media(msg, **kwargs)
+                        # Pass an explicit total-download timeout to prevent premature
+                        # timeout on large files that span multiple Telegram DCs.
+                        await client.download_media(msg, timeout=DOWNLOAD_TOTAL_TIMEOUT, **kwargs)
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                 logger.warning(
@@ -656,7 +622,8 @@ async def _download_with_telethon(
                             kwargs = {"file": dest_path}
                             if progress_callback is not None:
                                 kwargs["progress_callback"] = progress_callback
-                            await client.download_media(m, **kwargs)
+                            # Pass explicit total-download timeout
+                            await client.download_media(m, timeout=DOWNLOAD_TOTAL_TIMEOUT, **kwargs)
                             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                 if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                     logger.warning(
@@ -1034,26 +1001,17 @@ async def download_forward_via_userbot(
         has_usable_telethon_session,
     )
 
-    # ── 0) File_id-based download (fastest path, no chat resolution needed) ──
-    if file_id and TelegramClient is not None and has_usable_telethon_session():
-        logger.info("userbot: trying file_id-based download as primary method")
-        try:
-            result = await _download_file_by_file_id(
-                file_id, dest_path, progress_callback=progress_callback,
-            )
-            if result:
-                return True
-            logger.info("userbot: file_id download failed; trying chat-based Telethon download")
-        except Exception as e:
-            logger.warning("userbot: file_id download error (%s); trying chat-based Telethon", e)
+    # Note: file_id-based download via _download_file_by_file_id() was removed
+    # because modern Bot API file_id formats (v4+) are not supported by
+    # Telethon's resolve_bot_file_id utility.  The function still exists for
+    # potential future use or manual invocation.
 
-    # ── Sentinel check: if chat_id=0 and message_id=0, file_id was the only
-    # option available — skip chat-based downloads to avoid wasting time on
-    # invalid IDs.
+    # ── Sentinel check: if chat_id=0 and message_id=0, no chat context is
+    # available — skip all chat-based downloads.
     _only_file_id = (chat_id == 0 or str(chat_id) == "0") and (message_id == 0 or str(message_id) == "0")
     if _only_file_id:
-        logger.info("userbot: sentinel chat_id/message_id detected (file_id-only mode), skipping chat-based fallbacks")
-        logger.warning("userbot: all download methods failed for file_id (no chat fallback available)")
+        logger.info("userbot: sentinel chat_id/message_id detected, no chat context available")
+        logger.warning("userbot: all download methods failed (no chat context)")
         return False
 
     # ── 1) Telethon (preferred: faster, better large-file support) ──
