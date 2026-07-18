@@ -79,13 +79,43 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
         except Exception:
             bot_token = None
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        buf = io.BytesIO()
-        for chunk in r.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                buf.write(chunk)
-        return buf.getvalue()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with requests.get(url, stream=True, timeout=60) as r:
+                if r.status_code >= 500 or r.status_code == 429:
+                    # Server error or rate limit — retry with backoff
+                    last_exc = requests.HTTPError(
+                        f"Telegram download failed: status={r.status_code}"
+                    )
+                    logger.warning(
+                        "_tg_download_to_bytes: HTTP %s on attempt %d for %s",
+                        r.status_code, attempt + 1, tg_file_path,
+                    )
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise last_exc
+                r.raise_for_status()
+                buf = io.BytesIO()
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        buf.write(chunk)
+                return buf.getvalue()
+        except (requests.ConnectionError, requests.Timeout, requests.ChunkedEncodingError) as e:
+            # Transient network errors — retry with exponential backoff
+            last_exc = e
+            logger.warning(
+                "_tg_download_to_bytes: transient error %s on attempt %d for %s",
+                type(e).__name__, attempt + 1, tg_file_path,
+            )
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+        except requests.HTTPError:
+            # Non-retryable HTTP errors (e.g., 400, 404) — raise immediately
+            raise
+    raise last_exc or RuntimeError(f"Failed to download {tg_file_path} after 3 attempts")
 
 
 def _tg_send_document(bot_token: str | None, chat_id: int, doc_fileobj, filename: str, thumb_fileobj=None, caption: str | None = None):

@@ -658,7 +658,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if progress_msg_id:
                     await send_progress_update(msg.chat.id, context.bot, task, progress_msg_id)
             else:
-                await file.download_to_drive(custom_path=file_path)
+                await file.download_to_drive(custom_path=file_path, read_timeout=300, write_timeout=300)
             _dl_success = True
 
         # Validate PDF downloaded via Bot API — catch corrupted files before thumbnail creation
@@ -855,7 +855,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 task.start()
                 task.status = "downloading"
 
-            await file.download_to_drive(custom_path=file_path)
+            await file.download_to_drive(custom_path=file_path, read_timeout=300, write_timeout=300)
 
             if task:
                 task.update_progress(os.path.getsize(file_path))

@@ -757,10 +757,35 @@ async def main():
             tmp = _make_temp_path(msg_id, ext)
 
             try:
-                await client_instance.download_media(msg, file=tmp)
-                logger.info("Downloaded incoming media to %s", tmp)
+                for attempt in range(3):
+                    try:
+                        await client_instance.download_media(msg, file=tmp)
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                            logger.info(
+                                "Downloaded incoming media to %s (attempt %d)",
+                                tmp, attempt + 1,
+                            )
+                            break
+                        logger.warning(
+                            "telethon_ingest: download empty (attempt %d) for msg %s, retrying",
+                            attempt + 1, msg_id,
+                        )
+                    except Exception as dl_err:
+                        logger.warning(
+                            "telethon_ingest: download attempt %d failed for msg %s: %s",
+                            attempt + 1, msg_id, dl_err,
+                        )
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                else:
+                    # Loop completed without break — all attempts failed
+                    logger.error(
+                        "telethon_ingest: failed to download media after 3 attempts for msg %s",
+                        msg_id,
+                    )
+                    return
             except Exception:
-                logger.exception("Failed to download media from message %s", msg_id)
+                logger.exception("telethon_ingest: unexpected error downloading msg %s", msg_id)
                 return
 
             # Upload & enqueue
