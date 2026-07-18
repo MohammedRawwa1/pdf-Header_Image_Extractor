@@ -71,6 +71,54 @@ def _is_user_dm_chat(chat_id: Union[int, str]) -> bool:
         return False
 
 
+def _extract_file_dc_id(msg) -> Optional[int]:
+    """Extract the Telegram DC ID where the file in ``msg`` is stored.
+
+    Telethon message media objects contain a ``dc_id`` attribute that tells
+    which Telegram DC (data center) the file resides on.  By migrating the
+    client to that DC before downloading, we avoid ``FILE_MIGRATE_X`` errors
+    and the associated timeout/retry storms that happen during cross-DC file
+    transfers.
+
+    Args:
+        msg: A Telethon ``Message`` object with ``media``.
+
+    Returns:
+        The DC ID (int) if found, else None.
+    """
+    if msg is None:
+        return None
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None
+
+    # Document (files, stickers, voice, video)
+    doc = getattr(media, "document", None)
+    if doc is not None:
+        dc_id = getattr(doc, "dc_id", None)
+        if dc_id:
+            return dc_id
+
+    # Photo
+    photo = getattr(media, "photo", None)
+    if photo is not None:
+        dc_id = getattr(photo, "dc_id", None)
+        if dc_id:
+            return dc_id
+
+    # WebPage (link previews with media)
+    webpage = getattr(media, "webpage", None)
+    if webpage is not None:
+        for attr in ("photo", "document"):
+            sub = getattr(webpage, attr, None)
+            if sub is not None:
+                dc_id = getattr(sub, "dc_id", None)
+                if dc_id:
+                    return dc_id
+
+    return None
+
+
 async def _normalize_target(chat_id: Union[int, str], client=None):
     """Return a compatible target entity for ``chat_id``."""
     if isinstance(chat_id, str) and chat_id.startswith("@"):
@@ -615,6 +663,22 @@ async def _download_with_telethon(
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
             if getattr(msg, "media", None):
                 logger.info("userbot: message found; downloading %s/%s to %s", target, message_id, dest_path)
+
+                # ── Pre-migrate to the file's DC before downloading ──
+                # Cross-DC GetFileRequest timeouts are the #1 cause of download
+                # failures for large files.  Extract the file's DC from the
+                # message media and migrate the client there first.
+                try:
+                    _file_dc = _extract_file_dc_id(msg)
+                    if _file_dc is not None:
+                        logger.info(
+                            "userbot: file DC ID=%s, ensuring client is on correct DC",
+                            _file_dc,
+                        )
+                        await client._set_connection_dc(_file_dc)
+                except Exception as dc_err:
+                    logger.debug("userbot: DC pre-migration skipped: %s", dc_err)
+
                 for attempt in range(3):
                     total_attempts += 1
                     if total_attempts > MAX_TOTAL_ATTEMPTS:
@@ -867,7 +931,7 @@ async def _download_with_pyrogram(
 
         # ── DM fallback: if chat_id looks like a user ID (Bot API DM),
         # also try the bot's user ID so Pyrogram can access the bot's chat.
-        if await _is_user_dm_chat(chat_id):
+        if _is_user_dm_chat(chat_id):
             bot_user_id = _get_bot_user_id()
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
                 bot_resolved = await _resolve_pyrogram_peer(client, bot_user_id)
@@ -1178,6 +1242,19 @@ async def download_bytes_via_userbot(
                     if msgs:
                         msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
                         if getattr(msg, "media", None):
+
+                            # ── Pre-migrate to the file's DC before downloading ──
+                            try:
+                                _file_dc = _extract_file_dc_id(msg)
+                                if _file_dc is not None:
+                                    logger.info(
+                                        "userbot: in-memory file DC ID=%s, migrating",
+                                        _file_dc,
+                                    )
+                                    await _client._set_connection_dc(_file_dc)
+                            except Exception:
+                                pass
+
                             for attempt in range(3):
                                 try:
                                     buf = io.BytesIO()
