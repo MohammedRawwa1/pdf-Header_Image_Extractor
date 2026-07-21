@@ -11,6 +11,7 @@ import json
 import uuid
 import glob
 import time
+from typing import Union
 from urllib.parse import urlparse
 from telegram import InputFile
 from telegram import Update, BotCommand
@@ -96,8 +97,14 @@ async def _send_with_upload_progress(
     bot, chat_id: int, file_path: str, caption: str,
     thumb_path: str | None, user_id: int, filename: str, file_size: int,
     loop: asyncio.AbstractEventLoop,
+    target_chat_id: Union[int, str] = None,
 ) -> bool:
     """Send a file via userbot with upload progress tracking.
+
+    ``chat_id`` is used for the **progress message** (shown in the DM with the bot).
+    ``target_chat_id`` controls where the actual file is uploaded.
+    When ``target_chat_id`` is ``'me'``, the file lands in the userbot's Saved Messages.
+    Defaults to ``chat_id`` when not provided (backward-compatible).
 
     Creates a progress task, shows 'uploading' status with a progress bar,
     then calls send_file_via_userbot with a progress callback that updates
@@ -114,8 +121,9 @@ async def _send_with_upload_progress(
     _cb = _make_progress_cb(task.task_id, loop)
 
     try:
+        _upload_target = target_chat_id if target_chat_id is not None else chat_id
         success = await send_file_via_userbot(
-            chat_id=chat_id, file_path=file_path,
+            chat_id=_upload_target, file_path=file_path,
             caption=caption, thumb_path=thumb_path,
             progress_callback=_cb,
         )
@@ -762,6 +770,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 thumb_path=thumb_path,
                 user_id=user_id, filename=filename, file_size=_dl_size,
                 loop=_loop,
+                target_chat_id='me',
             )
         else:
             with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
@@ -805,6 +814,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             thumb_path=thumb_path,
                             user_id=user_id, filename=filename, file_size=_fb_size,
                             loop=_loop,
+                            target_chat_id='me',
                         )
                     else:
                         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
@@ -940,6 +950,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 thumb_path=thumb_path,
                 user_id=user_id, filename=filename, file_size=_ph_size,
                 loop=_loop,
+                target_chat_id='me',
             )
         else:
             with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
@@ -974,6 +985,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             thumb_path=thumb_path,
                             user_id=user_id, filename=filename, file_size=_ph_fb_size,
                             loop=_loop,
+                            target_chat_id='me',
                         )
                     else:
                         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
@@ -2064,6 +2076,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                         user_id=getattr(update.effective_user, "id", None),
                         filename=base, file_size=_url_file_size,
                         loop=_loop,
+                        target_chat_id='me',
                     )
                 else:
                     with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
