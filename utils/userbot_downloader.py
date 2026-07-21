@@ -26,6 +26,14 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# Module-level default timeout for Telethon download operations.
+# Configurable via TELETHON_DOWNLOAD_TIMEOUT env var (default 600s = 10 min).
+TELETHON_DOWNLOAD_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
+
+# Module-level default timeout for Pyrogram download operations.
+# Configurable via PYROGRAM_DOWNLOAD_TIMEOUT env var (default 600s = 10 min).
+PYROGRAM_DOWNLOAD_TIMEOUT = int(os.getenv("PYROGRAM_DOWNLOAD_TIMEOUT", "600"))
+
 # Check if PyMuPDF (fitz) is available for PDF validation after download.
 # If not installed, PDF validation is skipped and all downloads are accepted
 # at the file-exists level (graceful degradation — the error will surface later
@@ -330,7 +338,10 @@ async def _download_from_raw_channel(
         if progress_callback is not None:
             kwargs["progress"] = progress_callback
         try:
-            _dl = await client.download_media(msg, **kwargs)
+            _dl = await asyncio.wait_for(
+                client.download_media(msg, **kwargs),
+                timeout=PYROGRAM_DOWNLOAD_TIMEOUT,
+            )
         except Exception as e:
             logger.warning(
                 "userbot: raw channel download attempt %s failed: %s",
@@ -387,7 +398,10 @@ async def _download_bytes_from_raw_channel(
             await asyncio.sleep(2 ** attempt)
             continue
         try:
-            data = await client.download_media(msg, in_memory=True)
+            data = await asyncio.wait_for(
+                client.download_media(msg, in_memory=True),
+                timeout=PYROGRAM_DOWNLOAD_TIMEOUT,
+            )
         except Exception as e:
             logger.warning(
                 "userbot: raw channel bytes download attempt %s failed: %s",
@@ -604,9 +618,9 @@ async def _download_with_telethon(
 
     # Cap total download attempts to prevent infinite retry storms.
     MAX_TOTAL_ATTEMPTS = int(os.getenv("TELETHON_MAX_RETRY_ATTEMPTS", "20"))
-    # Total timeout for the entire download operation (passed to download_media).
+    # Total timeout for the entire download operation (used with asyncio.wait_for).
     # 600s = 10 minutes for files up to ~200MB. Adjust via env for faster/slower connections.
-    DOWNLOAD_TOTAL_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
+    DOWNLOAD_TOTAL_TIMEOUT = TELETHON_DOWNLOAD_TIMEOUT
     _dest_dir = os.path.dirname(dest_path)
     if _dest_dir:
         try:
@@ -690,9 +704,14 @@ async def _download_with_telethon(
                         kwargs = {"file": dest_path}
                         if progress_callback is not None:
                             kwargs["progress_callback"] = progress_callback
-                        # Pass an explicit total-download timeout to prevent premature
-                        # timeout on large files that span multiple Telegram DCs.
-                        await client.download_media(msg, timeout=DOWNLOAD_TOTAL_TIMEOUT, **kwargs)
+                        # Wrap in asyncio.wait_for to enforce a total-download timeout
+                        # and prevent hanging on large files that span multiple DCs.
+                        # This is more portable than Telethon's native timeout param
+                        # (which was added in a later version).
+                        await asyncio.wait_for(
+                            client.download_media(msg, **kwargs),
+                            timeout=DOWNLOAD_TOTAL_TIMEOUT,
+                        )
                         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                             if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                 logger.warning(
@@ -738,8 +757,11 @@ async def _download_with_telethon(
                             kwargs = {"file": dest_path}
                             if progress_callback is not None:
                                 kwargs["progress_callback"] = progress_callback
-                            # Pass explicit total-download timeout
-                            await client.download_media(m, timeout=DOWNLOAD_TOTAL_TIMEOUT, **kwargs)
+                            # Wrap in asyncio.wait_for to enforce total-download timeout
+                            await asyncio.wait_for(
+                                client.download_media(m, **kwargs),
+                                timeout=DOWNLOAD_TOTAL_TIMEOUT,
+                            )
                             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
                                 if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(dest_path):
                                     logger.warning(
@@ -838,7 +860,10 @@ async def _download_bytes_with_pyrogram(
                             kwargs = {"in_memory": True}
                             if progress_callback is not None:
                                 kwargs["progress"] = progress_callback
-                            data = await client.download_media(msg, **kwargs)
+                            data = await asyncio.wait_for(
+                                client.download_media(msg, **kwargs),
+                                timeout=PYROGRAM_DOWNLOAD_TIMEOUT,
+                            )
                             if data is not None and isinstance(data, bytes) and len(data) > 0:
                                 logger.info(
                                     "userbot: Pyrogram in-memory download succeeded: %d bytes",
@@ -960,7 +985,10 @@ async def _download_with_pyrogram(
                             kwargs = {"file_name": dest_path}
                             if progress_callback is not None:
                                 kwargs["progress"] = progress_callback
-                            _dl = await client.download_media(msg, **kwargs)
+                            _dl = await asyncio.wait_for(
+                                client.download_media(msg, **kwargs),
+                                timeout=PYROGRAM_DOWNLOAD_TIMEOUT,
+                            )
                             if _dl:
                                 _dl_path = str(_dl)
                                 _abs_dest = os.path.abspath(dest_path)
@@ -1260,7 +1288,10 @@ async def download_bytes_via_userbot(
                                     kwargs = {"file": buf}
                                     if progress_callback is not None:
                                         kwargs["progress_callback"] = progress_callback
-                                    await _client.download_media(msg, **kwargs)
+                                    await asyncio.wait_for(
+                                        _client.download_media(msg, **kwargs),
+                                        timeout=TELETHON_DOWNLOAD_TIMEOUT,
+                                    )
                                     data = buf.getvalue()
                                     if data and len(data) > 0:
                                         logger.info(
