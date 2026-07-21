@@ -122,13 +122,19 @@ async def _send_with_upload_progress(
         if success:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
-                await send_progress_update(chat_id, bot, task, progress_msg_id)
+                try:
+                    await send_progress_update(chat_id, bot, task, progress_msg_id)
+                except Exception:
+                    pass
             logger.info("Upload complete: %s (%s)", filename, _format_size(file_size))
             return True
         else:
             await progress_tracker.fail_task(task.task_id, "Userbot upload returned False")
             if progress_msg_id:
-                await send_progress_update(chat_id, bot, task, progress_msg_id)
+                try:
+                    await send_progress_update(chat_id, bot, task, progress_msg_id)
+                except Exception:
+                    pass
             raise RuntimeError(f"Userbot upload failed for {filename}")
     except Exception as e:
         await progress_tracker.fail_task(task.task_id, str(e))

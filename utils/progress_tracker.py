@@ -341,5 +341,12 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
             return msg.message_id
 
     except Exception as e:
-        logger.error("Error sending progress update: %s", e)
+        err_msg = str(e).lower()
+        # "Message to edit not found" / "message not found" are benign — the progress
+        # message was already deleted or the task finished before the final edit.
+        # Log at DEBUG instead of ERROR to avoid alarming in an otherwise healthy pipeline.
+        if "message to edit not found" in err_msg or "message not found" in err_msg or "message can't be edited" in err_msg:
+            logger.debug("Progress update edit skipped (message gone): %s", e)
+        else:
+            logger.error("Error sending progress update: %s", e)
         return None
