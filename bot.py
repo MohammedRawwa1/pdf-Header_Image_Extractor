@@ -8,6 +8,8 @@ import re
 import aiohttp
 import aiofiles
 import json
+import uuid
+import glob
 import time
 from urllib.parse import urlparse
 from telegram import InputFile
@@ -25,14 +27,14 @@ import config
 from config import OWNER_ID
 from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
 from utils.error_handler import (
-    BotErrorHandler,
     get_error_handler,
     handle_bot_error,
-    async_error_handler,
 )
 from utils.rate_limiter import TelegramAPIRateLimiter
 from utils.bigfile_pipeline import BigFilePipeline
 from utils.userbot_uploader import send_file_via_userbot
+from utils.redis_client import get_sync_redis
+from PIL import Image
 
 # ── Logging configuration (must be before any logger usage) ──
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -104,8 +106,7 @@ async def _send_with_upload_progress(
 
     Returns True on success, raises on failure.
     """
-    import uuid as _uuid
-    task_id = _uuid.uuid4().hex[:12]
+    task_id = uuid.uuid4().hex[:12]
     task = progress_tracker.create_task(task_id, user_id or 0, filename, file_size)
     task.status = "uploading"
     task.start()
@@ -202,10 +203,9 @@ async def _userbot_download_fallback(
         "pipeline" -> handled async by BigFilePipeline, caller should return
         False      -> all methods failed, user already notified
     """
-    import uuid as _uuid
     from utils.userbot_downloader import download_forward_via_userbot
 
-    task_id = _uuid.uuid4().hex[:12]
+    task_id = uuid.uuid4().hex[:12]
     task = progress_tracker.create_task(task_id, user_id or 0, filename, file_size or 0)
     task.status = "downloading"
     task.start()
@@ -486,11 +486,13 @@ async def _track_user_session(update: Update, action: str = "message"):
 # Optional RQ enqueue helper (import only when needed)
 def enqueue_job(func_name: str, *args, **kwargs):
     try:
-        from redis import Redis
         from rq import Queue
         import tasks
 
-        redis_conn = Redis.from_url(config.REDIS_URL)
+        redis_conn = get_sync_redis()
+        if not redis_conn:
+            logger.error("Redis not available for enqueue_job")
+            return False
         q = Queue('default', connection=redis_conn)
         # lookup function from tasks
         func = getattr(tasks, func_name)
@@ -515,25 +517,13 @@ application = ApplicationBuilder().token(BOT_TOKEN).build()
 local_forward_batches = {}
 
 
-def _get_redis_conn():
-    if not config.REDIS_URL:
-        return None
-    try:
-        from redis import Redis
-
-        return Redis.from_url(config.REDIS_URL)
-    except Exception:
-        logger.exception("Redis not available for forward-batch storage")
-        return None
-
-
 def _batch_keys(chat_id: int, user_id: int) -> tuple:
     base = f"forward_batch:{chat_id}:{user_id}"
     return base + ":active", base + ":items"
 
 
 def start_forward_batch(chat_id: int, user_id: int) -> bool:
-    r = _get_redis_conn()
+    r = get_sync_redis()
     if r:
         active_key, items_key = _batch_keys(chat_id, user_id)
         r.set(active_key, "1")
@@ -547,7 +537,7 @@ def start_forward_batch(chat_id: int, user_id: int) -> bool:
 
 
 def append_forward_item(chat_id: int, user_id: int, item: dict) -> bool:
-    r = _get_redis_conn()
+    r = get_sync_redis()
     if r:
         _, items_key = _batch_keys(chat_id, user_id)
         try:
@@ -562,7 +552,7 @@ def append_forward_item(chat_id: int, user_id: int, item: dict) -> bool:
 
 
 def get_forward_items(chat_id: int, user_id: int) -> list:
-    r = _get_redis_conn()
+    r = get_sync_redis()
     if r:
         _, items_key = _batch_keys(chat_id, user_id)
         try:
@@ -576,7 +566,7 @@ def get_forward_items(chat_id: int, user_id: int) -> list:
 
 
 def clear_forward_batch(chat_id: int, user_id: int) -> bool:
-    r = _get_redis_conn()
+    r = get_sync_redis()
     if r:
         active_key, items_key = _batch_keys(chat_id, user_id)
         try:
@@ -592,7 +582,7 @@ def clear_forward_batch(chat_id: int, user_id: int) -> bool:
 
 
 def is_batch_active(chat_id: int, user_id: int) -> bool:
-    r = _get_redis_conn()
+    r = get_sync_redis()
     if r:
         active_key, _ = _batch_keys(chat_id, user_id)
         try:
@@ -716,8 +706,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # ── Normal Bot API download ──
             file = await context.bot.get_file(doc.file_id)
             if file_size and file_size > 1024 * 1024:  # only show progress for files >1MB
-                import uuid as _uuid
-                task_id = _uuid.uuid4().hex[:12]
+                task_id = uuid.uuid4().hex[:12]
                 task = progress_tracker.create_task(task_id, user_id or 0, filename, file_size)
                 progress_msg_id = await send_progress_update(msg.chat.id, context.bot, task)
                 task.start()
@@ -754,7 +743,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             create_thumbnail_from_image(file_path, thumb_path)
         else:
             # generic placeholder thumbnail
-            from PIL import Image
             im = Image.new('RGB', (320, 320), (240, 240, 240))
             im.save(thumb_path, 'JPEG', quality=85)
 
@@ -798,7 +786,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     elif mime.startswith('image/'):
                         create_thumbnail_from_image(file_path, thumb_path)
                     else:
-                        from PIL import Image
                         im = Image.new('RGB', (320, 320), (240, 240, 240))
                         im.save(thumb_path, 'JPEG', quality=85)
 
@@ -848,6 +835,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     photo = msg.photo[-1]
+    photo_size = getattr(photo, 'file_size', None) or 0
 
     # If REDIS_URL configured, enqueue background job and return immediately
     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
@@ -900,8 +888,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         file_path = os.path.join(tmpdir, filename)
 
-        # Check if photo is too large for Bot API
-        photo_size = getattr(photo, 'file_size', None) or 0
         upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
 
         if photo_size > upload_limit and _check_userbot_available():
@@ -921,8 +907,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # ── Normal Bot API download ──
             file = await context.bot.get_file(photo.file_id)
             if photo_size > 1024 * 1024:
-                import uuid as _uuid
-                task_id = _uuid.uuid4().hex[:12]
+                task_id = uuid.uuid4().hex[:12]
                 task = progress_tracker.create_task(task_id, user_id or 0, filename, photo_size)
                 progress_msg_id = await send_progress_update(msg.chat.id, context.bot, task)
                 task.start()
@@ -1360,8 +1345,7 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         # Clean up temp session files
         try:
-            import glob as _glob
-            for f in _glob.glob(os.path.join(config.TEMP_PATH or "/tmp", "userbot_session*")):
+            for f in glob.glob(os.path.join(config.TEMP_PATH or "/tmp", "userbot_session*")):
                 try:
                     os.remove(f)
                     removed.append(f)

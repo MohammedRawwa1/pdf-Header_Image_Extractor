@@ -8,12 +8,11 @@ Provides a simple async cache with TTL support for:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
-import time
 from typing import Any, Dict, Optional
+
+from utils.redis_client import get_redis_url
 
 try:
     import redis.asyncio as aioredis
@@ -37,7 +36,7 @@ class RedisCache:
     """Async Redis-backed cache with TTL support."""
 
     def __init__(self, redis_url: Optional[str] = None):
-        self._redis_url = redis_url or os.getenv("REDIS_URL") or ""
+        self._redis_url = redis_url or get_redis_url() or ""
         self._client: Optional[aioredis.Redis] = None
 
     async def _get_client(self) -> Optional[aioredis.Redis]:

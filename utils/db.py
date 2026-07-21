@@ -120,8 +120,50 @@ async def _ensure_indexes(db):
         logger.debug("db: index creation skipped: %s", e)
 
 
+# ── Sync MongoDB client (for RQ worker background tasks) ────────
+
+_sync_pymongo_client = None
+_sync_pymongo_db = None
+
+
+def get_sync_db():
+    """Return a cached sync pymongo database (lazy singleton).
+
+    Used by background workers (RQ) that need synchronous MongoDB access.
+    Shares the same URI and db_name config as the async connection.
+    """
+    global _sync_pymongo_client, _sync_pymongo_db
+    if _sync_pymongo_db is not None:
+        return _sync_pymongo_db
+
+    uri = get_mongo_uri()
+    if not uri:
+        logger.debug("db: no MONGO_URI configured; sync MongoDB disabled")
+        return None
+
+    try:
+        import pymongo
+        _sync_pymongo_client = pymongo.MongoClient(
+            uri,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=5000,
+        )
+        db_name = get_db_name()
+        _sync_pymongo_db = _sync_pymongo_client[db_name]
+        # Verify connectivity with a lightweight ping
+        _sync_pymongo_client.admin.command("ping")
+        logger.info("db: sync MongoDB connected (db=%s)", db_name)
+        return _sync_pymongo_db
+    except Exception as e:
+        logger.warning("db: sync MongoDB connection failed: %s", e)
+        _sync_pymongo_client = None
+        _sync_pymongo_db = None
+        return None
+
+
 async def close_db():
-    """Close MongoDB connection."""
+    """Close async MongoDB connection."""
     global _client, _db
     if _client is not None:
         try:
@@ -130,6 +172,18 @@ async def close_db():
             pass
     _client = None
     _db = None
+
+
+def close_sync_db():
+    """Close sync MongoDB connection."""
+    global _sync_pymongo_client, _sync_pymongo_db
+    if _sync_pymongo_client is not None:
+        try:
+            _sync_pymongo_client.close()
+        except Exception:
+            pass
+    _sync_pymongo_client = None
+    _sync_pymongo_db = None
 
 
 # ── Job Metadata ──────────────────────────────────────────────

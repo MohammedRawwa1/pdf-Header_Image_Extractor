@@ -6,9 +6,9 @@ and MongoDB backup for durable job history.
 """
 
 import asyncio
+import inspect
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
@@ -18,23 +18,7 @@ logger = logging.getLogger(__name__)
 PREFIX_PROGRESS = "progress:"
 
 
-_sync_redis_client = None
-
-
-def _get_sync_redis():
-    """Return a cached sync Redis client (best-effort)."""
-    global _sync_redis_client
-    if _sync_redis_client is not None:
-        return _sync_redis_client
-    try:
-        import redis
-        url = os.getenv("REDIS_URL", "")
-        if not url:
-            return None
-        _sync_redis_client = redis.from_url(url, decode_responses=True)
-        return _sync_redis_client
-    except Exception:
-        return None
+from utils.redis_client import get_sync_redis
 
 
 @dataclass
@@ -115,7 +99,7 @@ class ProgressTracker:
     def _persist_to_redis(self, task: TaskProgress):
         """Best-effort write progress to Redis for survival across restarts."""
         try:
-            r = _get_sync_redis()
+            r = get_sync_redis()
             if r is None:
                 return
             key = f"{PREFIX_PROGRESS}{task.task_id}"
@@ -140,7 +124,7 @@ class ProgressTracker:
             return task
         # Fall back to Redis
         try:
-            r = _get_sync_redis()
+            r = get_sync_redis()
             if r:
                 raw = r.get(f"{PREFIX_PROGRESS}{task_id}")
                 if raw:
@@ -218,7 +202,7 @@ class ProgressTracker:
             del self.tasks[task_id]
             # Clean up Redis
             try:
-                r = _get_sync_redis()
+                r = get_sync_redis()
                 if r:
                     r.delete(f"{PREFIX_PROGRESS}{task_id}")
             except Exception:
@@ -233,7 +217,6 @@ class ProgressTracker:
         if not callback:
             return
         try:
-            import inspect
             if inspect.iscoroutinefunction(callback):
                 await callback(task)
             else:
@@ -272,6 +255,26 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
+def _build_progress_bar(percentage: float, segments: int = 20) -> str:
+    """Build a Unicode progress bar string.
+
+    █ = filled, ░ = empty
+    20 segments = 5% each for smooth granularity.
+    """
+    full_block = "\u2588"
+    empty = "\u2591"
+    filled = int(percentage / (100 / segments))
+    filled = max(0, min(segments, filled))
+
+    if filled >= segments:
+        bar = full_block * segments
+    elif filled <= 0:
+        bar = empty * segments
+    else:
+        bar = full_block * filled + empty * (segments - filled)
+    return "[" + bar + "]"
+
+
 def _format_time(seconds: float) -> str:
     """Format seconds to human readable string."""
     if seconds < 60:
@@ -294,24 +297,8 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
     20 segments = 5% each for smooth granularity.
     """
     try:
-        segments = 20
         total_progress = task.progress_percentage
-        filled = int(total_progress / (100 / segments))
-        filled = max(0, min(segments, filled))
-
-        # Build a clean progress bar using Unicode block characters
-        full_block = "\u2588"  # Full block █
-        empty = "\u2591"  # Light shade ░
-
-        if filled >= segments:
-            bar = full_block * segments
-        elif filled <= 0:
-            bar = empty * segments
-        else:
-            bar = full_block * filled + empty * (segments - filled)
-
-        # Surround bar with brackets for clarity
-        bar = "[" + bar + "]"
+        bar = _build_progress_bar(total_progress)
 
         processed = _format_size(task.processed_size)
         total = _format_size(task.total_size)

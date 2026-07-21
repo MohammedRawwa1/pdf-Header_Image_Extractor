@@ -150,6 +150,114 @@ def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
     r.raise_for_status()
     return r.json()
 
+
+def _tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown"):
+    """Edit a previously-sent message using Bot API's editMessageText.
+
+    Returns the API response dict on success, or None on failure (non-fatal).
+    """
+    try:
+        import config as _config
+        bot_token = _config.BOT_TOKEN
+    except Exception:
+        bot_token = None
+    if not bot_token:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
+        data = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+        r = requests.post(url, data=data, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+# ── Progress bar helpers (HTTP-based, no PTB needed) ─────────────
+# These mirror bot.py's send_progress_update but use raw HTTP calls
+# so they work in background workers without a PTB bot instance.
+
+_PROGRESS_STAGES = {
+    "queued": 0,
+    "downloading": 25,
+    "downloaded": 50,
+    "thumbnailing": 65,
+    "compressing": 80,
+    "sending": 90,
+    "done": 100,
+    "failed": 0,
+}
+
+
+
+
+
+def _tg_send_progress(
+    chat_id: int,
+    filename: str,
+    stage: str,
+    detail: str = "",
+    file_size: int = 0,
+    message_id: int | None = None,
+) -> int | None:
+    """Send or update a progress message with a visual Unicode progress bar.
+
+    Args:
+        chat_id: Telegram chat ID to send to.
+        filename: Display name of the file being processed.
+        stage: Key from _PROGRESS_STAGES dict (e.g. "downloading", "done").
+        detail: Optional detail line (e.g. "40.2 MB downloaded").
+        file_size: Total file size for display.
+        message_id: If provided, *edit* the existing message instead of sending new.
+
+    Returns:
+        message_id of the sent/edited message, or None on failure.
+    """
+    pct = _PROGRESS_STAGES.get(stage, 0)
+    bar = _build_progress_bar(pct)
+
+    size_str = _format_size(file_size) if file_size else ""
+    emojis = {
+        "queued": "\u23f3",
+        "downloading": "\U0001f4e5",
+        "downloaded": "\u2705",
+        "thumbnailing": "\U0001f5bc\ufe0f",
+        "compressing": "\U0001f5dc\ufe0f",
+        "sending": "\U0001f4e4",
+        "done": "\u2705",
+        "failed": "\u274c",
+    }
+    emoji = emojis.get(stage, "\u2753")
+
+    lines = [
+        f"\U0001f4c1 **{filename}**",
+        f"{bar} `{pct}%`",
+    ]
+    if size_str:
+        lines.insert(1, f"\U0001f4cf Size: `{size_str}`")
+    if detail:
+        lines.append(f"\n{emoji} {detail}")
+
+    text = "\n".join(lines)
+
+    try:
+        if message_id:
+            _tg_edit_message_text(chat_id, message_id, text)
+            return message_id
+        else:
+            res = _tg_send_message(None, chat_id, text)
+            if res and "result" in res and "message_id" in res["result"]:
+                return res["result"]["message_id"]
+            return None
+    except Exception:
+        return None
+
+
 from tools import (
     create_thumbnail_from_pdf,
     create_thumbnail_from_image,
@@ -157,6 +265,7 @@ from tools import (
     create_thumbnail_from_image_bytes,
     compress_pdf,
 )
+from utils.progress_tracker import _format_size, _build_progress_bar
 import config
 try:
     from rq import get_current_job
@@ -261,16 +370,28 @@ def process_input_key_job(job: dict) -> dict:
         pass
 
     tmpdir = None
+    _progress_msg_id = None
     try:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None))
         dest_path = os.path.join(tmpdir, filename)
+
+        # Send initial progress
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "downloading",
+            detail="\U0001f4e5 Downloading from S3 storage...",
+            file_size=job.get('size') or job.get('file_size') or 0,
+        )
 
         dl_start = time.time()
         ok = False
         if input_key:
             ok = _download_s3_key_to_file(input_key, dest_path)
         if not ok:
-            # nothing to do
+            _tg_send_progress(
+                chat_id, filename, "failed",
+                detail="\u274c Failed to download from S3 storage.",
+                message_id=_progress_msg_id,
+            )
             out_meta.setdefault('status', 'download_failed')
             out_meta.setdefault('error', 's3_download_failed')
             out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
@@ -282,8 +403,9 @@ def process_input_key_job(job: dict) -> dict:
         dl_elapsed = time.time() - dl_start
         out_meta.setdefault('durations', {})['download_ms'] = int(dl_elapsed * 1000)
         out_meta.setdefault('timestamps', {})['download_end'] = int(time.time())
+        _dl_size_post = os.path.getsize(dest_path)
         try:
-            out_meta.setdefault('sizes', {})['orig_bytes'] = os.path.getsize(dest_path)
+            out_meta.setdefault('sizes', {})['orig_bytes'] = _dl_size_post
         except Exception:
             pass
         try:
@@ -291,7 +413,20 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:
             pass
 
+        # Update progress: download complete
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "downloaded",                detail=f"\u2705 Download complete ({_format_size(_dl_size_post)})",
+            file_size=_dl_size_post,
+            message_id=_progress_msg_id,
+        )
+
         # Now reuse disk-mode flow: thumbnail, compress, s3-fallback if needed, send
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "thumbnailing",
+            detail="\U0001f5bc\ufe0f Creating cover preview...",
+            file_size=_dl_size_post,
+            message_id=_progress_msg_id,
+        )
         thumb_path = os.path.join(tmpdir, 'thumb.jpg')
         if filename.lower().endswith('.pdf'):
             create_thumbnail_from_pdf(dest_path, thumb_path)
@@ -307,6 +442,12 @@ def process_input_key_job(job: dict) -> dict:
 
         compress_total = 0.0
         if orig_size and upload_limit and orig_size > upload_limit:
+            _progress_msg_id = _tg_send_progress(
+                chat_id, filename, "compressing",
+                detail="\U0001f5dc\ufe0f Compressing with /ebook quality...",
+                file_size=orig_size,
+                message_id=_progress_msg_id,
+            )
             # first attempt
             try:
                 a_start = time.time()
@@ -332,6 +473,12 @@ def process_input_key_job(job: dict) -> dict:
                 pass
 
             if upload_path == dest_path:
+                _progress_msg_id = _tg_send_progress(
+                    chat_id, filename, "compressing",
+                    detail="\U0001f5dc\ufe0f /ebook too large; trying /screen...",
+                    file_size=orig_size,
+                    message_id=_progress_msg_id,
+                )
                 try:
                     b_start = time.time()
                     c2 = dest_path + '.compressed.screen.pdf'
@@ -394,6 +541,12 @@ def process_input_key_job(job: dict) -> dict:
             return {'error': 'file too large after compression'}
 
         # send final document via Telegram
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "sending",
+            detail="\U0001f4e4 Sending result to Telegram...",
+            file_size=os.path.getsize(upload_path),
+            message_id=_progress_msg_id,
+        )
         send_start = time.time()
         with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
             res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
@@ -414,6 +567,13 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:
             pass
 
+        _tg_send_progress(
+            chat_id, filename, "done",
+            detail="\u2705 Processing complete!",
+            file_size=os.path.getsize(upload_path),
+            message_id=_progress_msg_id,
+        )
+
         try:
             if get_current_job is not None:
                 job_obj = get_current_job()
@@ -427,6 +587,11 @@ def process_input_key_job(job: dict) -> dict:
 
     except Exception as e:
         logger.exception("Error processing input_key job %s", job_id)
+        _tg_send_progress(
+            chat_id, filename, "failed",
+            detail=f"\u274c Error: {e}",
+            message_id=_progress_msg_id,
+        )
         out_meta.setdefault('status', 'error')
         out_meta.setdefault('error', str(e))
         out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
@@ -452,43 +617,8 @@ def process_input_key_job(job: dict) -> dict:
 IO_TTL = 7 * 24 * 3600
 
 
-def _get_redis_client():
-    if not getattr(config, 'REDIS_URL', None):
-        return None
-    try:
-        import redis
-        return redis.from_url(config.REDIS_URL)
-    except Exception:
-        return None
-
-
-_pymongo_client = None
-_pymongo_db = None
-
-
-def _get_mongo_db():
-    """Return a cached pymongo database (best-effort, for RQ worker sync path).
-
-    Uses centralized URI and db_name from utils.db to stay consistent.
-    """
-    global _pymongo_client, _pymongo_db
-    if _pymongo_db is not None:
-        return _pymongo_db
-    try:
-        from utils.db import get_mongo_uri, get_db_name
-        mongo_uri = get_mongo_uri()
-        if not mongo_uri:
-            return None
-        import pymongo
-        _pymongo_client = pymongo.MongoClient(
-            mongo_uri, serverSelectionTimeoutMS=3000
-        )
-        _pymongo_db = _pymongo_client[get_db_name()]
-        return _pymongo_db
-    except Exception:
-        _pymongo_client = None
-        _pymongo_db = None
-        return None
+from utils.redis_client import get_sync_redis
+from utils.db import get_sync_db
 
 
 def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
@@ -497,7 +627,7 @@ def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: di
     Also writes a best-effort backup to MongoDB (sync) so
     metadata survives Redis key expiry or restarts.
     """
-    r = _get_redis_client()
+    r = get_sync_redis()
     redis_ok = False
     try:
         if r:
@@ -522,7 +652,7 @@ def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: di
             mongo_meta["unique_id"] = unique_id
             mongo_meta["type"] = "io_metadata"
             mongo_meta["created_at"] = time.time()
-            mongo_db = _get_mongo_db()
+            mongo_db = get_sync_db()
             if mongo_db is not None:
                 mongo_db.job_metadata.update_one(
                     {"job_id": f"io:{unique_id}"},
@@ -584,12 +714,15 @@ def process_document_job(
     _userbot_dl_data = None
     # Calculate upload limit BEFORE getFile so the early size check can use it
     upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+    # Track progress message ID so we can edit the same message
+    _progress_msg_id = None
     try:
         # 1) getFile (path) — with multi-level userbot fallback for files >50MB
         #
         # Fallback chain when Bot API cannot handle the file:
         #   a) File_id-based download  — fastest, but broken for v4+ file_ids
         #   b) Chat-based download     — works reliably with any file_id
+        #   d) Relay group             — forward to relay, then userbot download
         #   c) BigFilePipeline         — S3 pipeline + separate worker
         #
         gf_start = time.time()
@@ -603,11 +736,25 @@ def process_document_job(
                     file_size, upload_limit,
                 )
                 raise requests.HTTPError("Bad Request: file is too big")
+            # For small files going through Bot API: send initial progress
+            _progress_msg_id = _tg_send_progress(
+                chat_id, filename, "downloading",
+                detail="\U0001f4e5 Downloading via Bot API...",
+                file_size=file_size or 0,
+            )
             tg_file_path = _tg_get_file_path(None, file_id)
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
                 logger.info("Bot API cannot handle large file; trying userbot fallback chain")
+
+                # Send initial progress message
+                _progress_msg_id = _tg_send_progress(
+                    chat_id, filename, "downloading",
+                    detail="\U0001f504 Connecting to userbot...",
+                    file_size=file_size or 0,
+                )
+
                 import asyncio as _asyncio
                 _ub_data = None
                 _fallback_errors = []
@@ -629,6 +776,12 @@ def process_document_job(
                 if _ub_data is None and message_id:
                     try:
                         from utils.userbot_downloader import download_bytes_via_userbot as _dl_chat
+                        _progress_msg_id = _tg_send_progress(
+                            chat_id, filename, "downloading",
+                            detail="\U0001f4e5 Downloading via userbot...",
+                            file_size=file_size or 0,
+                            message_id=_progress_msg_id,
+                        )
                         logger.info(
                             "Trying fallback (b) chat-based download: chat=%s msg=%s",
                             chat_id, message_id,
@@ -644,10 +797,6 @@ def process_document_job(
                         logger.warning("Fallback (b) chat-based download failed: %s", _fb_b)
 
                 # ── Fallback (d): relay group (forward -> userbot download) ──
-                # When the file is in a DM between user and bot, the userbot cannot
-                # access it directly (MTProto limitation).  The bot can forward the
-                # message to a relay group where the userbot IS a member, then the
-                # userbot downloads from there.
                 if _ub_data is None and message_id:
                     try:
                         relay_chat = getattr(config, 'RELAY_CHAT_ID', None)
@@ -655,6 +804,12 @@ def process_document_job(
                             relay_chat_id = int(relay_chat)
                             bot_token = config.BOT_TOKEN
                             fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
+                            _progress_msg_id = _tg_send_progress(
+                                chat_id, filename, "downloading",
+                                detail="\U0001f504 Forwarding to relay group...",
+                                file_size=file_size or 0,
+                                message_id=_progress_msg_id,
+                            )
                             logger.info(
                                 "Trying fallback (d) relay group: forwarding %s/%s -> %s",
                                 chat_id, message_id, relay_chat_id,
@@ -696,6 +851,12 @@ def process_document_job(
                 if _ub_data is None and message_id:
                     try:
                         from utils.bigfile_pipeline import BigFilePipeline as _BFP
+                        _progress_msg_id = _tg_send_progress(
+                            chat_id, filename, "downloading",
+                            detail="\U0001f504 Trying S3 pipeline...",
+                            file_size=file_size or 0,
+                            message_id=_progress_msg_id,
+                        )
                         logger.info(
                             "Trying fallback (c) BigFilePipeline: chat=%s msg=%s size=%s",
                             chat_id, message_id, file_size or "unknown",
@@ -713,15 +874,12 @@ def process_document_job(
                                 "BigFilePipeline job enqueued: job_id=%s s3_key=%s",
                                 _result.job_id, _result.s3_key,
                             )
-                            try:
-                                _size_display = file_size // (1024 * 1024) if file_size else "?"
-                                _tg_send_message(None, chat_id,
-                                    f"Large file ({_size_display} MB) queued via pipeline. "
-                                    f"Job: {_result.job_id[:8] if _result.job_id else 'unknown'}... "
-                                    f"You'll receive the result when ready."
-                                )
-                            except Exception:
-                                pass
+                            _tg_send_progress(
+                                chat_id, filename, "done",
+                                detail="\u2705 Large file queued via S3 pipeline. You'll receive the result when ready.",
+                                file_size=file_size or 0,
+                                message_id=_progress_msg_id,
+                            )
                             return {"pipeline": _result.job_id}
                         else:
                             raise Exception(f"BigFilePipeline failed: {_result.error if _result else 'unknown'}")
@@ -738,6 +896,13 @@ def process_document_job(
                         "All download methods failed for file_id=%s chat=%s msg=%s. Errors: %s",
                         file_id, chat_id, message_id,
                         "; ".join(_fallback_errors),
+                    )
+                    # Update progress to failed with details
+                    _tg_send_progress(
+                        chat_id, filename, "failed",
+                        detail=f"\u274c All download methods failed. Check server logs.",
+                        file_size=file_size or 0,
+                        message_id=_progress_msg_id,
                     )
                     raise _gf_err from RuntimeError(
                         f"All {len(_fallback_errors)} fallbacks exhausted: "
@@ -783,8 +948,9 @@ def process_document_job(
             dl_elapsed = time.time() - dl_start
             out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
             out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
+            _dl_size_post = os.path.getsize(file_path)
             try:
-                out_meta.setdefault("sizes", {})["orig_bytes"] = os.path.getsize(file_path)
+                out_meta.setdefault("sizes", {})["orig_bytes"] = _dl_size_post
             except Exception:
                 pass
             try:
@@ -792,7 +958,21 @@ def process_document_job(
             except Exception:
                 pass
 
+            # Update progress: download complete
+            _progress_msg_id = _tg_send_progress(
+                chat_id, filename, "downloaded",
+                detail=f"\u2705 Download complete ({_format_size(_dl_size_post)})",
+                file_size=_dl_size_post,
+                message_id=_progress_msg_id,
+            )
+
             # thumbnail
+            _progress_msg_id = _tg_send_progress(
+                chat_id, filename, "thumbnailing",
+                detail="\U0001f5bc\ufe0f Creating cover preview...",
+                file_size=_dl_size_post,
+                message_id=_progress_msg_id,
+            )
             thumb_path = os.path.join(tmpdir, "thumb.jpg")
             if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
                 create_thumbnail_from_pdf(file_path, thumb_path)
@@ -808,6 +988,12 @@ def process_document_job(
 
             compress_total = 0.0
             if orig_size and upload_limit and orig_size > upload_limit:
+                _progress_msg_id = _tg_send_progress(
+                    chat_id, filename, "compressing",
+                    detail="\U0001f5dc\ufe0f Compressing with /ebook quality...",
+                    file_size=orig_size,
+                    message_id=_progress_msg_id,
+                )
                 # attempt first pass
                 try:
                     a_start = time.time()
@@ -834,6 +1020,12 @@ def process_document_job(
 
                 if upload_path == file_path:
                     # try second, more aggressive pass
+                    _progress_msg_id = _tg_send_progress(
+                        chat_id, filename, "compressing",
+                        detail="\U0001f5dc\ufe0f /ebook too large; trying /screen...",
+                        file_size=orig_size,
+                        message_id=_progress_msg_id,
+                    )
                     try:
                         b_start = time.time()
                         c2 = file_path + '.compressed.screen.pdf'
@@ -896,6 +1088,12 @@ def process_document_job(
                 return {"error": "file too large after compression"}
 
             # send final document via Telegram
+            _progress_msg_id = _tg_send_progress(
+                chat_id, filename, "sending",
+                detail="\U0001f4e4 Sending result...",
+                file_size=os.path.getsize(upload_path),
+                message_id=_progress_msg_id,
+            )
             send_start = time.time()
             with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
                 res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
@@ -915,6 +1113,14 @@ def process_document_job(
                 _set_io_keys(unique_key, output_meta=out_meta)
             except Exception:
                 pass
+
+            # Update progress to done
+            _tg_send_progress(
+                chat_id, filename, "done",
+                detail="\u2705 Processing complete!",
+                file_size=os.path.getsize(upload_path),
+                message_id=_progress_msg_id,
+            )
 
             try:
                 if get_current_job is not None:
@@ -1091,6 +1297,15 @@ def process_document_job(
             out_meta.setdefault("error", str(e))
             out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
             _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:
+            pass
+        # Update progress to failed if a progress message exists
+        try:
+            _tg_send_progress(
+                chat_id, filename, "failed",
+                detail=f"\u274c Error: {e}",
+                message_id=_progress_msg_id,
+            )
         except Exception:
             pass
         try:

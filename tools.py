@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import os
 from PIL import Image
 import io
@@ -137,8 +138,6 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
 
     Returns True if `output_path` was created (and may be smaller), False on failure.
     """
-    import subprocess
-    import os
     # Remove any existing output
     try:
         if os.path.exists(output_path):
@@ -147,7 +146,6 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
         pass
 
     # 1) Ghostscript: try common executable names (Linux/macOS: 'gs', Windows: 'gswin64c'/'gswin32c')
-    import shutil
 
     gs_candidates = ["gs", "gswin64c", "gswin32c"]
     for gs_exe in gs_candidates:
