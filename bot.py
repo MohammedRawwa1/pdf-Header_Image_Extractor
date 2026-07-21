@@ -255,36 +255,91 @@ async def _userbot_download_fallback(
         if relay_chat:
             try:
                 relay_chat_id = int(relay_chat)
-                _forwarded = await msg.get_bot().forward_message(
-                    chat_id=relay_chat_id,
-                    from_chat_id=msg.chat.id,
-                    message_id=msg.message_id,
-                )
-                if _forwarded and getattr(_forwarded, "message_id", None):
-                    relay_msg_id = _forwarded.message_id
-                    logger.info(
-                        "relay: forwarded %s/%s to %s/%s",
-                        msg.chat.id, msg.message_id, relay_chat_id, relay_msg_id,
-                    )
-                    dl_ok = await download_forward_via_userbot(
+                # Try PTB-based forward first (preferred when bot context is available)
+                _bot = getattr(msg, 'get_bot', None)
+                if _bot is not None:
+                    _forwarded = await _bot().forward_message(
                         chat_id=relay_chat_id,
-                        message_id=relay_msg_id,
-                        dest_path=file_path,
-                        progress_callback=_cb,
-                        file_id=file_id,
+                        from_chat_id=msg.chat.id,
+                        message_id=msg.message_id,
                     )
-                    if dl_ok and filename.lower().endswith('.pdf'):
-                        if not is_valid_pdf(file_path):
-                            logger.warning(
-                                "relay: downloaded PDF is corrupted, trying next method"
+                    if _forwarded and getattr(_forwarded, "message_id", None):
+                        relay_msg_id = _forwarded.message_id
+                        logger.info(
+                            "relay (PTB): forwarded %s/%s to %s/%s",
+                            msg.chat.id, msg.message_id, relay_chat_id, relay_msg_id,
+                        )
+                        dl_ok = await download_forward_via_userbot(
+                            chat_id=relay_chat_id,
+                            message_id=relay_msg_id,
+                            dest_path=file_path,
+                            progress_callback=_cb,
+                            file_id=file_id,
+                        )
+                        if dl_ok and filename.lower().endswith('.pdf'):
+                            if not is_valid_pdf(file_path):
+                                logger.warning(
+                                    "relay: downloaded PDF is corrupted, trying next method"
+                                )
+                                dl_ok = False
+                                try:
+                                    os.remove(file_path)
+                                except Exception:
+                                    pass
+                    else:
+                        raise Exception("PTB forward_message returned no message_id")
+                else:
+                    raise Exception("msg.get_bot() not available")
+            except Exception as _relay_ptb_err:
+                # ── If PTB relay failed, try HTTP-based relay (same approach as tasks.py) ──
+                if not dl_ok:
+                    try:
+                        logger.warning(
+                            "relay (PTB) failed (%s); trying HTTP-based relay forward",
+                            _relay_ptb_err,
+                        )
+                        bot_token = config.BOT_TOKEN
+                        fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
+                        import requests as _requests
+                        fwd_resp = _requests.post(fwd_url, data={
+                            "chat_id": relay_chat_id,
+                            "from_chat_id": chat_id,
+                            "message_id": msg.message_id,
+                        }, timeout=30)
+                        if fwd_resp.status_code == 200:
+                            fwd_data = fwd_resp.json()
+                            relay_msg_id = fwd_data["result"]["message_id"]
+                            logger.info(
+                                "relay (HTTP): forwarded %s/%s to %s/%s",
+                                msg.chat.id, msg.message_id, relay_chat_id, relay_msg_id,
                             )
-                            dl_ok = False
-                            try:
-                                os.remove(file_path)
-                            except Exception:
-                                pass
-            except Exception as relay_err:
-                logger.warning("relay: forward or download failed: %s", relay_err)
+                            dl_ok = await download_forward_via_userbot(
+                                chat_id=relay_chat_id,
+                                message_id=relay_msg_id,
+                                dest_path=file_path,
+                                progress_callback=_cb,
+                                file_id=file_id,
+                            )
+                            if dl_ok and filename.lower().endswith('.pdf'):
+                                if not is_valid_pdf(file_path):
+                                    logger.warning(
+                                        "relay (HTTP): downloaded PDF is corrupted, trying next method"
+                                    )
+                                    dl_ok = False
+                                    try:
+                                        os.remove(file_path)
+                                    except Exception:
+                                        pass
+                        else:
+                            raise Exception(
+                                f"HTTP forwardMessage failed: {fwd_resp.status_code} "
+                                f"{fwd_resp.text[:200]}"
+                            )
+                    except Exception as _relay_http_err:
+                        logger.warning(
+                            "relay (HTTP) also failed for %s/%s: %s",
+                            msg.chat.id, msg.message_id, _relay_http_err,
+                        )
 
     # 3) Direct chat download (group chat where userbot is a member)
     if not dl_ok:

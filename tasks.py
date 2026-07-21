@@ -643,6 +643,55 @@ def process_document_job(
                         _fallback_errors.append(f"chat download: {_fb_b}")
                         logger.warning("Fallback (b) chat-based download failed: %s", _fb_b)
 
+                # ── Fallback (d): relay group (forward -> userbot download) ──
+                # When the file is in a DM between user and bot, the userbot cannot
+                # access it directly (MTProto limitation).  The bot can forward the
+                # message to a relay group where the userbot IS a member, then the
+                # userbot downloads from there.
+                if _ub_data is None and message_id:
+                    try:
+                        relay_chat = getattr(config, 'RELAY_CHAT_ID', None)
+                        if relay_chat:
+                            relay_chat_id = int(relay_chat)
+                            bot_token = config.BOT_TOKEN
+                            fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
+                            logger.info(
+                                "Trying fallback (d) relay group: forwarding %s/%s -> %s",
+                                chat_id, message_id, relay_chat_id,
+                            )
+                            fwd_resp = requests.post(fwd_url, data={
+                                "chat_id": relay_chat_id,
+                                "from_chat_id": chat_id,
+                                "message_id": message_id,
+                            }, timeout=30)
+                            if fwd_resp.status_code == 200:
+                                fwd_data = fwd_resp.json()
+                                fwd_msg_id = fwd_data["result"]["message_id"]
+                                logger.info(
+                                    "Forwarded to relay %s/%s, trying userbot download",
+                                    relay_chat_id, fwd_msg_id,
+                                )
+                                from utils.userbot_downloader import download_bytes_via_userbot as _dl_relay
+                                _ub_data = _asyncio.run(_dl_relay(relay_chat_id, fwd_msg_id))
+                                if _ub_data and len(_ub_data) > 0:
+                                    logger.info(
+                                        "Relay userbot download succeeded: %d bytes",
+                                        len(_ub_data),
+                                    )
+                                else:
+                                    _ub_data = None
+                                    raise Exception("relay download returned empty")
+                            else:
+                                raise Exception(
+                                    f"forwardMessage failed: {fwd_resp.status_code} "
+                                    f"{fwd_resp.text[:200]}"
+                                )
+                        else:
+                            logger.info("RELAY_CHAT_ID not configured, skipping fallback (d)")
+                    except Exception as _fb_d:
+                        _fallback_errors.append(f"relay group: {_fb_d}")
+                        logger.warning("Fallback (d) relay group download failed: %s", _fb_d)
+
                 # ── Fallback (c): BigFilePipeline (S3 pipeline) ──
                 if _ub_data is None and message_id:
                     try:
