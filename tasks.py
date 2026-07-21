@@ -246,7 +246,7 @@ def process_input_key_job(job: dict) -> dict:
             'job_id': job_id,
             'input_key': input_key,
             'filename': filename,
-            'size': job.get('size'),
+            'size': job.get('size') or job.get('file_size'),
             'chat_id': chat_id,
             'enqueued_at': int(time.time()),
         }
@@ -543,8 +543,14 @@ def process_document_job(
     file_unique_id: Optional[str] = None,
     message_id: Optional[int] = None,
     forward_info: Optional[dict] = None,
-) -> None:
+    file_size: Optional[int] = None,
+) -> Optional[dict]:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
+
+    When the Bot API cannot handle a large file (>50MB), falls back through:
+      1. File_id-based userbot download (fast, but may fail for modern file_id formats)
+      2. Chat-based userbot download ``download_bytes_via_userbot(chat_id, message_id)``
+      3. BigFilePipeline (S3 pipeline + separate worker) — only if S3 is configured
 
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
     """
@@ -576,29 +582,118 @@ def process_document_job(
     tmpdir = None
     # Flag for userbot fallback data (large files that Bot API can't handle)
     _userbot_dl_data = None
+    # Calculate upload limit BEFORE getFile so the early size check can use it
+    upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
     try:
-        # 1) getFile (path) — with userbot fallback for files >50MB
+        # 1) getFile (path) — with multi-level userbot fallback for files >50MB
+        #
+        # Fallback chain when Bot API cannot handle the file:
+        #   a) File_id-based download  — fastest, but broken for v4+ file_ids
+        #   b) Chat-based download     — works reliably with any file_id
+        #   c) BigFilePipeline         — S3 pipeline + separate worker
+        #
         gf_start = time.time()
         try:
+            # If we already know the file exceeds Bot API limits, skip getFile entirely
+            _skip_bot_api = file_size and upload_limit and file_size > upload_limit
+            if _skip_bot_api:
+                logger.info(
+                    "file_size=%d > upload_limit=%d; skipping Bot API getFile, "
+                    "proceeding directly to userbot download",
+                    file_size, upload_limit,
+                )
+                raise requests.HTTPError("Bad Request: file is too big")
             tg_file_path = _tg_get_file_path(None, file_id)
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
-                logger.info("Bot API getFile failed (file too big); falling back to userbot by file_id")
+                logger.info("Bot API cannot handle large file; trying userbot fallback chain")
+                import asyncio as _asyncio
+                _ub_data = None
+                _fallback_errors = []
+
+                # ── Fallback (a): file_id-based download ──
                 try:
-                    import asyncio as _asyncio
                     from utils.userbot_downloader import download_bytes_by_file_id_via_userbot as _dl_file_id
                     _ub_data = _asyncio.run(_dl_file_id(file_id))
                     if _ub_data and len(_ub_data) > 0:
                         logger.info("Userbot file_id download succeeded: %d bytes", len(_ub_data))
-                        _userbot_dl_data = _ub_data
-                        # Use a sentinel path so downstream code knows not to call Bot API download
-                        tg_file_path = "__userbot_fallback__"
                     else:
-                        raise
-                except Exception as _ub_inner:
-                    logger.exception("Userbot download fallback also failed for file_id=%s", file_id)
-                    raise _gf_err from _ub_inner
+                        _ub_data = None
+                        raise Exception("file_id download returned empty")
+                except Exception as _fb_a:
+                    _fallback_errors.append(f"file_id download: {_fb_a}")
+                    logger.warning("Fallback (a) file_id download failed: %s", _fb_a)
+
+                # ── Fallback (b): chat-based download (works with any file_id) ──
+                if _ub_data is None and message_id:
+                    try:
+                        from utils.userbot_downloader import download_bytes_via_userbot as _dl_chat
+                        logger.info(
+                            "Trying fallback (b) chat-based download: chat=%s msg=%s",
+                            chat_id, message_id,
+                        )
+                        _ub_data = _asyncio.run(_dl_chat(chat_id, message_id))
+                        if _ub_data and len(_ub_data) > 0:
+                            logger.info("Userbot chat-based download succeeded: %d bytes", len(_ub_data))
+                        else:
+                            _ub_data = None
+                            raise Exception("chat download returned empty")
+                    except Exception as _fb_b:
+                        _fallback_errors.append(f"chat download: {_fb_b}")
+                        logger.warning("Fallback (b) chat-based download failed: %s", _fb_b)
+
+                # ── Fallback (c): BigFilePipeline (S3 pipeline) ──
+                if _ub_data is None and message_id:
+                    try:
+                        from utils.bigfile_pipeline import BigFilePipeline as _BFP
+                        logger.info(
+                            "Trying fallback (c) BigFilePipeline: chat=%s msg=%s size=%s",
+                            chat_id, message_id, file_size or "unknown",
+                        )
+                        _pipeline = _BFP()
+                        _result = _asyncio.run(_pipeline.ingest_large_file(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            file_size=file_size or 0,
+                            file_unique_id=file_unique_id,
+                            original_filename=filename,
+                        ))
+                        if _result and _result.ok:
+                            logger.info(
+                                "BigFilePipeline job enqueued: job_id=%s s3_key=%s",
+                                _result.job_id, _result.s3_key,
+                            )
+                            try:
+                                _size_display = file_size // (1024 * 1024) if file_size else "?"
+                                _tg_send_message(None, chat_id,
+                                    f"Large file ({_size_display} MB) queued via pipeline. "
+                                    f"Job: {_result.job_id[:8] if _result.job_id else 'unknown'}... "
+                                    f"You'll receive the result when ready."
+                                )
+                            except Exception:
+                                pass
+                            return {"pipeline": _result.job_id}
+                        else:
+                            raise Exception(f"BigFilePipeline failed: {_result.error if _result else 'unknown'}")
+                    except Exception as _fb_c:
+                        _fallback_errors.append(f"BigFilePipeline: {_fb_c}")
+                        logger.warning("Fallback (c) BigFilePipeline failed: %s", _fb_c)
+
+                # ── All fallbacks exhausted ──
+                if _ub_data is not None:
+                    _userbot_dl_data = _ub_data
+                    tg_file_path = "__userbot_fallback__"
+                else:
+                    logger.error(
+                        "All download methods failed for file_id=%s chat=%s msg=%s. Errors: %s",
+                        file_id, chat_id, message_id,
+                        "; ".join(_fallback_errors),
+                    )
+                    raise _gf_err from RuntimeError(
+                        f"All {len(_fallback_errors)} fallbacks exhausted: "
+                        + "; ".join(_fallback_errors)
+                    )
             else:
                 raise
         gf_elapsed = time.time() - gf_start
@@ -609,8 +704,7 @@ def process_document_job(
         except Exception:
             pass
 
-        # Decide disk vs in-memory
-        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        # (upload_limit was calculated before the getFile block above)
 
         if config.TMP_DIR:
             # disk-mode

@@ -623,12 +623,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # userbot/BigFilePipeline instead. process_document_job uses the Bot API
         # (getFile) which cannot handle files >50MB and will fail with "file is too big".
         if not use_userbot_download:
-            # Pass message_id + forward_info so the worker has context for userbot fallback
+            # Pass message_id + forward_info + file_size so the worker has context for userbot fallback
             ok = enqueue_job(
                 'process_document_job',
                 chat_id, doc.file_id, filename, mime,
                 getattr(doc, 'file_unique_id', None),
                 msg.message_id, forward_info,
+                file_size,
             )
             if ok:
                 await msg.reply_text("Queued your file for background processing; I'll send the result when ready.")
@@ -830,6 +831,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             chat_id, photo.file_id, filename, 'image/jpeg',
             getattr(photo, 'file_unique_id', None),
             msg.message_id, photo_forward_info,
+            photo_size,
         )
         if ok:
             await msg.reply_text("Queued your photo for background processing; I'll send the result when ready.")

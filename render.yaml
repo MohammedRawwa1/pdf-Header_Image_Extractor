@@ -50,14 +50,42 @@ services:
     env: docker
     branch: main
     dockerfilePath: Dockerfile
-    # If you prefer a separate worker service, keep this. Otherwise remove
-    # the worker service block and run the worker in the web container.
+    # RQ background worker: processes process_document_job, process_url_job, etc.
     startCommand: "python worker.py"
     envVars:
       - key: REDIS_URL
         value: "redis://localhost:6379/0"
       - key: BOT_TOKEN
         value: "<REPLACE_WITH_BOT_TOKEN>"
+      - key: LOG_CHANNEL
+        value: ""
+      - key: TMP_DIR
+        value: "/tmp"
+      - key: MAX_FILE_SIZE
+        value: "524288000"
+
+  - type: worker
+    name: pdf-header-image-pipeline-worker
+    env: docker
+    branch: main
+    dockerfilePath: Dockerfile
+    # Pipeline worker: consumes jobs from the BigFilePipeline Redis queue
+    # (pdf:jobs list) and processes them via process_input_key_job.
+    # This handles the S3 pipeline path for very large files.
+    startCommand: "python pipeline_worker.py"
+    envVars:
+      - key: REDIS_URL
+        value: "redis://localhost:6379/0"
+      - key: BOT_TOKEN
+        value: "<REPLACE_WITH_BOT_TOKEN>"
+      - key: S3_BUCKET
+        value: "<REPLACE_WITH_S3_BUCKET>"
+      - key: S3_REGION
+        value: "<REPLACE_WITH_S3_REGION>"
+      - key: AWS_ACCESS_KEY_ID
+        value: "<REPLACE_WITH_AWS_ACCESS_KEY>"
+      - key: AWS_SECRET_ACCESS_KEY
+        value: "<REPLACE_WITH_AWS_SECRET>"
       - key: LOG_CHANNEL
         value: ""
       - key: TMP_DIR
