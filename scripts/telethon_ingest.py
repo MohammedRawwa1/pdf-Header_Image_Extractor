@@ -80,7 +80,7 @@ logger = logging.getLogger("telethon_ingest")
 # Per-run file logger for Telethon debug info
 try:
     from logging.handlers import RotatingFileHandler
-    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", "/tmp/telethon_ingest.log"))
+    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", os.path.join(os.environ.get("TEMP_PATH", "/tmp"), "telethon_ingest.log")))  # nosec B108 - /tmp is last fallback, prefers env vars
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = RotatingFileHandler(str(LOG_PATH), maxBytes=5_000_000, backupCount=3)
     fh.setLevel(logging.DEBUG)
@@ -171,7 +171,7 @@ async def _start_aiohttp_debug_server():
     runner = _web.AppRunner(app)
     try:
         await runner.setup()
-        site = _web.TCPSite(runner, "0.0.0.0", port)
+        site = _web.TCPSite(runner, "0.0.0.0", port)  # nosec B104 - intentional debug server bind to all interfaces
         await site.start()
         logger.info("telethon_ingest: debug HTTP server started on 0.0.0.0:%s", port)
         return runner
@@ -650,7 +650,7 @@ async def main():
     try:
         if not string_session_loaded:
             # Prefer TELETHON_SESSION_DIR, then TEMP_PATH from config, then /tmp
-            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"
+            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"  # nosec B108 - /tmp is last fallback, prefers env vars
             try:
                 os.makedirs(session_dir, exist_ok=True)
             except Exception:

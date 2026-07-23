@@ -46,10 +46,10 @@ def main():
 
     try:
         # use stdlib to avoid extra deps
-        from urllib.request import Request, urlopen
+        from urllib.request import Request, urlopen  # nosec B310 - test script hitting localhost only
 
         req = Request(post_url, data=data, headers={"Content-Type": "application/json"})
-        with urlopen(req, timeout=10) as resp:
+        with urlopen(req, timeout=10) as resp:  # nosec B310 - localhost-only test call
             print("Status:", resp.status)
             body = resp.read().decode()
             print("Response body:", body)

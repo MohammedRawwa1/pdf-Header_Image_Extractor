@@ -511,7 +511,7 @@ def process_input_key_job(job: dict) -> dict:
                     up_elapsed = time.time() - up_start
                     if url:
                         try:
-                            _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                            _tg_send_message(None, chat_id, "\U0001f4ce File was too large for Telegram; uploaded to external storage.")
                         except Exception:
                             pass
                         out_meta.setdefault('durations', {})['s3_upload_ms'] = int(up_elapsed * 1000)
@@ -528,7 +528,7 @@ def process_input_key_job(job: dict) -> dict:
 
             # fallback notify and persist
             try:
-                _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes.")
+                _tg_send_message(None, chat_id, "\U0001f4e6 File too large to upload via bot; compression couldn't reduce it enough. Try a smaller file or external storage.")
             except Exception:
                 pass
             out_meta.setdefault('status', 'too_large_after_compress')
@@ -589,7 +589,7 @@ def process_input_key_job(job: dict) -> dict:
         logger.exception("Error processing input_key job %s", job_id)
         _tg_send_progress(
             chat_id, filename, "failed",
-            detail=f"\u274c Error: {e}",
+            detail="\u274c Processing failed. Check server logs for details.",
             message_id=_progress_msg_id,
         )
         out_meta.setdefault('status', 'error')
@@ -600,10 +600,10 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:
             pass
         try:
-            _tg_send_message(None, chat_id, f"Error processing uploaded file: {e}")
+            _tg_send_message(None, chat_id, "\u274c Error processing uploaded file. Check server logs for details.")
         except Exception:
             pass
-        return {'error': str(e)}
+        return {'error': 'processing_error'}
     finally:
         try:
             if tmpdir and os.path.exists(tmpdir):
@@ -618,7 +618,8 @@ IO_TTL = 7 * 24 * 3600
 
 
 from utils.redis_client import get_sync_redis
-from utils.db import get_sync_db
+from utils.db import get_sync_db, sync_query, COL_JOBS
+from utils.url_validation import _validate_url_safe
 
 
 def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
@@ -652,13 +653,10 @@ def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: di
             mongo_meta["unique_id"] = unique_id
             mongo_meta["type"] = "io_metadata"
             mongo_meta["created_at"] = time.time()
+            # Use the prepared statement query builder (field whitelist + parameter binding)
             mongo_db = get_sync_db()
             if mongo_db is not None:
-                mongo_db.job_metadata.update_one(
-                    {"job_id": f"io:{unique_id}"},
-                    {"$set": mongo_meta},
-                    upsert=True,
-                )
+                sync_query(COL_JOBS, mongo_db).where("job_id", "=", f"io:{unique_id}").upsert(mongo_meta)
     except Exception:
         pass
 
@@ -1075,7 +1073,7 @@ def process_document_job(
 
                 # otherwise notify user and persist io entry
                 try:
-                    _tg_send_message(None, chat_id, f"File too large to upload via bot ({orig_size} bytes); compression didn't reduce it below {upload_limit} bytes. Consider external storage or a smaller file.")
+                    _tg_send_message(None, chat_id, f"\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.")
                 except Exception:
                     pass
                 out_meta.setdefault("status", "too_large_after_compress")
@@ -1303,13 +1301,13 @@ def process_document_job(
         try:
             _tg_send_progress(
                 chat_id, filename, "failed",
-                detail=f"\u274c Error: {e}",
+                detail="\u274c Processing failed. Check server logs for details.",
                 message_id=_progress_msg_id,
             )
         except Exception:
             pass
         try:
-            _tg_send_message(None, chat_id, f"Error processing file in background: {e}")
+            _tg_send_message(None, chat_id, "\u274c Error processing file in background. Check server logs for details.")
         except Exception:
             pass
         return {"error": str(e)}
@@ -1319,39 +1317,6 @@ def process_document_job(
                 shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
-    # In-memory processing
-    try:
-        if not filename:
-            filename = os.path.basename(url.split('?', 1)[0]) or 'download.pdf'
-        if not filename.lower().endswith('.pdf'):
-            filename = filename + '.pdf'
-
-        buf = io.BytesIO()
-        with requests.get(url, stream=True, allow_redirects=True, timeout=60) as r:
-            r.raise_for_status()
-            for chunk in r.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    buf.write(chunk)
-        file_bytes = buf.getvalue()
-
-        thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
-
-        doc_buf = io.BytesIO(file_bytes)
-        thumb_buf = io.BytesIO(thumb_bytes)
-        doc_buf.seek(0)
-        thumb_buf.seek(0)
-
-        res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf,
-                                caption="Here is your file with an auto-generated cover preview.")
-        return res
-    except Exception as e:
-        try:
-            _tg_send_message(None, chat_id, f"Error processing URL in background: {e}")
-        except Exception:
-            pass
-        return {"error": str(e)}
-
-
 
 
 def process_document_batch_job(chat_id: int, items: list) -> None:
@@ -1378,14 +1343,27 @@ def process_document_batch_job(chat_id: int, items: list) -> None:
 
 
 def process_url_job(chat_id: int, url: str, filename: str) -> None:
-    """RQ job: download a PDF from URL, create thumbnail, and send back."""
+    """RQ job: download a PDF from URL, create thumbnail, and send back.
+
+    Validates the URL to prevent SSRF attacks before downloading.
+    """
+    # SSRF prevention: validate the URL before making any requests
+    if not _validate_url_safe(url):
+        logger.warning("SSRF prevention: blocked invalid/dangerous URL in process_url_job: %s", url[:100])
+        try:
+            _tg_send_message(None, chat_id, "\u274c Invalid or blocked URL. Only http/https URLs to public servers are allowed.")
+        except Exception:
+            pass
+        return
+
     tmpdir = None
     try:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None) or None)
         file_path = os.path.join(tmpdir, filename)
 
         # download
-        with requests.get(url, stream=True, allow_redirects=True, timeout=120) as r:
+        # Disable redirects to prevent SSRF bypass via redirect chains
+        with requests.get(url, stream=True, allow_redirects=False, timeout=120) as r:
             r.raise_for_status()
             with open(file_path, 'wb') as fh:
                 for chunk in r.iter_content(chunk_size=64 * 1024):
@@ -1404,7 +1382,7 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
     except Exception as e:
         logger.exception('Failed processing URL job: %s', url)
         try:
-            _tg_send_message(None, chat_id, f'Error processing URL: {e}')
+            _tg_send_message(None, chat_id, "\u274c Error processing URL. Check server logs for details.")
         except Exception:
             pass
     finally:

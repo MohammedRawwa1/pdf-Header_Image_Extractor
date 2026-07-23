@@ -197,7 +197,7 @@ class BigFilePipeline:
 
             except Exception as e:
                 logger.exception("BigFilePipeline: userbot download error: %s", e)
-                return IngestResult(ok=False, error=f"Download error: {e}")
+                return IngestResult(ok=False, error="Userbot download failed. Check server logs for details.")
 
             # Upload to S3
             try:
@@ -241,7 +241,7 @@ class BigFilePipeline:
 
         except Exception as e:
             logger.exception("BigFilePipeline: enqueue failed: %s", e)
-            return IngestResult(ok=False, error=f"Enqueue error: {e}")
+            return IngestResult(ok=False, error="Enqueue failed. Check server logs for details.")
 
     async def _download_via_userbot(
         self, chat_id: int, message_id: int, dest_path: str

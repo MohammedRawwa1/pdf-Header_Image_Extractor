@@ -5,7 +5,7 @@ from typing import Set
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
 USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in ("1", "true", "yes")
-HOST: str = os.getenv("HOST", "0.0.0.0")
+HOST: str = os.getenv("HOST", "0.0.0.0")  # nosec B104 - intentional bind to all interfaces for web serving
 PORT: int = int(os.getenv("PORT", "8000"))
 
 # ── Owner & Admin ──────────────────────────────────────────────────────────────
@@ -38,6 +38,10 @@ ADMIN_SECRET: str = os.getenv("ADMIN_SECRET", "")
 # Optional logging / integrations
 LOG_CHANNEL: str = os.getenv("LOG_CHANNEL", "")
 SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+
+# Webhook secret token for CSRF protection (X-Telegram-Bot-Api-Secret-Token)
+# If not set, a random token is auto-generated on startup
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
 
 # Background queue (optional)
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

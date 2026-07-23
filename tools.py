@@ -1,6 +1,7 @@
 import shutil
-import subprocess
+import subprocess  # nosec B404 - intentional, needed for Ghostscript PDF compression
 import os
+import logging
 from PIL import Image
 import io
 
@@ -128,6 +129,17 @@ def _optimize_thumbnail_bytes(im: Image.Image, max_bytes: int = 200 * 1024) -> b
         return b""
 
 
+def _validate_path_safe(path: str) -> bool:
+    """Validate that a file path doesn't contain path traversal sequences."""
+    # Check for path traversal BEFORE normalization, because normpath resolves `..`
+    normalized_sep = path.replace("\\", "/").split("/")
+    if ".." in normalized_sep:
+        return False
+    # Ensure the normalized path is absolute (paths from tempfile.mkdtemp are absolute)
+    normalized = os.path.normpath(path)
+    return os.path.isabs(normalized)
+
+
 def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") -> bool:
     """Try to compress a PDF file.
 
@@ -138,6 +150,19 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
 
     Returns True if `output_path` was created (and may be smaller), False on failure.
     """
+    # Validate paths to prevent command injection / path traversal
+    if not _validate_path_safe(input_path) or not _validate_path_safe(output_path):
+        logger = logging.getLogger(__name__)
+        logger.warning("compress_pdf: path validation failed for input=%s output=%s", input_path, output_path)
+        return False
+
+    # Validate gs_quality is one of the expected Ghostscript presets
+    _VALID_GS_QUALITIES = {"/screen", "/ebook", "/printer", "/prepress", "/default"}
+    if gs_quality not in _VALID_GS_QUALITIES:
+        logger = logging.getLogger(__name__)
+        logger.warning("compress_pdf: invalid gs_quality=%s, using /ebook", gs_quality)
+        gs_quality = "/ebook"
+
     # Remove any existing output
     try:
         if os.path.exists(output_path):
@@ -152,6 +177,7 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
         gs_path = shutil.which(gs_exe)
         if not gs_path:
             continue
+        # Use list form (not string) to avoid shell injection
         gs_cmd = [
             gs_path,
             "-sDEVICE=pdfwrite",
@@ -164,7 +190,7 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
             input_path,
         ]
         try:
-            subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+            subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)  # nosec B603 - uses whitelisted exe names + list form (no shell injection)
             return os.path.exists(output_path)
         except subprocess.CalledProcessError:
             # Ghostscript ran but failed for this candidate; try next candidate

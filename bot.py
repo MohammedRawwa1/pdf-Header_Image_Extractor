@@ -23,6 +23,37 @@ from telegram.ext import (
     filters,
 )
 
+
+# ── Security helpers ────────────────────────────────────────────
+_SAFE_FILENAME_RE = re.compile(r'[^a-zA-Z0-9._\- ]')
+_MAX_FILENAME_LENGTH = 255
+
+
+def _sanitize_filename(filename: str, default: str = "file") -> str:
+    """Sanitize a user-supplied filename to prevent path traversal and injection.
+
+    - Removes path separators and directory traversal sequences
+    - Strips dangerous characters (only allows a-z, A-Z, 0-9, ., _, -, space)
+    - Limits length to 255 characters
+    - Returns a safe default if the result is empty
+    """
+    if not filename or not isinstance(filename, str):
+        return default
+    # Remove any path separators
+    filename = filename.replace("\\", "_").replace("/", "_")
+    # Remove null bytes and control characters
+    filename = ''.join(c for c in filename if c >= ' ')
+    # Strip directory traversal sequences
+    filename = filename.replace("..", "_")
+    # Remove any remaining dangerous characters
+    filename = _SAFE_FILENAME_RE.sub('_', filename)
+    # Limit length
+    filename = filename[:_MAX_FILENAME_LENGTH]
+    # Strip leading dots and spaces
+    filename = filename.lstrip('. ')
+    # Default if empty
+    return filename if filename else default
+
 from tools import create_thumbnail_from_pdf, create_thumbnail_from_image, is_valid_pdf
 import config
 from config import OWNER_ID
@@ -40,6 +71,7 @@ from utils.session_healthcheck import (
     stop_session_healthcheck,
     get_session_healthchecker,
 )
+from utils.url_validation import _validate_url_safe
 from PIL import Image
 
 # ── Logging configuration (must be before any logger usage) ──
@@ -529,6 +561,21 @@ if not BOT_TOKEN:
 WEBHOOK_URL = config.WEBHOOK_URL
 USE_POLLING = config.USE_POLLING
 
+# ── Webhook secret token for CSRF protection ────────────────
+# This is sent as X-Telegram-Bot-Api-Secret-Token by Telegram when calling
+# the webhook endpoint. It protects against fake requests from malicious actors.
+# If not configured via WEBHOOK_SECRET env var, generate a random one on startup.
+WEBHOOK_SECRET = config.WEBHOOK_SECRET
+if not WEBHOOK_SECRET:
+    import secrets
+    WEBHOOK_SECRET = secrets.token_urlsafe(32)
+    logger.warning(
+        "WEBHOOK_SECRET not set in env! Auto-generated to %s... "
+        "This secret changes on every restart, which will break the webhook. "
+        "Set the WEBHOOK_SECRET env var for a persistent secret across restarts.",
+        WEBHOOK_SECRET[:8],
+    )
+
 # Build async Application (python-telegram-bot v20+)
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -641,7 +688,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     doc = msg.document
     # If REDIS_URL provided, enqueue background job and return immediately
     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-    filename = doc.file_name or f"file_{doc.file_id}"
+    filename = _sanitize_filename(doc.file_name, f"file_{doc.file_id}")
     mime = getattr(doc, "mime_type", "") or ""
     # If this was forwarded and a forward-batch is active for this sender, store metadata and return
     is_forwarded = bool(getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None) or getattr(msg, "forward_date", None))
@@ -879,7 +926,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # If REDIS_URL configured, enqueue background job and return immediately
     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-    filename = f"photo_{photo.file_id}.jpg"
+    filename = _sanitize_filename(f"photo_{photo.file_id}.jpg", "photo.jpg")
     # If this photo was forwarded and batch collection is active, append to batch
     is_forwarded = bool(getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None) or getattr(msg, "forward_date", None))
     user_id = getattr(update.effective_user, "id", None)
@@ -1090,14 +1137,49 @@ async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("Usage: /setwebhook https://example.com")
         return
     url = args[0]
+    # Validate URL to prevent SSRF attacks
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("https", "http"):
+            await update.effective_message.reply_text("\u274c URL must start with http:// or https://")
+            return
+        if not parsed.netloc:
+            await update.effective_message.reply_text("\u274c Invalid URL: no hostname")
+            return
+        # Block internal/private IP ranges to prevent SSRF
+        import ipaddress
+        try:
+            import socket
+            hostname = parsed.netloc.split(":")[0].split("@")[-1]
+            # Only check if it looks like an IP address
+            try:
+                ip = ipaddress.ip_address(hostname)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                    await update.effective_message.reply_text("\u274c URL points to an internal/private IP address. This is not allowed.")
+                    return
+            except ValueError:
+                pass  # Hostname, not an IP - allow through
+        except Exception:
+            pass  # Best-effort validation
+    except Exception:
+        await update.effective_message.reply_text("\u274c Invalid URL format")
+        return
     webhook_path = f"/webhook/{BOT_TOKEN}"
     full_url = url.rstrip("/") + webhook_path
     try:
-        await context.bot.set_webhook(full_url)
-        await update.effective_message.reply_text(f"Webhook set to {full_url}")
+        # Register webhook with secret token for CSRF protection
+        # Telegram will send X-Telegram-Bot-Api-Secret-Token header on each request
+        await context.bot.set_webhook(
+            url=full_url,
+            secret_token=WEBHOOK_SECRET,
+        )
+        await update.effective_message.reply_text(
+            f"Webhook set to {full_url}\n"
+            f"\ud83d\udd12 CSRF protection enabled (secret token configured)"
+        )
     except Exception as e:
         logger.exception("Failed to set webhook")
-        await update.effective_message.reply_text(f"Error setting webhook: {e}")
+        await update.effective_message.reply_text("\u274c Failed to set webhook. Check the URL and try again.")
 
 
 async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1112,7 +1194,7 @@ async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("Webhook deleted")
     except Exception as e:
         logger.exception("Failed to delete webhook")
-        await update.effective_message.reply_text(f"Error deleting webhook: {e}")
+        await update.effective_message.reply_text("\u274c Failed to delete webhook.")
 
 
 async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1144,7 +1226,7 @@ async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.effective_message.reply_text("Commands updated")
     except Exception as e:
         logger.exception("Failed to set commands")
-        await update.effective_message.reply_text(f"Error setting commands: {e}")
+        await update.effective_message.reply_text("\u274c Failed to update commands.")
 
 
 application.add_handler(CommandHandler("start", cmd_start))
@@ -1199,7 +1281,7 @@ async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(f"Processed batch with {len(items)} items.")
     except Exception as e:
         logger.exception("Failed to process batch inline")
-        await update.effective_message.reply_text(f"Error processing batch: {e}")
+        await update.effective_message.reply_text("\u274c Error processing batch. Check server logs for details.")
 
 
 async def cmd_cancelbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1561,7 +1643,7 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # ── 4) Clean up temp session files ──
     try:
-        for f in glob.glob(os.path.join(config.TEMP_PATH or "/tmp", "userbot_session*")):
+        for f in glob.glob(os.path.join(config.TEMP_PATH or tempfile.gettempdir(), "userbot_session*")):  # nosec - B108: config-defined fallback path
             try:
                 os.remove(f)
                 removed.append(f)
@@ -1743,8 +1825,7 @@ async def _process_pyro_login_text(update: Update, context: ContextTypes.DEFAULT
         except Exception as exc:
             logger.exception("Pyrogram send_code failed: %s", exc)
             await update.message.reply_text(
-                f"Failed to send code: {exc.__class__.__name__}. "
-                "Check API_ID/API_HASH and the phone number."
+                "Failed to send code. Check API_ID/API_HASH and the phone number."
             )
             try:
                 await pyro_client.stop()
@@ -1796,7 +1877,7 @@ async def _process_pyro_login_text(update: Update, context: ContextTypes.DEFAULT
         except Exception as exc:
             logger.exception("Pyrogram sign_in failed: %s", exc)
             await update.message.reply_text(
-                f"Login failed: {exc.__class__.__name__}. Please run /loginpyro again."
+                "Login failed. Please run /loginpyro again."
             )
             _clear_login_flow(user_id, context)
         
@@ -1999,7 +2080,7 @@ async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                         else:
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text=f"Login failed: {start_exc.__class__.__name__}.\nPlease run /login again.",
+                                text="Login failed.\nPlease run /login again.",
                             )
                     except Exception:
                         await context.bot.send_message(
@@ -2242,14 +2323,14 @@ async def on_startup() -> None:
         async def _worker_supervisor():
             """Monitor the RQ worker subprocess and restart it if it crashes."""
             import sys as _sys
-            import subprocess as _sub
+            import subprocess as _sub  # nosec - B404: needed for worker process supervision with list form (no shell)
             worker_path = os.path.join(os.getcwd(), "worker.py")
             restart_delay = 5
 
             while not _shutdown_event.is_set():
                 try:
                     global _worker_proc
-                    _worker_proc = _sub.Popen(
+                    _worker_proc = _sub.Popen(  # nosec - B603: list form, no shell=True, fixed worker path
                         [_sys.executable, worker_path],
                         env=os.environ.copy(),
                         close_fds=True,
@@ -2463,9 +2544,34 @@ async def on_shutdown() -> None:
 
 
 @app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request, background_tasks: BackgroundTasks):
+async def telegram_webhook(
+    token: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+):
+    """Receive incoming updates from Telegram via webhook.
+
+    CSRF Protection:
+    - URL path token must match BOT_TOKEN (prevents path guessing)
+    - X-Telegram-Bot-Api-Secret-Token header must match WEBHOOK_SECRET
+      (set when registering the webhook via /setwebhook or /set_webhook)
+      This is Telegram's official CSRF protection mechanism.
+    """
+    # Layer 1: URL path token validation
     if token != BOT_TOKEN:
         logger.warning("Received webhook with invalid token")
+        return {"ok": False}
+
+    # Layer 2: Secret token header validation (CSRF protection)
+    # Telegram sends this header when secret_token is configured in setWebhook
+    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        logger.warning(
+            "Received webhook with invalid X-Telegram-Bot-Api-Secret-Token "
+            "(expected=%s..., got=%s...)",
+            WEBHOOK_SECRET[:8] if WEBHOOK_SECRET else "None",
+            str(x_telegram_bot_api_secret_token)[:8] if x_telegram_bot_api_secret_token else "None",
+        )
         return {"ok": False}
 
     data = await request.json()
@@ -2479,9 +2585,12 @@ URL_RE = re.compile(r"https?://[^\s'\)\]\>]+", re.IGNORECASE)
 
 
 async def download_url_to_file(url: str, dest_path: str) -> None:
+    # SSRF prevention: validate URL before fetching and disable redirects
+    if not _validate_url_safe(url):
+        raise RuntimeError(f"SSRF prevention: blocked unsafe URL: {url[:100]}")
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, allow_redirects=True) as resp:
+        async with session.get(url, allow_redirects=False) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Download failed: {resp.status}")
             # Stream to file
@@ -2552,10 +2661,10 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                 shutil.rmtree(tmpdir, ignore_errors=True)
             return
         else:
-            # HEAD to detect content-type
+            # HEAD to detect content-type (disabled redirects for SSRF prevention)
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.head(url, allow_redirects=True) as resp:
+                    async with session.head(url, allow_redirects=False) as resp:
                         ctype = resp.headers.get('Content-Type', '')
                         if 'pdf' in ctype.lower():
                             tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR) if config.TMP_DIR else tempfile.mkdtemp()
@@ -2610,7 +2719,7 @@ async def get_commands(admin_token: str | None = Header(default=None)) -> dict:
         return {"ok": True, "commands": [c.to_dict() for c in cmds]}
     except Exception as e:
         logger.exception("Failed to fetch commands")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to fetch commands. Check server logs for details.")
 
 
 @app.post("/set_webhook")
@@ -2627,11 +2736,14 @@ async def set_webhook(request: Request, admin_token: str | None = Header(default
     webhook_path = f"/webhook/{BOT_TOKEN}"
     full_url = url.rstrip("/") + webhook_path
     try:
-        await application.bot.set_webhook(full_url)
-        return {"ok": True, "webhook": full_url}
+        await application.bot.set_webhook(
+            url=full_url,
+            secret_token=WEBHOOK_SECRET,
+        )
+        return {"ok": True, "webhook": full_url, "csrf_protected": True}
     except Exception as e:
         logger.exception("Failed to set webhook")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to set webhook. Check server logs for details.")
 
 
 @app.post("/delete_webhook")
@@ -2645,15 +2757,7 @@ async def delete_webhook(request: Request, admin_token: str | None = Header(defa
         return {"ok": True}
     except Exception as e:
         logger.exception("Failed to delete webhook")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post('/admin/recache_thumbs')
-async def admin_recache_thumbs(request: Request, admin_token: str | None = Header(default=None)) -> dict:
-    """Thumbnail recache endpoint — disabled. Thumbnail caching was removed."""
-    if not admin_token or not _verify_admin_header(admin_token):
-        raise HTTPException(status_code=403, detail='Invalid admin token')
-    return {'ok': False, 'error': 'Thumbnail caching is disabled. This endpoint is no-op.'}
+        raise HTTPException(status_code=500, detail="Failed to delete webhook. Check server logs for details.")
 
 
 @app.post('/admin/purge_s3')
@@ -2678,7 +2782,7 @@ async def admin_purge_s3(request: Request, admin_token: str | None = Header(defa
         return {'ok': True, 'deleted': deleted}
     except Exception as e:
         logger.exception('Failed purging S3 objects')
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail='Failed to purge S3 objects. Check server logs for details.')
 
 
 @app.post("/set_commands")
@@ -2704,7 +2808,7 @@ async def set_commands(request: Request, admin_token: str | None = Header(defaul
         return {"ok": True}
     except Exception as e:
         logger.exception("Failed to set commands")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to set commands. Check server logs for details.")
 
 
 @app.get("/")
@@ -2720,6 +2824,6 @@ async def health() -> str:
 if __name__ == '__main__':
     import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "0.0.0.0")  # nosec - B104: container deployment, configurable via HOST env var
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("bot:app", host=host, port=port, log_level="info")

@@ -656,6 +656,26 @@ class SessionHealthChecker:
                 "SessionHealthChecker: failed to export Pyrogram session string: %s", exc,
             )
 
+    # ── Privacy helper ─────────────────────────────────────────────
+
+    @staticmethod
+    def _mask_phone(phone: Optional[str]) -> Optional[str]:
+        """Mask a phone number for privacy, showing only first 3 and last 2 digits.
+
+        Examples:
+            +1234567890  ->  +12******90
+            1234567890   ->  123*****90
+            None         ->  None
+        """
+        if not phone:
+            return None
+        phone = phone.strip()
+        if len(phone) <= 5:
+            # Short number: show only first 2 chars + ***
+            return phone[:2] + "***"
+        # Show first 3 chars, mask middle, show last 2
+        return phone[:3] + "*" * (len(phone) - 5) + phone[-2:]
+
     # ── Admin alerts ────────────────────────────────────────────────
 
     async def _alert_admin(self, title: str, result: dict):
@@ -676,8 +696,9 @@ class SessionHealthChecker:
             f"\u23f1 Latency: `{result.get('latency_ms', 'N/A')} ms`",
             f"\u26a0 Error: `{result.get('error', 'None')}`",
         ]
-        if result.get("phone"):
-            lines.append(f"\ud83d\udcf1 Phone: `{result['phone']}`")
+        phone = self._mask_phone(result.get("phone"))
+        if phone:
+            lines.append(f"\ud83d\udcf1 Phone: `{phone}`")
         if result.get("dc_id"):
             lines.append(f"\ud83d\udda5 DC: `{result['dc_id']}`")
         lines.extend([
@@ -725,8 +746,9 @@ class SessionHealthChecker:
             lines.append(f"{status_emoji} *{name.capitalize()}*")
             lines.append(f"   Alive: `{r.get('alive')}`")
             lines.append(f"   Latency: `{r.get('latency_ms', 'N/A')} ms`")
-            if r.get("phone"):
-                lines.append(f"   Phone: `{r['phone']}`")
+            phone = self._mask_phone(r.get("phone"))
+            if phone:
+                lines.append(f"   Phone: `{phone}`")
             if r.get("dc_id"):
                 lines.append(f"   DC: `{r['dc_id']}`")
             if r.get("error"):
