@@ -35,6 +35,11 @@ from utils.rate_limiter import TelegramAPIRateLimiter
 from utils.bigfile_pipeline import BigFilePipeline
 from utils.userbot_uploader import send_file_via_userbot
 from utils.redis_client import get_sync_redis
+from utils.session_healthcheck import (
+    start_session_healthcheck,
+    stop_session_healthcheck,
+    get_session_healthchecker,
+)
 from PIL import Image
 
 # ── Logging configuration (must be before any logger usage) ──
@@ -526,6 +531,25 @@ USE_POLLING = config.USE_POLLING
 
 # Build async Application (python-telegram-bot v20+)
 application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# ── Session healthcheck background task ─────────────────────
+# Start the periodic session health verification loop.
+# The checker will persist healthy session strings to JSON + MongoDB.
+_shc_task = None
+try:
+    _admin_id = OWNER_ID if OWNER_ID else (list(config.ADMIN_USERS)[0] if config.ADMIN_USERS else None)
+    if _admin_id:
+        _shc_task = start_session_healthcheck(
+            admin_user_id=_admin_id,
+            bot_app=application,
+            db_model=None,  # uses utils.db fallback for MongoDB persistence
+            check_interval=int(os.getenv("SESSION_HEALTHCHECK_INTERVAL", "3600")),
+        )
+        logger.info("Session healthcheck started for admin %s", _admin_id)
+    else:
+        logger.info("No admin configured; session healthcheck disabled")
+except Exception as e:
+    logger.warning("Session healthcheck init failed (non-fatal): %s", e)
 
 # Batch-forward collection helpers (Redis-backed with local fallback)
 local_forward_batches = {}
@@ -1032,13 +1056,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start - start\n"
         "/help - this help\n"
         "/status - get bot status\n"
-        "/login - (owner) login Telethon/Pyrogram userbot\n"
+        "/login - (owner) login Telethon userbot\n"
+        "/loginpyro - (owner) login Pyrogram userbot\n"
         "/loginstatus - (owner) show login status\n"
         "/logout - (owner) logout and clear session\n"
         "/clearflood - (owner) clear flood wait / resend code\n"
         "/setwebhook <url> - (admin) set webhook to URL\n"
         "/delwebhook - (admin) delete webhook\n"
         "/setcommands - (admin) set bot command list\n"
+        "/sessionstatus - (owner) check userbot session health\n"
         "/startbatch - start collecting forwarded files\n"
         "/endbatch - process collected batch\n"
         "/cancelbatch - cancel batch collection\n"
@@ -1102,12 +1128,14 @@ async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         BotCommand("help", "Show help and available commands"),
         BotCommand("status", "Get bot status"),
         BotCommand("login", "(owner) Login Telethon userbot"),
+        BotCommand("loginpyro", "(owner) Login Pyrogram userbot"),
         BotCommand("loginstatus", "(owner) Show login status"),
         BotCommand("logout", "(owner) Logout and clear session"),
         BotCommand("clearflood", "(owner) Clear flood wait / resend code"),
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
+        BotCommand("sessionstatus", "(owner) Check userbot session health"),
         BotCommand("setwebhook", "(admin) Set webhook URL"),
         BotCommand("delwebhook", "(admin) Delete webhook"),
     ]
@@ -1190,6 +1218,30 @@ application.add_handler(CommandHandler("startbatch", cmd_startbatch))
 application.add_handler(CommandHandler("endbatch", cmd_endbatch))
 application.add_handler(CommandHandler("cancelbatch", cmd_cancelbatch))
 
+
+async def cmd_sessionstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show userbot session health status (owner only)."""
+    user = update.effective_user
+    uid = getattr(user, "id", None)
+    if not config.is_owner(uid):
+        await update.effective_message.reply_text("\u26d4 Only the bot owner can run this command.")
+        return
+
+    try:
+        checker = get_session_healthchecker()
+        # Run a fresh check (doesn't wait for interval)
+        await checker.run_once()
+        text = checker.format_status_text()
+        await update.effective_message.reply_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("/sessionstatus failed: %s", exc)
+        await update.effective_message.reply_text(
+            "Failed to check session health. Check server logs for details."
+        )
+
+
+application.add_handler(CommandHandler("sessionstatus", cmd_sessionstatus))
+
 # ── Telethon / Userbot Login Commands ────────────────────────
 
 
@@ -1223,6 +1275,18 @@ def _clear_login_flow(user_id, context):
                     pass
         except Exception:
             pass
+        # Safety net: also stop any lingering Pyrogram client
+        try:
+            pyro_client = context.user_data.get("pyro_client")
+            if pyro_client is not None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.create_task(pyro_client.stop())
+                except RuntimeError:
+                    pass
+        except Exception:
+            pass
         for key in (
             "awaiting_login_phone",
             "awaiting_login_code",
@@ -1241,6 +1305,17 @@ def _clear_login_flow(user_id, context):
             "login_pending_type",
             "login_start_task",
             "login_flow_started",
+            # Pyrogram login flow keys
+            "awaiting_pyro_phone",
+            "awaiting_pyro_code",
+            "awaiting_pyro_password",
+            "pyro_client",
+            "pyro_phone",
+            "pyro_phone_code_hash",
+            "pyro_sent_code_type",
+            "pyro_flood_wait_until",
+            "pyro_password_retry_count",
+            "pyro_login_type",
         ):
             context.user_data.pop(key, None)
 
@@ -1277,8 +1352,54 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGIN_PENDING_USERS.add(uid)
 
 
+async def cmd_loginpyro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start Pyrogram userbot login flow.
+
+    After successful login, the session string is automatically persisted to:
+    - JSON file (session_name.session.json)
+    - MongoDB (via utils.db.save_user_session)
+    """
+    user = update.effective_user
+    uid = getattr(user, "id", None)
+    if not config.is_owner(uid):
+        await update.effective_message.reply_text("\u26d4 Only the bot owner can run this command.")
+        return
+
+    try:
+        from pyrogram import Client as PyrogramClient
+    except ImportError:
+        await update.effective_message.reply_text(
+            "Pyrogram is not installed. Install pyrogram to use /loginpyro:\n"
+            "pip install pyrogram"
+        )
+        return
+
+    api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
+    api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
+    if not api_id or not api_hash:
+        await update.effective_message.reply_text(
+            "Missing credentials. Set API_ID and API_HASH in the environment."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Please send the phone number for the Pyrogram session in "
+        "international format, e.g. +1234567890."
+    )
+    context.user_data["awaiting_pyro_phone"] = True
+    context.user_data["pyro_login_type"] = True
+    LOGIN_PENDING_USERS.add(uid)
+
+
 async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current Telethon/Pyrogram login status (owner only)."""
+    """Show current Telethon/Pyrogram login status (owner only).
+
+    Enhanced to show session sources:
+    - Environment variables
+    - JSON persistence file
+    - MongoDB storage
+    - File-based .session files
+    """
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
@@ -1296,17 +1417,82 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "password": bool(data.get("awaiting_login_password")),
     }
 
+    # ── Telethon session status (multi-source) ──
     telethon_ready = False
+    telethon_source = "missing"
+    telethon_path = ""
     try:
-        from utils.telethon_session import has_usable_telethon_session
+        from utils.telethon_session import (
+            has_usable_telethon_session,
+            get_telethon_session_path,
+            _get_configured_session_string,
+            _get_persisted_session_path,
+            _load_session_string_from_file,
+        )
         telethon_ready = has_usable_telethon_session()
+        telethon_path = get_telethon_session_path()
+
+        if _get_configured_session_string():
+            telethon_source = "env"
+        elif _load_session_string_from_file(client_type="telethon"):
+            telethon_source = "json_file"
+        elif os.path.exists(telethon_path) or os.path.exists(telethon_path + ".session"):
+            telethon_source = "dot_session"
+        else:
+            telethon_source = "missing"
     except Exception:
         pass
 
+    # ── Pyrogram session status (multi-source) ──
     pyrogram_ready = False
+    pyrogram_source = "missing"
     try:
-        from utils.telethon_session import get_pyrogram_session_string
-        pyrogram_ready = bool(get_pyrogram_session_string())
+        from utils.telethon_session import (
+            get_pyrogram_session_string,
+            _load_session_string_from_file,
+        )
+        pg_env = os.getenv("PYROGRAM_SESSION") or os.getenv("USERBOT_PYROGRAM_SESSION")
+        if pg_env:
+            pyrogram_ready = True
+            pyrogram_source = "env"
+        else:
+            pg_file = _load_session_string_from_file(client_type="pyrogram")
+            if pg_file:
+                pyrogram_ready = True
+                pyrogram_source = "json_file"
+            else:
+                pyrogram_ready = bool(get_pyrogram_session_string())
+                if pyrogram_ready:
+                    pyrogram_source = "env"
+    except Exception:
+        pass
+
+    # ── JSON persistence file status ──
+    json_path = ""
+    json_has_telethon = False
+    json_has_pyrogram = False
+    try:
+        from utils.telethon_session import _get_persisted_session_path
+        json_path = _get_persisted_session_path()
+        if os.path.exists(json_path):
+            import json as _json
+            with open(json_path, "r") as _f:
+                _data = _json.load(_f)
+            json_has_telethon = bool(_data.get("telethon_session"))
+            json_has_pyrogram = bool(_data.get("pyrogram_session"))
+    except Exception:
+        pass
+
+    # ── MongoDB session status ──
+    mongo_has_session = False
+    try:
+        from utils.db import get_user_session
+        mongo_session = await get_user_session(uid)
+        mongo_has_session = bool(mongo_session and (
+            mongo_session.get("telethon_session") or
+            mongo_session.get("pyrogram_session") or
+            mongo_session.get("string_session")
+        ))
     except Exception:
         pass
 
@@ -1318,11 +1504,28 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         pass
 
+    telethon_emoji = "\u2705" if telethon_ready else "\u274c"
+    pyrogram_emoji = "\u2705" if pyrogram_ready else "\u274c"
+    source_labels = {
+        "env": "\ud83d\udce1 Environment Variable",
+        "json_file": "\ud83d\udcc4 JSON Persistence File",
+        "dot_session": "\ud83d\udcc1 .session File",
+        "mongodb": "\ud83c\udfdb\ufe0f MongoDB",
+        "missing": "\u274c Not Configured",
+    }
+
     lines = [
         "\U0001f510 **Login Status**",
         "",
-        "**Telethon session:** " + ("\u2705 Available" if telethon_ready else "\u274c Not configured"),
-        "**Pyrogram session:** " + ("\u2705 Available" if pyrogram_ready else "\u274c Not configured"),
+        f"{telethon_emoji} **Telethon session:** {source_labels.get(telethon_source, telethon_source)}",
+        f"{pyrogram_emoji} **Pyrogram session:** {source_labels.get(pyrogram_source, pyrogram_source)}",
+        "",
+        "**Session persistence:**",
+        f"  \ud83d\udcc4 JSON file: {"\u2705 Exists" if os.path.exists(json_path) else "\u274c Not found"}",
+        f"    {json_path}" if json_path else "",
+        f"    Telethon key: {"\u2705 Present" if json_has_telethon else "\u274c Empty"}",
+        f"    Pyrogram key: {"\u2705 Present" if json_has_pyrogram else "\u274c Empty"}",
+        f"  \ud83c\udfdb\ufe0f MongoDB: {"\u2705 Session stored" if mongo_has_session else "\u274c No session"}",
         "",
         "**Active login flow:**",
         "  awaiting: " + str(awaiting),
@@ -1330,75 +1533,363 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "  resend_count: " + str(resend_count),
         "  code_hash: " + str(masked_hash),
         "  session_path: " + str(session_path),
+        "  telethon_path: " + telethon_path,
     ]
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove Telethon session files and clear login state."""
+    """Remove all Telethon/Pyrogram session traces.
+
+    Cleans up:
+    - Telethon .session files and journals
+    - JSON persistence file (session_name.session.json)
+    - Pyrogram session string from JSON
+    - MongoDB stored sessions
+    - Redis-cached session data
+    - In-memory session cache
+    """
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
         await update.effective_message.reply_text("\u26d4 Only the bot owner can run this command.")
         return
 
+    removed = []
     try:
+        from utils.telethon_session import (
+            get_telethon_session_path,
+            _get_persisted_session_path,
+            save_session_string_to_file_async,
+            _invalidate_session_cache,
+        )
+    except ImportError:
         from utils.telethon_session import get_telethon_session_path
-        session_path = get_telethon_session_path()
-        removed = []
+        _get_persisted_session_path = None
+        save_session_string_to_file_async = None
+        _invalidate_session_cache = None
+
+    session_path = get_telethon_session_path()
+
+    # ── 1) Remove Telethon .session files ──
+    try:
         if os.path.exists(session_path):
+            os.remove(session_path)
+            removed.append(session_path)
+    except Exception:
+        pass
+    for suffix in (".session", ".session-journal", ".session.lock"):
+        path_with_suffix = session_path + suffix
+        if os.path.exists(path_with_suffix):
             try:
-                os.remove(session_path)
-                removed.append(session_path)
+                os.remove(path_with_suffix)
+                removed.append(path_with_suffix)
             except Exception:
                 pass
-        for suffix in (".session", ".session-journal", ".session.lock"):
-            path_with_suffix = session_path + suffix
-            if os.path.exists(path_with_suffix):
-                try:
-                    os.remove(path_with_suffix)
-                    removed.append(path_with_suffix)
-                except Exception:
-                    pass
 
-        # Clean up temp session files
+    # ── 2) Remove JSON persistence file ──
+    if _get_persisted_session_path:
         try:
-            for f in glob.glob(os.path.join(config.TEMP_PATH or "/tmp", "userbot_session*")):
-                try:
-                    os.remove(f)
-                    removed.append(f)
-                except Exception:
-                    pass
+            json_path = _get_persisted_session_path()
+            if os.path.exists(json_path):
+                os.remove(json_path)
+                removed.append(json_path + " (JSON session persistence)")
         except Exception:
             pass
 
-        # Clear Redis-cached session if any
+    # ── 3) Clear in-memory session cache ──
+    if _invalidate_session_cache:
         try:
-            from utils.cache import get_cache
-            cache = await get_cache()
-            await cache.delete("telethon:session_string")
+            _invalidate_session_cache()
         except Exception:
             pass
 
-        _clear_login_flow(uid, context)
+    # ── 4) Clean up temp session files ──
+    try:
+        for f in glob.glob(os.path.join(config.TEMP_PATH or "/tmp", "userbot_session*")):
+            try:
+                os.remove(f)
+                removed.append(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-        if removed:
-            await update.effective_message.reply_text(
-                "\u2705 Logged out and removed Telethon session files:\n" + "\n".join(removed)
-            )
+    # ── 5) Clear Redis-cached session ──
+    try:
+        from utils.cache import get_cache
+        cache = await get_cache()
+        await cache.delete("telethon:session_string")
+        if uid:
+            await cache.delete(f"cache:user:{uid}")
+    except Exception:
+        pass
+
+    # ── 6) Clear MongoDB session data ──
+    mongo_cleared = False
+    if uid:
+        try:
+            from utils.db import save_user_session
+            await save_user_session(uid, {
+                "telethon_session": "",
+                "pyrogram_session": "",
+                "string_session": "",
+                "logged_out": True,
+                "logged_out_at": time.time(),
+            })
+            mongo_cleared = True
+        except Exception:
+            pass
+
+    # ── 7) Clear login flow state ──
+    _clear_login_flow(uid, context)
+
+    # ── Build response ──
+    lines = []
+    if removed:
+        lines.append("\u2705 Logged out and removed session files:")
+        lines.extend(f"  \u2022 {f}" for f in removed)
+    else:
+        lines.append("\u2705 Logged out (no session files found)")
+
+    if mongo_cleared:
+        lines.append("  \u2022 MongoDB session cleared")
+    else:
+        lines.append("  \u2022 MongoDB not available or already clean")
+
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def _finalize_pyro_login(pyro_client, update, context, user_id):
+    """Export Pyrogram session string and persist to JSON + MongoDB."""
+    try:
+        session_str = await pyro_client.export_session_string()
+        
+        # Save to JSON persistence file
+        saved_file = False
+        try:
+            from utils.telethon_session import save_session_string_to_file_async
+            saved_file = await save_session_string_to_file_async(session_str, client_type="pyrogram")
+        except Exception as exc:
+            logger.debug("Failed to save Pyrogram session to JSON: %s", exc)
+        
+        # Save to MongoDB
+        saved_mongo = False
+        try:
+            from utils.db import save_user_session
+            await save_user_session(user_id, {
+                "pyrogram_session": session_str,
+                "string_session": session_str,
+            })
+            saved_mongo = True
+        except Exception as exc:
+            logger.debug("Failed to save Pyrogram session to MongoDB: %s", exc)
+        
+        lines = ["\u2705 Pyrogram userbot login successful!"]
+        if saved_file:
+            lines.append("  \u2022 Session saved to JSON persistence file")
+        if saved_mongo:
+            lines.append("  \u2022 Session saved to MongoDB")
+        lines.append(f"  \u2022 Session string length: {len(session_str)} chars")
+        lines.append("")
+        if saved_file or saved_mongo:
+            lines.append("The session is now fully persisted and available for userbot operations.")
         else:
-            await update.effective_message.reply_text(
-                "No local Telethon session file was found to remove."
-            )
+            lines.append("Note: session string was not persisted (set PYROGRAM_SESSION env var to preserve across restarts).")
+        
+        await update.message.reply_text("\n".join(lines))
+        logger.info("Pyrogram login successful for user %s", user_id)
+        
     except Exception as exc:
-        logger.exception("/logout failed: %s", exc)
-        await update.effective_message.reply_text(
-            "Failed to remove the Telethon session. Check server logs for details."
+        logger.exception("Pyrogram session export failed: %s", exc)
+        await update.message.reply_text(
+            "Login completed but session export failed. Check server logs."
         )
+    finally:
+        try:
+            await pyro_client.stop()
+        except Exception:
+            pass
+        _clear_login_flow(user_id, context)
+
+
+async def _process_pyro_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages during the Pyrogram login flow (phone, code, password)."""
+    user_id = getattr(update.effective_user, "id", None)
+    if not user_id:
+        return
+    
+    # Respect FloodWait
+    try:
+        flood_until = context.user_data.get("pyro_flood_wait_until")
+        if flood_until:
+            now = time.time()
+            if now < flood_until:
+                remaining = int(flood_until - now)
+                await update.message.reply_text(
+                    f"Too many login attempts. Please wait {remaining} seconds before retrying."
+                )
+                return
+            else:
+                context.user_data.pop("pyro_flood_wait_until", None)
+    except Exception:
+        pass
+    
+    # ── Phone number step ──
+    if context.user_data.get("awaiting_pyro_phone"):
+        context.user_data["awaiting_pyro_phone"] = False
+        phone = update.message.text.strip()
+        await update.message.reply_text("Got phone number. Sending code via Pyrogram...")
+        
+        api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
+        api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
+        try:
+            api_id = int(api_id)
+        except Exception:
+            await update.message.reply_text("Configured API_ID is invalid.")
+            _clear_login_flow(user_id, context)
+            return
+        
+        try:
+            from pyrogram import Client as PyrogramClient
+        except ImportError:
+            await update.message.reply_text("Pyrogram is not installed.")
+            _clear_login_flow(user_id, context)
+            return
+        
+        # Create in-memory Pyrogram client
+        pyro_client = PyrogramClient(
+            "pyro_login_session",
+            api_id=api_id,
+            api_hash=api_hash,
+            in_memory=True,
+        )
+        
+        try:
+            await pyro_client.connect()
+            sent_code = await pyro_client.send_code(phone)
+            
+            context.user_data["pyro_client"] = pyro_client
+            context.user_data["pyro_phone"] = phone
+            context.user_data["pyro_phone_code_hash"] = sent_code.phone_code_hash
+            context.user_data["awaiting_pyro_code"] = True
+            
+            # Log the code delivery type for diagnostics
+            code_type = getattr(sent_code, "type", None)
+            if code_type:
+                context.user_data["pyro_sent_code_type"] = str(code_type)
+                logger.info("Pyrogram: code sent via %s", code_type)
+            
+            await update.message.reply_text(
+                "A login code has been sent to your Telegram app. "
+                "Please send me the code (just the digits)."
+            )
+            
+        except Exception as exc:
+            logger.exception("Pyrogram send_code failed: %s", exc)
+            await update.message.reply_text(
+                f"Failed to send code: {exc.__class__.__name__}. "
+                "Check API_ID/API_HASH and the phone number."
+            )
+            try:
+                await pyro_client.stop()
+            except Exception:
+                pass
+            _clear_login_flow(user_id, context)
+        
+        return
+    
+    # ── Code entry step ──
+    if context.user_data.get("awaiting_pyro_code"):
+        code = update.message.text.strip()
+        # Normalize Arabic/ Persian digits and strip non-digit chars
+        try:
+            trans = str.maketrans({
+                "\u0660": "0", "\u0661": "1", "\u0662": "2", "\u0663": "3", "\u0664": "4",
+                "\u0665": "5", "\u0666": "6", "\u0667": "7", "\u0668": "8", "\u0669": "9",
+                "\u06F0": "0", "\u06F1": "1", "\u06F2": "2", "\u06F3": "3", "\u06F4": "4",
+                "\u06F5": "5", "\u06F6": "6", "\u06F7": "7", "\u06F8": "8", "\u06F9": "9",
+            })
+            code = code.translate(trans)
+            code = "".join(c for c in code if c.isdigit())
+        except Exception:
+            pass
+        
+        pyro_client = context.user_data.get("pyro_client")
+        phone = context.user_data.get("pyro_phone")
+        phone_code_hash = context.user_data.get("pyro_phone_code_hash")
+        
+        if not pyro_client or not phone:
+            await update.message.reply_text("Session state lost. Please run /loginpyro again.")
+            _clear_login_flow(user_id, context)
+            return
+        
+        try:
+            from pyrogram.errors import SessionPasswordNeeded
+            
+            await pyro_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            # No 2FA needed
+            context.user_data["awaiting_pyro_code"] = False
+            await _finalize_pyro_login(pyro_client, update, context, user_id)
+            
+        except SessionPasswordNeeded:
+            context.user_data["awaiting_pyro_code"] = False
+            context.user_data["awaiting_pyro_password"] = True
+            await update.message.reply_text(
+                "Two-step verification is enabled. Please enter your account password:"
+            )
+        except Exception as exc:
+            logger.exception("Pyrogram sign_in failed: %s", exc)
+            await update.message.reply_text(
+                f"Login failed: {exc.__class__.__name__}. Please run /loginpyro again."
+            )
+            _clear_login_flow(user_id, context)
+        
+        return
+    
+    # ── Password entry step (2FA) ──
+    if context.user_data.get("awaiting_pyro_password"):
+        password = update.message.text.strip()
+        pyro_client = context.user_data.get("pyro_client")
+        
+        if not pyro_client:
+            await update.message.reply_text("Session state lost. Please run /loginpyro again.")
+            _clear_login_flow(user_id, context)
+            return
+        
+        try:
+            await pyro_client.sign_in(password=password)
+            context.user_data["awaiting_pyro_password"] = False
+            await _finalize_pyro_login(pyro_client, update, context, user_id)
+        except Exception as exc:
+            logger.exception("Pyrogram password sign_in failed: %s", exc)
+            retry = context.user_data.get("pyro_password_retry_count", 0) + 1
+            context.user_data["pyro_password_retry_count"] = retry
+            if retry >= 3:
+                await update.message.reply_text(
+                    "Too many incorrect password attempts. Please run /loginpyro again."
+                )
+                _clear_login_flow(user_id, context)
+            else:
+                await update.message.reply_text(
+                    f"Incorrect password. Try again ({retry}/3):"
+                )
+        return
 
 
 async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages during the Telethon login flow (phone, code, password)."""
+    """Handle text messages during login flows (Telethon or Pyrogram).
+    
+    Dispatches to the Pyrogram handler when ``pyro_login_type`` is set.
+    """
+    # Dispatch to Pyrogram handler if this is a Pyrogram login flow
+    if context.user_data.get("pyro_login_type"):
+        await _process_pyro_login_text(update, context)
+        return
+    
+    user_id = getattr(update.effective_user, "id", None)
+    if not user_id:
+        return
     user_id = getattr(update.effective_user, "id", None)
     if not user_id:
         return
@@ -1644,6 +2135,7 @@ async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 application.add_handler(CommandHandler("login", cmd_login))
+application.add_handler(CommandHandler("loginpyro", cmd_loginpyro))
 application.add_handler(CommandHandler("loginstatus", cmd_loginstatus))
 application.add_handler(CommandHandler("logout", cmd_logout))
 
@@ -1743,6 +2235,18 @@ _login_text_filter = filters.TEXT & ~filters.COMMAND & AwaitingLoginFilter()
 application.add_handler(MessageHandler(_login_text_filter, _process_login_text))
 
 app = FastAPI()
+
+
+# ── Application shutdown handler ────────────────────────────
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """Graceful shutdown: stop session healthcheck and cleanup."""
+    logger.info("Shutting down bot application...")
+    try:
+        stop_session_healthcheck()
+        logger.info("Session healthcheck stopped")
+    except Exception:
+        pass
 
 # Background tasks references for graceful shutdown
 _keep_alive_task = None
