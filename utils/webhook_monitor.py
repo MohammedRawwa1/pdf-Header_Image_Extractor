@@ -145,9 +145,10 @@ class WebhookMonitor:
 class WebhookRecoveryManager:
     """Manage webhook recovery and automatic restart."""
 
-    def __init__(self, bot_application, webhook_url: str):
+    def __init__(self, bot_application, webhook_url: str, secret_token: str | None = None):
         self.application = bot_application
         self.webhook_url = webhook_url
+        self.secret_token = secret_token
         self.monitor = WebhookMonitor(webhook_url)
         self.recovery_attempts = 0
         self.max_recovery_attempts = 3
@@ -163,9 +164,10 @@ class WebhookRecoveryManager:
 
         logger.warning("Attempting webhook recovery (attempt %d/%d)", self.recovery_attempts + 1, self.max_recovery_attempts)
         try:
-            await self.application.bot.set_webhook(
-                url=self.webhook_url, allowed_updates=["message", "callback_query", "edited_message"]
-            )
+            kwargs = {"url": self.webhook_url, "allowed_updates": ["message", "callback_query", "edited_message"]}
+            if self.secret_token:
+                kwargs["secret_token"] = self.secret_token
+            await self.application.bot.set_webhook(**kwargs)
             self.recovery_attempts += 1
             if await self.monitor.wait_until_healthy(timeout=30):
                 logger.info("Webhook recovered successfully")

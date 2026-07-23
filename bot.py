@@ -2420,7 +2420,7 @@ async def on_startup() -> None:
     elif WEBHOOK_URL:
         webhook_path = f"/webhook/{BOT_TOKEN}"
         full_url = WEBHOOK_URL.rstrip("/") + webhook_path
-        await application.bot.set_webhook(full_url)
+        await application.bot.set_webhook(url=full_url, secret_token=WEBHOOK_SECRET)
         try:
             masked_url = full_url.rsplit('/', 1)[0] + '/<REDACTED_BOT_TOKEN>'
         except Exception:
@@ -2433,7 +2433,7 @@ async def on_startup() -> None:
     if WEBHOOK_URL:
         try:
             from utils.webhook_monitor import WebhookRecoveryManager
-            _webhook_recovery = WebhookRecoveryManager(application, WEBHOOK_URL)
+            _webhook_recovery = WebhookRecoveryManager(application, WEBHOOK_URL, WEBHOOK_SECRET)
             await _webhook_recovery.start()
             logger.info("Webhook recovery monitor started")
         except Exception as _wh_err:
