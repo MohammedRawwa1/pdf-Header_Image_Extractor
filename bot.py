@@ -2025,13 +2025,20 @@ async def cmd_logout(
             except Exception:
                 pass
 
-    # ── 2) Remove JSON persistence file ──
+    # ── 2) Remove Telethon session string from JSON, keep Pyrogram ──
     if _get_persisted_session_path:
         try:
             json_path = _get_persisted_session_path()
             if os.path.exists(json_path):
-                os.remove(json_path)
-                removed.append(json_path + " (JSON session persistence)")
+                with open(json_path) as _f:
+                    _data = json.load(_f)
+                had_tel = _data.pop("telethon_session", None)
+                if had_tel:
+                    with open(json_path, "w") as _f:
+                        json.dump(_data, _f, indent=2)
+                    removed.append(
+                        json_path + " (Telethon session removed from JSON)"
+                    )
         except Exception:
             pass
 
@@ -2068,7 +2075,7 @@ async def cmd_logout(
     except Exception:
         pass
 
-    # ── 6) Clear MongoDB session data ──
+    # ── 6) Clear Telethon session from MongoDB, keep Pyrogram ──
     mongo_cleared = False
     if uid:
         try:
@@ -2078,7 +2085,6 @@ async def cmd_logout(
                 uid,
                 {
                     "telethon_session": "",
-                    "pyrogram_session": "",
                     "string_session": "",
                     "logged_out": True,
                     "logged_out_at": time.time(),
@@ -2458,11 +2464,74 @@ async def _process_login_text(
             await client.connect()
 
             if await client.is_user_authorized():
+                # Session exists on disk. Also persist the session string to
+                # the JSON file and MongoDB so it survives across restarts
+                # without the .session file (mirrors the same logic in _do_start()).
+                _tel_session_str = None
+                _tel_saved_file = False
+                _tel_saved_mongo = False
+                try:
+                    _tel_session_str = client.session.save()
+                    if _tel_session_str:
+                        _tel_session_str = str(_tel_session_str)
+                        from utils.telethon_session import (
+                            save_session_string_to_file_async,
+                        )
+
+                        _tel_saved_file = (
+                            await save_session_string_to_file_async(
+                                _tel_session_str,
+                                client_type="telethon",
+                            )
+                        )
+                except Exception as _tel_save_err:
+                    logger.debug(
+                        "Failed to persist Telethon session to JSON: %s",
+                        _tel_save_err,
+                    )
+
+                # Persist to MongoDB for cross-deployment survival
+                if _tel_session_str:
+                    try:
+                        from utils.db import save_user_session
+
+                        await save_user_session(
+                            user_id,
+                            {
+                                "telethon_session": _tel_session_str,
+                                "string_session": _tel_session_str,
+                            },
+                        )
+                        _tel_saved_mongo = True
+                    except Exception as _tel_mongo_err:
+                        logger.debug(
+                            "Failed to persist Telethon session to MongoDB: %s",
+                            _tel_mongo_err,
+                        )
+
+                _persist_msgs = []
+                if _tel_saved_file:
+                    _persist_msgs.append(
+                        "  \u2022 Session saved to JSON persistence file"
+                    )
+                if _tel_saved_mongo:
+                    _persist_msgs.append(
+                        "  \u2022 Session saved to MongoDB"
+                    )
+
                 await update.message.reply_text(
-                    f"Telethon session is already authorized and saved to {session_path}."
+                    "Telethon session is already authorized and saved."
+                    + ("\n" + "\n".join(_persist_msgs) if _persist_msgs else "")
                 )
                 await client.disconnect()
                 _clear_login_flow(user_id, context)
+                logger.info(
+                    "Telethon session already authorized for %s "
+                    "(json_persisted=%s, mongo_persisted=%s)",
+                    phone,
+                    _tel_saved_file,
+                    _tel_saved_mongo,
+                )
                 return
 
             async def _do_start():
@@ -2563,9 +2632,11 @@ async def _process_login_text(
                         # Telethon already saved the session to its native .session file
                         # at session_path. has_usable_telethon_session() and
                         # build_telethon_client() will find it automatically.
-                        # Also persist the session string to the JSON file so it survives
-                        # across restarts without the .session file.
+                        # Also persist the session string to the JSON file and MongoDB
+                        # so it survives across restarts without the .session file.
+                        _tel_session_str = None
                         _tel_saved_file = False
+                        _tel_saved_mongo = False
                         try:
                             _tel_session_str = client.session.save()
                             if _tel_session_str:
@@ -2586,6 +2657,25 @@ async def _process_login_text(
                                 _tel_save_err,
                             )
 
+                        # Persist to MongoDB for cross-deployment survival
+                        if _tel_session_str:
+                            try:
+                                from utils.db import save_user_session
+
+                                await save_user_session(
+                                    user_id,
+                                    {
+                                        "telethon_session": _tel_session_str,
+                                        "string_session": _tel_session_str,
+                                    },
+                                )
+                                _tel_saved_mongo = True
+                            except Exception as _tel_mongo_err:
+                                logger.debug(
+                                    "Failed to persist Telethon session to MongoDB: %s",
+                                    _tel_mongo_err,
+                                )
+
                         # Show the full login status so the user immediately sees
                         # whether Telethon/Pyrogram/JSON/MongoDB are all set.
                         try:
@@ -2602,14 +2692,20 @@ async def _process_login_text(
                                 _tel_lines.append(
                                     "  \u2022 Session saved to JSON persistence file"
                                 )
+                            if _tel_saved_mongo:
+                                _tel_lines.append(
+                                    "  \u2022 Session saved to MongoDB"
+                                )
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
                                 text="\n".join(_tel_lines),
                             )
                         logger.info(
-                            "Telethon login successful for %s (json_persisted=%s)",
+                            "Telethon login successful for %s "
+                            "(json_persisted=%s, mongo_persisted=%s)",
                             phone,
                             _tel_saved_file,
+                            _tel_saved_mongo,
                         )
                     else:
                         await context.bot.send_message(
