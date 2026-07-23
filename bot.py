@@ -79,10 +79,10 @@ from utils.progress_tracker import (  # noqa: E402
     progress_tracker,
     send_progress_update,
 )
-from utils.rate_limiter import (
+from utils.rate_limiter import (  # noqa: E402
     RedisSlidingWindowRateLimiter,
     TelegramAPIRateLimiter,
-)  # noqa: E402
+)
 from utils.redis_client import get_sync_redis  # noqa: E402
 from utils.session_healthcheck import (  # noqa: E402
     get_session_healthchecker,
