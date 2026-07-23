@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -214,7 +214,6 @@ def get_storage_backend_sync():
             self.s3.copy_object(Bucket=self.bucket, CopySource=copy_source, Key=dest_key)
 
         def _upload_bytes_sync(self, data: bytes, dest_key: str) -> str:
-            import os as _os
             extra = {'Metadata': {'orig_size': str(len(data))}}
             self.s3.put_object(Bucket=self.bucket, Key=dest_key, Body=data, ExtraArgs=extra)
             return dest_key

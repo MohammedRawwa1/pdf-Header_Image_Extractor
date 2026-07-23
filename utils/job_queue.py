@@ -4,14 +4,13 @@ Push/pop job dicts via Redis list with optional delayed scheduling.
 """
 
 import json
-import os
 import logging
+import os
 import pathlib
 import time
-from typing import Optional
 import uuid
 
-from utils.redis_client import get_async_redis, close_async_redis
+from utils.redis_client import get_async_redis
 
 JOB_LIST = "pdf:jobs"
 DELAYED_SET = "pdf:delayed"
@@ -81,7 +80,7 @@ async def enqueue_job(job: dict) -> None:
         pass
 
 
-async def pop_job(timeout: int = 5) -> Optional[dict]:
+async def pop_job(timeout: int = 5) -> dict | None:
     """Blocking pop a job from the Redis job list."""
     r = await get_async_redis()
     try:

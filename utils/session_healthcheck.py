@@ -28,7 +28,6 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +56,10 @@ class SessionHealth:
     def __init__(self, name: str):
         self.name = name
         self.alive = False
-        self.latency_ms: Optional[float] = None
-        self.error: Optional[str] = None
-        self.phone: Optional[str] = None
-        self.dc_id: Optional[int] = None
+        self.latency_ms: float | None = None
+        self.error: str | None = None
+        self.phone: str | None = None
+        self.dc_id: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -101,7 +100,7 @@ class SessionHealthChecker:
     def __init__(
         self,
         check_interval: int = 3600,          # every hour
-        admin_user_id: Optional[int] = None,
+        admin_user_id: int | None = None,
         bot_app=None,                         # PTB Application
         db_model=None,                        # MongoDB model with save_session/load_session
         max_consecutive_failures: int = 3,
@@ -113,11 +112,11 @@ class SessionHealthChecker:
         self.max_consecutive_failures = max_consecutive_failures
 
         self.is_running = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
 
         # Track transitions so we only alert once per failure streak
-        self._prev_pyrogram_ok: Optional[bool] = None
-        self._prev_telethon_ok: Optional[bool] = None
+        self._prev_pyrogram_ok: bool | None = None
+        self._prev_telethon_ok: bool | None = None
         self._pyrogram_failures = 0
         self._telethon_failures = 0
         self._last_advisory_time: float = 0
@@ -314,8 +313,8 @@ class SessionHealthChecker:
         try:
             from utils.telethon_session import (
                 build_pyrogram_client,
-                get_userbot_credentials,
                 get_pyrogram_session_string,
+                get_userbot_credentials,
             )
             if not get_pyrogram_session_string():
                 return False
@@ -360,10 +359,10 @@ class SessionHealthChecker:
 
         try:
             from utils.telethon_session import (
+                _get_env_value,
+                _load_session_string_from_file_async,
                 build_pyrogram_client,
                 get_userbot_credentials,
-                _load_session_string_from_file_async,
-                _get_env_value,
             )
         except ImportError as exc:
             h.error = f"import failed: {exc}"
@@ -444,11 +443,11 @@ class SessionHealthChecker:
         h = SessionHealth("telethon")
 
         from utils.telethon_session import (
-            build_telethon_client,
-            get_userbot_credentials,
-            _load_session_string_from_file_async,
             _get_env_value,
+            _load_session_string_from_file_async,
+            build_telethon_client,
             get_telethon_session_path,
+            get_userbot_credentials,
         )
 
         # Check env vars first (fast, no I/O)
@@ -659,7 +658,7 @@ class SessionHealthChecker:
     # ── Privacy helper ─────────────────────────────────────────────
 
     @staticmethod
-    def _mask_phone(phone: Optional[str]) -> Optional[str]:
+    def _mask_phone(phone: str | None) -> str | None:
         """Mask a phone number for privacy, showing only first 3 and last 2 digits.
 
         Examples:
@@ -768,7 +767,7 @@ class SessionHealthChecker:
 # ──────────────────────────────────────────────────────────────────────
 # Global singleton (following the cleanup_manager pattern)
 # ──────────────────────────────────────────────────────────────────────
-_session_healthchecker: Optional[SessionHealthChecker] = None
+_session_healthchecker: SessionHealthChecker | None = None
 
 
 def get_session_healthchecker() -> SessionHealthChecker:
@@ -783,7 +782,7 @@ def get_session_healthchecker() -> SessionHealthChecker:
 
 
 def start_session_healthcheck(
-    admin_user_id: Optional[int] = None,
+    admin_user_id: int | None = None,
     bot_app=None,
     db_model=None,
     check_interval: int = 3600,

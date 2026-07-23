@@ -16,7 +16,7 @@ from typing import Any
 
 try:
     import redis
-except Exception as e:
+except Exception:
     print("Missing dependency: redis. Install with `pip install redis`.", file=sys.stderr)
     raise
 
@@ -74,7 +74,7 @@ def main() -> int:
     else:
         print(pretty(in_val) if not args.raw else repr(in_val))
 
-    print("\nKey: {0}".format(key_out))
+    print(f"\nKey: {key_out}")
     if out_val is None:
         print("  <missing>")
     else:

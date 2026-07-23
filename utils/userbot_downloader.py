@@ -4,13 +4,12 @@ Adapted from media_conersion_bot for PDF-only use (no video/FFmpeg).
 Used when Telegram Bot API cannot download files >50MB.
 """
 
-import io
-import os
-import logging
-import shutil
-from typing import Union, Optional, Callable
 import asyncio
-import json
+import io
+import logging
+import os
+import shutil
+from collections.abc import Callable
 
 try:
     from telethon import TelegramClient
@@ -45,7 +44,7 @@ except ImportError:
     _FITZ_AVAILABLE = False
 
 
-def _get_bot_user_id() -> Optional[int]:
+def _get_bot_user_id() -> int | None:
     """Extract the bot's user ID from the BOT_TOKEN environment variable.
 
     When the Bot API reports ``chat_id == user_id`` (i.e. the user's ID in a DM),
@@ -65,7 +64,7 @@ def _get_bot_user_id() -> Optional[int]:
     return None
 
 
-def _is_user_dm_chat(chat_id: Union[int, str]) -> bool:
+def _is_user_dm_chat(chat_id: int | str) -> bool:
     """Return True if ``chat_id`` looks like a user-to-bot DM chat.
 
     In the Bot API, DMs use the user's Telegram ID as the ``chat_id``,
@@ -78,7 +77,7 @@ def _is_user_dm_chat(chat_id: Union[int, str]) -> bool:
         return False
 
 
-def _extract_file_dc_id(msg) -> Optional[int]:
+def _extract_file_dc_id(msg) -> int | None:
     """Extract the Telegram DC ID where the file in ``msg`` is stored.
 
     Telethon message media objects contain a ``dc_id`` attribute that tells
@@ -126,7 +125,7 @@ def _extract_file_dc_id(msg) -> Optional[int]:
     return None
 
 
-async def _normalize_target(chat_id: Union[int, str], client=None):
+async def _normalize_target(chat_id: int | str, client=None):
     """Return a compatible target entity for ``chat_id``."""
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         return chat_id
@@ -136,7 +135,7 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
         return chat_id
 
 
-async def _resolve_pyrogram_peer(client, peer_id: Union[int, str]) -> int:
+async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
     """Resolve a peer ID to get Pyrogram's cached entity (with access_hash).
 
     Pyrogram needs the ``access_hash`` for a peer before it can call
@@ -381,7 +380,7 @@ async def _download_from_raw_channel(
 async def _download_bytes_from_raw_channel(
     client, bot_api_chat_id: int, message_id: int,
     progress_callback=None,
-) -> Optional[bytes]:
+) -> bytes | None:
     """Try to in-memory download a message from a large Bot API channel via raw API.
 
     Returns bytes on success, or None.
@@ -418,7 +417,7 @@ async def _download_bytes_from_raw_channel(
 async def _download_file_by_file_id(
     file_id: str,
     dest_path: str,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Download a file directly by Bot API file_id using Telethon's resolve_bot_file_id.
 
@@ -504,7 +503,7 @@ async def _download_file_by_file_id(
             pass
 
 
-async def _resolve_telethon_entity(client, chat_id: Union[int, str]):
+async def _resolve_telethon_entity(client, chat_id: int | str):
     """Resolve a chat/peer entity for Telethon with multiple fallback strategies.
 
     Telethon needs a cached entity (from ``get_entity`` or dialog iteration)
@@ -579,13 +578,13 @@ async def _resolve_telethon_entity(client, chat_id: Union[int, str]):
 
 
 async def _download_with_telethon(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    msg_date: Optional[str] = None,
-    file_unique_id: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-    file_id: Optional[str] = None,
+    msg_date: str | None = None,
+    file_unique_id: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    file_id: str | None = None,
 ) -> bool:
     """Download using Telethon client.
 
@@ -793,10 +792,10 @@ async def _download_with_telethon(
 
 
 async def _download_bytes_with_pyrogram(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Optional[bytes]:
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bytes | None:
     """Download a message's media into memory (bytes) using Pyrogram.
 
     If ``progress_callback`` is provided, it will be called with
@@ -910,10 +909,10 @@ async def _download_bytes_with_pyrogram(
 
 
 async def _download_with_pyrogram(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -1054,8 +1053,8 @@ async def _download_with_pyrogram(
 
 async def download_bytes_by_file_id_via_userbot(
     file_id: str,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Optional[bytes]:
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bytes | None:
     """Download a file directly by bot-API file_id using userbot.
 
     Uses Telethon's ``resolve_bot_file_id`` + ``download_file`` to get the raw
@@ -1072,6 +1071,7 @@ async def download_bytes_by_file_id_via_userbot(
     if TelegramClient is not None:
         try:
             from telethon.utils import resolve_bot_file_id
+
             from utils.telethon_session import (
                 build_telethon_client,
                 get_userbot_credentials,
@@ -1131,13 +1131,13 @@ async def download_bytes_by_file_id_via_userbot(
 
 
 async def download_forward_via_userbot(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
     dest_path: str,
-    msg_date: Optional[str] = None,
-    file_unique_id: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-    file_id: Optional[str] = None,
+    msg_date: str | None = None,
+    file_unique_id: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    file_id: str | None = None,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -1210,10 +1210,10 @@ async def download_forward_via_userbot(
 
 
 async def download_bytes_via_userbot(
-    chat_id: Union[int, str],
+    chat_id: int | str,
     message_id: int,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> Optional[bytes]:
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bytes | None:
     """Download a message media into memory (bytes) using userbot.
 
     Tries **Telethon** first (faster, better large-file support),
@@ -1236,7 +1236,8 @@ async def download_bytes_via_userbot(
     # ── 1) Telethon (preferred: faster, better large-file support) ──
     if TelegramClient is not None and has_usable_telethon_session():
         try:
-            from utils.telethon_session import build_telethon_client, get_userbot_credentials as _get_creds
+            from utils.telethon_session import build_telethon_client
+            from utils.telethon_session import get_userbot_credentials as _get_creds
 
             _api_id, _api_hash = _get_creds()
             _client = build_telethon_client(_api_id, _api_hash)

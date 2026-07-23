@@ -12,9 +12,10 @@ Provides:
 import asyncio
 import logging
 import traceback
+from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ class BotErrorHandler:
         self.max_log_size = 1000
 
     @staticmethod
-    def categorize_error(exception: Exception, context: Optional[str] = None) -> str:
+    def categorize_error(exception: Exception, context: str | None = None) -> str:
         """Categorize an exception into a known error type."""
         exc_str = str(exception).lower()
         ctx = (context or "").lower()
@@ -145,9 +146,9 @@ class BotErrorHandler:
         exception: Exception,
         context: str,
         severity: str = "error",
-        user_id: Optional[int] = None,
-        additional_info: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        user_id: int | None = None,
+        additional_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Log an error with full context and return a structured error entry.
 
         Args:
@@ -226,9 +227,9 @@ async def handle_bot_error(
     exception: Exception,
     context: str,
     update=None,
-    user_id: Optional[int] = None,
+    user_id: int | None = None,
     send_user_message=None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Handle an error: log it and optionally notify the user.
 
     Args:
@@ -268,7 +269,7 @@ async def handle_bot_error(
 
 def async_error_handler(
     context: str,
-    send_user_message_callback: Optional[Callable] = None,
+    send_user_message_callback: Callable | None = None,
     re_raise: bool = False,
 ):
     """Decorator for async functions to handle errors gracefully.

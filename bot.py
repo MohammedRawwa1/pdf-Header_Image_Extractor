@@ -1,28 +1,26 @@
-import os
-import logging
-import tempfile
-import shutil
-from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 import asyncio
-import re
-import aiohttp
-import aiofiles
-import json
-import uuid
 import glob
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
 import time
-from typing import Union
+import uuid
 from urllib.parse import urlparse
-from telegram import InputFile
-from telegram import Update, BotCommand
+
+import aiofiles
+import aiohttp
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from telegram import BotCommand, InputFile, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
-    CommandHandler,
     filters,
 )
-
 
 # ── Security helpers ────────────────────────────────────────────
 _SAFE_FILENAME_RE = re.compile(r'[^a-zA-Z0-9._\- ]')
@@ -54,25 +52,34 @@ def _sanitize_filename(filename: str, default: str = "file") -> str:
     # Default if empty
     return filename if filename else default
 
-from tools import create_thumbnail_from_pdf, create_thumbnail_from_image, is_valid_pdf
-import config
-from config import OWNER_ID
-from utils.progress_tracker import progress_tracker, send_progress_update, _format_size
-from utils.error_handler import (
+from PIL import Image  # noqa: E402
+
+import config  # noqa: E402
+from config import OWNER_ID  # noqa: E402
+from tools import (  # noqa: E402
+    create_thumbnail_from_image,
+    create_thumbnail_from_pdf,
+    is_valid_pdf,
+)
+from utils.bigfile_pipeline import BigFilePipeline  # noqa: E402
+from utils.error_handler import (  # noqa: E402
     get_error_handler,
     handle_bot_error,
 )
-from utils.rate_limiter import TelegramAPIRateLimiter
-from utils.bigfile_pipeline import BigFilePipeline
-from utils.userbot_uploader import send_file_via_userbot
-from utils.redis_client import get_sync_redis
-from utils.session_healthcheck import (
+from utils.progress_tracker import (  # noqa: E402
+    _format_size,
+    progress_tracker,
+    send_progress_update,
+)
+from utils.rate_limiter import TelegramAPIRateLimiter  # noqa: E402
+from utils.redis_client import get_sync_redis  # noqa: E402
+from utils.session_healthcheck import (  # noqa: E402
+    get_session_healthchecker,
     start_session_healthcheck,
     stop_session_healthcheck,
-    get_session_healthchecker,
 )
-from utils.url_validation import _validate_url_safe
-from PIL import Image
+from utils.url_validation import _validate_url_safe  # noqa: E402
+from utils.userbot_uploader import send_file_via_userbot  # noqa: E402
 
 # ── Logging configuration (must be before any logger usage) ──
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -106,7 +113,10 @@ except Exception as e:
 def _check_userbot_available() -> bool:
     """Return True if a Telethon or Pyrogram userbot session is configured."""
     try:
-        from utils.telethon_session import has_usable_telethon_session, get_pyrogram_session_string
+        from utils.telethon_session import (
+            get_pyrogram_session_string,
+            has_usable_telethon_session,
+        )
         return has_usable_telethon_session() or bool(get_pyrogram_session_string())
     except Exception:
         return False
@@ -134,7 +144,7 @@ async def _send_with_upload_progress(
     bot, chat_id: int, file_path: str, caption: str,
     thumb_path: str | None, user_id: int, filename: str, file_size: int,
     loop: asyncio.AbstractEventLoop,
-    target_chat_id: Union[int, str] = None,
+    target_chat_id: int | str = None,
 ) -> bool:
     """Send a file via userbot with upload progress tracking.
 
@@ -538,6 +548,7 @@ async def _track_user_session(update: Update, action: str = "message"):
 def enqueue_job(func_name: str, *args, **kwargs):
     try:
         from rq import Queue
+
         import tasks
 
         redis_conn = get_sync_redis()
@@ -1149,7 +1160,6 @@ async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Block internal/private IP ranges to prevent SSRF
         import ipaddress
         try:
-            import socket
             hostname = parsed.netloc.split(":")[0].split("@")[-1]
             # Only check if it looks like an IP address
             try:
@@ -1177,7 +1187,7 @@ async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Webhook set to {full_url}\n"
             f"\ud83d\udd12 CSRF protection enabled (secret token configured)"
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to set webhook")
         await update.effective_message.reply_text("\u274c Failed to set webhook. Check the URL and try again.")
 
@@ -1192,7 +1202,7 @@ async def cmd_delwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         await context.bot.delete_webhook()
         await update.effective_message.reply_text("Webhook deleted")
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to delete webhook")
         await update.effective_message.reply_text("\u274c Failed to delete webhook.")
 
@@ -1224,7 +1234,7 @@ async def cmd_setcommands(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         await context.bot.set_my_commands(commands)
         await update.effective_message.reply_text("Commands updated")
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to set commands")
         await update.effective_message.reply_text("\u274c Failed to update commands.")
 
@@ -1279,7 +1289,7 @@ async def cmd_endbatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await loop.run_in_executor(None, tasks.process_document_batch_job, chat_id, items)
         clear_forward_batch(chat_id, user_id)
         await update.effective_message.reply_text(f"Processed batch with {len(items)} items.")
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to process batch inline")
         await update.effective_message.reply_text("\u274c Error processing batch. Check server logs for details.")
 
@@ -1411,7 +1421,7 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        from telethon import TelegramClient
+        from telethon import TelegramClient  # noqa: F401
     except ImportError:
         await update.effective_message.reply_text(
             "Telethon is not installed. Install telethon to use /login:\n"
@@ -1448,7 +1458,7 @@ async def cmd_loginpyro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     try:
-        from pyrogram import Client as PyrogramClient
+        from pyrogram import Client as PyrogramClient  # noqa: F401
     except ImportError:
         await update.effective_message.reply_text(
             "Pyrogram is not installed. Install pyrogram to use /loginpyro:\n"
@@ -1494,10 +1504,10 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     telethon_source = ""
     try:
         from utils.telethon_session import (
-            has_usable_telethon_session,
-            get_telethon_session_path,
             _get_configured_session_string,
             _load_session_string_from_file,
+            get_telethon_session_path,
+            has_usable_telethon_session,
         )
         telethon_ready = has_usable_telethon_session()
         if _get_configured_session_string():
@@ -1515,7 +1525,10 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     pyrogram_ready = False
     pyrogram_source = ""
     try:
-        from utils.telethon_session import get_pyrogram_session_string, _load_session_string_from_file
+        from utils.telethon_session import (
+            _load_session_string_from_file,
+            get_pyrogram_session_string,
+        )
         pg_env = os.getenv("PYROGRAM_SESSION") or os.getenv("USERBOT_PYROGRAM_SESSION")
         if pg_env:
             pyrogram_ready = True
@@ -1539,7 +1552,7 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         json_exists = os.path.exists(json_path)
         if json_exists:
             import json as _json
-            with open(json_path, "r") as _f:
+            with open(json_path) as _f:
                 _data = _json.load(_f)
             json_has_telethon = bool(_data.get("telethon_session"))
             json_has_pyrogram = bool(_data.get("pyrogram_session"))
@@ -1595,15 +1608,14 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     removed = []
     try:
         from utils.telethon_session import (
-            get_telethon_session_path,
             _get_persisted_session_path,
-            save_session_string_to_file_async,
             _invalidate_session_cache,
+            get_telethon_session_path,
+            save_session_string_to_file_async,  # noqa: F401
         )
     except ImportError:
         from utils.telethon_session import get_telethon_session_path
         _get_persisted_session_path = None
-        save_session_string_to_file_async = None
         _invalidate_session_cache = None
 
     session_path = get_telethon_session_path()
@@ -1992,7 +2004,11 @@ async def _process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
 
             async def _do_start():
-                from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError, FloodWaitError
+                from telethon.errors import (
+                    FloodWaitError,
+                    PhoneCodeExpiredError,
+                    SessionPasswordNeededError,
+                )
 
                 try:
                     loop = asyncio.get_running_loop()
@@ -2322,8 +2338,8 @@ async def on_startup() -> None:
     if os.getenv("RUN_WORKER_IN_PROC", "false").lower() in ("1", "true", "yes"):
         async def _worker_supervisor():
             """Monitor the RQ worker subprocess and restart it if it crashes."""
-            import sys as _sys
             import subprocess as _sub  # nosec - B404: needed for worker process supervision with list form (no shell)
+            import sys as _sys
             worker_path = os.path.join(os.getcwd(), "worker.py")
             restart_delay = 5
 
@@ -2352,7 +2368,7 @@ async def on_startup() -> None:
                         _shutdown_event.wait(), timeout=restart_delay,
                     )
                     break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
 
         _worker_task = asyncio.create_task(_worker_supervisor())
@@ -2384,7 +2400,7 @@ async def on_startup() -> None:
                                 await application.process_update(u)
                             except Exception:
                                 logger.exception("Failed to dispatch polled update")
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Normal timeout — no updates, keep polling
                     pass
                 except Exception as e:
@@ -2394,7 +2410,7 @@ async def on_startup() -> None:
                             _shutdown_event.wait(), timeout=poll_interval,
                         )
                         break
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         continue
 
             logger.info("Long-poller stopped")
@@ -2465,12 +2481,12 @@ async def on_startup() -> None:
                                 try:
                                     async with _session.get(_health_url, timeout=aiohttp.ClientTimeout(total=10)) as _resp:
                                         logger.debug("Keep-alive ping: %s", _resp.status)
-                                except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
+                                except (TimeoutError, aiohttp.ClientError, OSError) as _e:
                                     logger.debug("Keep-alive ping failed (harmless): %s", _e)
                                 try:
                                     await asyncio.wait_for(_shutdown_event.wait(), timeout=_ka_interval)
                                     break
-                                except asyncio.TimeoutError:
+                                except TimeoutError:
                                     continue
                                 except asyncio.CancelledError:
                                     break
@@ -2650,7 +2666,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                     with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                         input_doc = InputFile(f_doc, filename=base)
                         chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-                        await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
+                        await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption="Generated thumbnail from URL")
             except Exception as e:
                 error_info = await handle_bot_error(e, "URL PDF Processing", update=update)
                 try:
@@ -2680,7 +2696,7 @@ async def handle_text_with_url(update: Update, context: ContextTypes.DEFAULT_TYP
                                 with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
                                     input_doc = InputFile(f_doc, filename=base)
                                     chat_id = msg.chat.id if getattr(msg, 'chat', None) else msg.chat_id
-                                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption=f"Generated thumbnail from URL")
+                                    await context.bot.send_document(chat_id=chat_id, document=input_doc, thumbnail=f_thumb, caption="Generated thumbnail from URL")
                             except Exception as e:
                                 error_info = await handle_bot_error(e, "URL PDF Processing (HEAD detect)", update=update)
                                 try:
@@ -2717,7 +2733,7 @@ async def get_commands(admin_token: str | None = Header(default=None)) -> dict:
     try:
         cmds = await application.bot.get_my_commands()
         return {"ok": True, "commands": [c.to_dict() for c in cmds]}
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to fetch commands")
         raise HTTPException(status_code=500, detail="Failed to fetch commands. Check server logs for details.")
 
@@ -2741,7 +2757,7 @@ async def set_webhook(request: Request, admin_token: str | None = Header(default
             secret_token=WEBHOOK_SECRET,
         )
         return {"ok": True, "webhook": full_url, "csrf_protected": True}
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to set webhook")
         raise HTTPException(status_code=500, detail="Failed to set webhook. Check server logs for details.")
 
@@ -2755,7 +2771,7 @@ async def delete_webhook(request: Request, admin_token: str | None = Header(defa
     try:
         await application.bot.delete_webhook()
         return {"ok": True}
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to delete webhook")
         raise HTTPException(status_code=500, detail="Failed to delete webhook. Check server logs for details.")
 
@@ -2780,7 +2796,7 @@ async def admin_purge_s3(request: Request, admin_token: str | None = Header(defa
         loop = asyncio.get_running_loop()
         deleted = await loop.run_in_executor(None, purge_objects_older_than, ttl, prefix)
         return {'ok': True, 'deleted': deleted}
-    except Exception as e:
+    except Exception:
         logger.exception('Failed purging S3 objects')
         raise HTTPException(status_code=500, detail='Failed to purge S3 objects. Check server logs for details.')
 
@@ -2806,7 +2822,7 @@ async def set_commands(request: Request, admin_token: str | None = Header(defaul
                 BotCommand("status", "Get bot status"),
             ])
         return {"ok": True}
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to set commands")
         raise HTTPException(status_code=500, detail="Failed to set commands. Check server logs for details.")
 

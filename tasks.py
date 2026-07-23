@@ -1,13 +1,13 @@
-import os
-import tempfile
-import shutil
-from typing import Optional
 import io
-import requests
-import time
-import logging
 import json
+import logging
+import os
+import shutil
+import tempfile
+import time
 import uuid
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
     for attempt in range(3):
         try:
             r = requests.get(url, params={"file_id": file_id}, timeout=30)
-        except Exception as e:
+        except Exception:
             logger.exception("Network error fetching getFile for %s (attempt %s)", file_id, attempt + 1)
             if attempt < 2:
                 time.sleep(1 + attempt)
@@ -258,15 +258,16 @@ def _tg_send_progress(
         return None
 
 
-from tools import (
-    create_thumbnail_from_pdf,
-    create_thumbnail_from_image,
-    create_thumbnail_from_pdf_bytes,
-    create_thumbnail_from_image_bytes,
+import config  # noqa: E402
+from tools import (  # noqa: E402
     compress_pdf,
+    create_thumbnail_from_image,
+    create_thumbnail_from_image_bytes,
+    create_thumbnail_from_pdf,
+    create_thumbnail_from_pdf_bytes,
 )
-from utils.progress_tracker import _format_size, _build_progress_bar
-import config
+from utils.progress_tracker import _build_progress_bar, _format_size  # noqa: E402
+
 try:
     from rq import get_current_job
 except Exception:
@@ -617,9 +618,9 @@ def process_input_key_job(job: dict) -> dict:
 IO_TTL = 7 * 24 * 3600
 
 
-from utils.redis_client import get_sync_redis
-from utils.db import get_sync_db, sync_query, COL_JOBS
-from utils.url_validation import _validate_url_safe
+from utils.db import COL_JOBS, get_sync_db, sync_query  # noqa: E402
+from utils.redis_client import get_sync_redis  # noqa: E402
+from utils.url_validation import _validate_url_safe  # noqa: E402
 
 
 def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
@@ -667,12 +668,12 @@ def process_document_job(
     chat_id: int,
     file_id: str,
     filename: str,
-    mime: Optional[str] = "",
-    file_unique_id: Optional[str] = None,
-    message_id: Optional[int] = None,
-    forward_info: Optional[dict] = None,
-    file_size: Optional[int] = None,
-) -> Optional[dict]:
+    mime: str | None = "",
+    file_unique_id: str | None = None,
+    message_id: int | None = None,
+    forward_info: dict | None = None,
+    file_size: int | None = None,
+) -> dict | None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
 
     When the Bot API cannot handle a large file (>50MB), falls back through:
@@ -759,7 +760,9 @@ def process_document_job(
 
                 # ── Fallback (a): file_id-based download ──
                 try:
-                    from utils.userbot_downloader import download_bytes_by_file_id_via_userbot as _dl_file_id
+                    from utils.userbot_downloader import (
+                        download_bytes_by_file_id_via_userbot as _dl_file_id,
+                    )
                     _ub_data = _asyncio.run(_dl_file_id(file_id))
                     if _ub_data and len(_ub_data) > 0:
                         logger.info("Userbot file_id download succeeded: %d bytes", len(_ub_data))
@@ -773,7 +776,9 @@ def process_document_job(
                 # ── Fallback (b): chat-based download (works with any file_id) ──
                 if _ub_data is None and message_id:
                     try:
-                        from utils.userbot_downloader import download_bytes_via_userbot as _dl_chat
+                        from utils.userbot_downloader import (
+                            download_bytes_via_userbot as _dl_chat,
+                        )
                         _progress_msg_id = _tg_send_progress(
                             chat_id, filename, "downloading",
                             detail="\U0001f4e5 Downloading via userbot...",
@@ -824,7 +829,9 @@ def process_document_job(
                                     "Forwarded to relay %s/%s, trying userbot download",
                                     relay_chat_id, fwd_msg_id,
                                 )
-                                from utils.userbot_downloader import download_bytes_via_userbot as _dl_relay
+                                from utils.userbot_downloader import (
+                                    download_bytes_via_userbot as _dl_relay,
+                                )
                                 _ub_data = _asyncio.run(_dl_relay(relay_chat_id, fwd_msg_id))
                                 if _ub_data and len(_ub_data) > 0:
                                     logger.info(
@@ -848,7 +855,9 @@ def process_document_job(
                 # ── Fallback (c): BigFilePipeline (S3 pipeline) ──
                 if _ub_data is None and message_id:
                     try:
-                        from utils.bigfile_pipeline import BigFilePipeline as _BFP
+                        from utils.bigfile_pipeline import (
+                            BigFilePipeline as _BFP,  # noqa: N814
+                        )
                         _progress_msg_id = _tg_send_progress(
                             chat_id, filename, "downloading",
                             detail="\U0001f504 Trying S3 pipeline...",
@@ -898,7 +907,7 @@ def process_document_job(
                     # Update progress to failed with details
                     _tg_send_progress(
                         chat_id, filename, "failed",
-                        detail=f"\u274c All download methods failed. Check server logs.",
+                        detail="\u274c All download methods failed. Check server logs.",
                         file_size=file_size or 0,
                         message_id=_progress_msg_id,
                     )
@@ -1073,7 +1082,7 @@ def process_document_job(
 
                 # otherwise notify user and persist io entry
                 try:
-                    _tg_send_message(None, chat_id, f"\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.")
+                    _tg_send_message(None, chat_id, "\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.")
                 except Exception:
                     pass
                 out_meta.setdefault("status", "too_large_after_compress")
@@ -1379,7 +1388,7 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
         with open(file_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
             _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
                              caption='Here is your file with an auto-generated cover preview.')
-    except Exception as e:
+    except Exception:
         logger.exception('Failed processing URL job: %s', url)
         try:
             _tg_send_message(None, chat_id, "\u274c Error processing URL. Check server logs for details.")

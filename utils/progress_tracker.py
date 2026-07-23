@@ -10,15 +10,15 @@ import inspect
 import json
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 PREFIX_PROGRESS = "progress:"
 
 
-from utils.redis_client import get_sync_redis
+from utils.redis_client import get_sync_redis  # noqa: E402
 
 
 @dataclass
@@ -31,10 +31,10 @@ class TaskProgress:
     total_size: int
     processed_size: int = 0
     status: str = "pending"  # pending, downloading, processing, uploading, completed, failed
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
-    error_message: Optional[str] = None
-    _last_update: Optional[float] = None
+    start_time: float | None = None
+    end_time: float | None = None
+    error_message: str | None = None
+    _last_update: float | None = None
 
     @property
     def progress_percentage(self) -> float:
@@ -74,7 +74,7 @@ class TaskProgress:
         self.status = "failed"
         self.error_message = error_message
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
             "user_id": self.user_id,
@@ -93,8 +93,8 @@ class ProgressTracker:
     """Manage multiple task progress trackers with Redis persistence."""
 
     def __init__(self):
-        self.tasks: Dict[str, TaskProgress] = {}
-        self.callbacks: Dict[str, Callable] = {}
+        self.tasks: dict[str, TaskProgress] = {}
+        self.callbacks: dict[str, Callable] = {}
 
     def _persist_to_redis(self, task: TaskProgress):
         """Best-effort write progress to Redis for survival across restarts."""
@@ -117,7 +117,7 @@ class ProgressTracker:
         logger.info("Created task tracker: %s", task_id)
         return task
 
-    def get_task(self, task_id: str) -> Optional[TaskProgress]:
+    def get_task(self, task_id: str) -> TaskProgress | None:
         # Try in-memory first
         task = self.tasks.get(task_id)
         if task:
@@ -225,7 +225,7 @@ class ProgressTracker:
         except Exception as e:
             logger.error("Error executing callback for task %s: %s", task_id, e)
 
-    def get_all_tasks(self) -> Dict[str, TaskProgress]:
+    def get_all_tasks(self) -> dict[str, TaskProgress]:
         return self.tasks
 
     def cleanup_old_tasks(self, max_age_hours: int = 24):
@@ -289,7 +289,7 @@ def _format_time(seconds: float) -> str:
         return f"{h}h {m}m"
 
 
-async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: Optional[int] = None):
+async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: int | None = None):
     """Send or update progress message with visual progress bar.
 
     Uses Unicode block characters for maximum cross-client compatibility.

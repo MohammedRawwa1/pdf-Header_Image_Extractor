@@ -1,9 +1,10 @@
+import io
+import logging
+import os
 import shutil
 import subprocess  # nosec B404 - intentional, needed for Ghostscript PDF compression
-import os
-import logging
+
 from PIL import Image
-import io
 
 try:
     import fitz  # PyMuPDF

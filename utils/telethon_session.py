@@ -1,10 +1,9 @@
 import asyncio
 import json
-import os
-import time
-import threading
 import logging
-from typing import Optional, Union
+import os
+import threading
+import time
 
 try:
     from telethon import TelegramClient
@@ -21,7 +20,7 @@ except Exception:  # pragma: no cover - optional dependency
 logger = logging.getLogger(__name__)
 
 
-def _get_env_value(*names: str) -> Optional[str]:
+def _get_env_value(*names: str) -> str | None:
     for name in names:
         value = os.getenv(name)
         if value:
@@ -84,7 +83,7 @@ _SESSION_CACHE_TTL = 60  # seconds
 _SESSION_CACHE_LOCK = threading.Lock()
 
 
-def _get_cached_sessions() -> Optional[dict]:
+def _get_cached_sessions() -> dict | None:
     """Return cached session dict if still fresh, else None."""
     with _SESSION_CACHE_LOCK:
         if _SESSION_CACHE_DATA is not None and time.time() < _SESSION_CACHE_EXPIRES:
@@ -138,7 +137,7 @@ def _load_all_sessions_from_file() -> dict:
         _set_cached_sessions({})
         return {}
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             data = json.load(f)
         result = data if isinstance(data, dict) else {}
         _set_cached_sessions(result)
@@ -190,7 +189,7 @@ def save_session_string_to_file(session_str: str, client_type: str = "telethon")
         existing = {}
         if os.path.exists(path):
             try:
-                with open(path, "r") as f:
+                with open(path) as f:
                     _raw = json.load(f)
                 if isinstance(_raw, dict):
                     existing = _raw
@@ -234,7 +233,7 @@ async def save_session_string_to_file_async(session_str: str, client_type: str =
     )
 
 
-def _load_session_string_from_file(client_type: str = "telethon") -> Optional[str]:
+def _load_session_string_from_file(client_type: str = "telethon") -> str | None:
     """Load a session string previously persisted by the healthchecker (synchronous).
 
     Parameters
@@ -261,7 +260,7 @@ def _load_session_string_from_file(client_type: str = "telethon") -> Optional[st
     return None
 
 
-async def _load_session_string_from_file_async(client_type: str = "telethon") -> Optional[str]:
+async def _load_session_string_from_file_async(client_type: str = "telethon") -> str | None:
     """Async version of ``_load_session_string_from_file``.
 
     Runs the sync file I/O in a thread via ``asyncio.to_thread`` so the
@@ -282,7 +281,7 @@ async def _load_session_string_from_file_async(client_type: str = "telethon") ->
     return None
 
 
-def _get_configured_session_string() -> Optional[str]:
+def _get_configured_session_string() -> str | None:
     """Return a Telethon session string from any available source.
 
     Resolution order:
@@ -310,7 +309,7 @@ def _get_configured_session_string() -> Optional[str]:
     return None
 
 
-async def get_telethon_session_string_for_user(user_id: Optional[int] = None, db_model: Optional[object] = None) -> Optional[str]:
+async def get_telethon_session_string_for_user(user_id: int | None = None, db_model: object | None = None) -> str | None:
     """Return a usable Telethon session string for the given user, if available.
 
     Checks env vars first, then a MongoDB-persisted session when db_model is supplied.
@@ -341,7 +340,7 @@ async def get_telethon_session_string_for_user(user_id: Optional[int] = None, db
     return None
 
 
-async def get_telethon_session_status(user_id: Optional[int] = None, db_model: Optional[object] = None) -> dict:
+async def get_telethon_session_status(user_id: int | None = None, db_model: object | None = None) -> dict:
     """Return a diagnostic summary for Telethon session availability.
 
     Checks the same sources the bot can actually use for login fallback:
@@ -394,7 +393,7 @@ async def get_telethon_session_status(user_id: Optional[int] = None, db_model: O
     }
 
 
-def build_telethon_client(api_id: int, api_hash: str, session_str: Optional[str] = None):
+def build_telethon_client(api_id: int, api_hash: str, session_str: str | None = None):
     """Build a Telethon client with session persistence.
 
     Session resolution order:
@@ -482,7 +481,7 @@ def build_telethon_client(api_id: int, api_hash: str, session_str: Optional[str]
     )
 
 
-def get_pyrogram_session_string() -> Optional[str]:
+def get_pyrogram_session_string() -> str | None:
     """Return a Pyrogram session string from any available source.
 
     Resolution order:
@@ -507,7 +506,7 @@ def get_pyrogram_session_string() -> Optional[str]:
     return None
 
 
-def build_pyrogram_client(api_id: int, api_hash: str, session_str: Optional[str] = None) -> Optional[object]:
+def build_pyrogram_client(api_id: int, api_hash: str, session_str: str | None = None) -> object | None:
     """Build a Pyrogram client from a session string.
 
     Parameters
@@ -635,7 +634,7 @@ def get_userbot_credentials():
     return api_id, api_hash
 
 
-def normalize_target(chat_id: Union[int, str]) -> Union[int, str]:
+def normalize_target(chat_id: int | str) -> int | str:
     """Normalize a chat_id to a form usable by both Telethon and Pyrogram."""
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         return chat_id

@@ -1,8 +1,8 @@
 """Helper script to set bot commands (async)."""
-import os
 import asyncio
-from telegram import Bot, BotCommand
+import os
 
+from telegram import Bot, BotCommand
 
 DEFAULT_COMMANDS = [
     ("start", "Start interaction with the bot"),

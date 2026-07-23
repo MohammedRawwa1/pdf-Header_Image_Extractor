@@ -1,9 +1,8 @@
 import json
 import os
-from typing import Dict, Any
+from typing import Any
 
 import config
-
 
 DEFAULTS = {
     "upload_mode": "video",  # options: video, file, zip
@@ -26,18 +25,18 @@ def _settings_path() -> str:
     return os.path.join(path, "user_settings.json")
 
 
-def _load_all() -> Dict[str, Any]:
+def _load_all() -> dict[str, Any]:
     p = _settings_path()
     if not os.path.exists(p):
         return {}
     try:
-        with open(p, "r", encoding="utf-8") as fh:
+        with open(p, encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return {}
 
 
-def _save_all(data: Dict[str, Any]) -> None:
+def _save_all(data: dict[str, Any]) -> None:
     p = _settings_path()
     try:
         with open(p, "w", encoding="utf-8") as fh:
@@ -46,7 +45,7 @@ def _save_all(data: Dict[str, Any]) -> None:
         pass
 
 
-def get_user_settings(user_id: int) -> Dict[str, Any]:
+def get_user_settings(user_id: int) -> dict[str, Any]:
     all_s = _load_all()
     s = all_s.get(str(user_id), {})
     result = DEFAULTS.copy()

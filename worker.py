@@ -5,15 +5,15 @@ Usage:
 
 Ensure `REDIS_URL` is set in the environment.
 """
-import os
-import logging
 import argparse
+import logging
+import os
 import sys
-from redis import Redis
-from rq import Worker, Queue, SimpleWorker
-import traceback
-import time
 import threading
+import traceback
+
+from redis import Redis
+from rq import Queue, SimpleWorker, Worker
 
 listen = ["default"]
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")

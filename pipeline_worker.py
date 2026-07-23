@@ -64,8 +64,8 @@ def _check_boto3() -> str | None:
 
 async def consume_loop():
     """Infinite loop: pop jobs from 'pdf:jobs' and process them."""
-    from utils.job_queue import pop_job, close_redis
     import tasks
+    from utils.job_queue import close_redis, pop_job
 
     logger.info(
         "Pipeline worker started, polling 'pdf:jobs' queue (timeout=%ss)...",

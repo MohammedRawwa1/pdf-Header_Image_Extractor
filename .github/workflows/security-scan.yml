@@ -1,7 +1,8 @@
 # 🔒 Security Scan Pipeline
 # Runs on every push and pull request to main.
 # Performs: Bandit static analysis, pip-audit dependency scanning,
-# Python syntax validation, and OWASP leak pattern detection.
+# Python syntax validation, OWASP leak pattern detection,
+# and TruffleHog secret scanning for leaked credentials.
 #
 # Usage:
 #   - Runs automatically on push/PR to main
@@ -22,7 +23,7 @@ env:
 
 jobs:
   security-scan:
-    name: "Bandit + pip-audit + Syntax Check"
+    name: "Bandit + pip-audit + Ruff Lint"
     runs-on: ubuntu-latest
 
     steps:
@@ -45,16 +46,27 @@ jobs:
       - name: Validate .bandit config
         run: |
           python -c "
-          import yaml
-          with open('.bandit') as f:
-              config = yaml.safe_load(f)
-          skips = config.get('skips', [])
-          print(f'.bandit config valid: {len(skips)} skips configured ({skips})')
+          import os, yaml
+          config_path = '.bandit'
+          if not os.path.exists(config_path):
+              print('⚠️  .bandit config not found — using Bandit defaults')
+          else:
+              with open(config_path) as f:
+                  config = yaml.safe_load(f)
+              skips = config.get('skips', [])
+              print(f'✅ .bandit config valid: {len(skips)} skips configured ({skips})')
           "
 
       - name: Run Bandit security scan
         run: |
-          python -m bandit -c .bandit -r . -f json -o bandit-report.json 2>&1 || true
+          BANDIT_ARGS=""
+          if [ -f .bandit ]; then
+            BANDIT_ARGS="-c .bandit"
+            echo "Using .bandit config"
+          else
+            echo "No .bandit config found — using Bandit defaults"
+          fi
+          python -m bandit $BANDIT_ARGS -r . -f json -o bandit-report.json 2>&1 || true
           python -c "
           import json, sys
           with open('bandit-report.json') as f:
@@ -89,30 +101,11 @@ jobs:
             echo "::warning::pip-audit found vulnerabilities! Check output above."
           fi
 
-      - name: Check Python syntax (all .py files)
+      - name: Run Ruff linter with security rules
         run: |
-          echo "Checking Python syntax across all files..."
-          python -c "
-          import py_compile, os, sys
-          errors = []
-          for root, dirs, files in os.walk('.'):
-              # Skip hidden dirs and venvs
-              dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('env', '.venv', '__pycache__', 'node_modules')]
-              for f in files:
-                  if f.endswith('.py'):
-                      path = os.path.join(root, f)
-                      try:
-                          py_compile.compile(path, doraise=True)
-                      except py_compile.PyCompileError as e:
-                          errors.append(f'{path}: {e}')
-          if errors:
-              for e in errors:
-                  print(f'::error file={e.split(\":\")[0]}::{e}')
-                  print(f'FAIL: {e}')
-              sys.exit(1)
-          else:
-              print('✅ All Python files compile successfully')
-          "
+          echo "Running Ruff linter (syntax + security rules)..."
+          python -m ruff check . --output-format github
+          echo "✅ Ruff: no issues found"
 
       - name: Check for OWASP exception leak patterns
         run: |
@@ -141,7 +134,32 @@ jobs:
           echo "═══════════════════════════════════════"
           echo "  Bandit:       $(python -c "import json; d=json.load(open('bandit-report.json')); print(f'{len(d[\"results\"])} findings')" 2>/dev/null || echo "skipped")"
           echo "  pip-audit:    $(grep -c 'No known vulnerabilities' pip-audit-output.txt 2>/dev/null | xargs -I{} echo 'clean')"
-          echo "  Syntax:       checked all .py files"
+          echo "  Ruff Lint:    $(python -m ruff check . --config ruff.toml --statistics 2>&1 | tail -n 2 || echo "done")"
           echo "  Leak patterns: checked"
           echo "═══════════════════════════════════════"
           echo ""
+
+  secret-scan:
+    name: "🔑 TruffleHog Secret Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required to scan full git history
+
+      - name: Run TruffleHog secret scanner
+        uses: docker://trufflesecurity/trufflehog:latest
+        with:
+          args: >-
+            git file://.
+            --only-verified
+            --fail
+            --no-update
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::warning::🔑 TruffleHog detected verified secrets in the repository!"
+          echo "Review the logs above to see which credentials were leaked."

@@ -1,5 +1,4 @@
 import os
-from typing import Set
 
 # Core
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
@@ -22,7 +21,7 @@ if _owner_raw:
 
 # Admins: comma-separated Telegram user ids (e.g. "12345,67890"). If empty, admin commands require ADMIN_SECRET.
 ADMIN_USERS_RAW = os.getenv("ADMIN_USERS", "")
-ADMIN_USERS: Set[int] = set()
+ADMIN_USERS: set[int] = set()
 if ADMIN_USERS_RAW:
     for part in ADMIN_USERS_RAW.split(","):
         part = part.strip()

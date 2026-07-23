@@ -1,7 +1,7 @@
-from pathlib import Path
-import os
 import json
+import os
 import time
+from pathlib import Path
 
 
 def load_env_file(path: str = ".env") -> dict:
@@ -46,10 +46,13 @@ def main():
 
     try:
         # use stdlib to avoid extra deps
-        from urllib.request import Request, urlopen  # nosec B310 - test script hitting localhost only
+        from urllib.request import (  # nosec B310 - test script hitting localhost only
+            Request,
+            urlopen,
+        )
 
         req = Request(post_url, data=data, headers={"Content-Type": "application/json"})
-        with urlopen(req, timeout=10) as resp:  # nosec B310 - localhost-only test call
+        with urlopen(req, timeout=10) as resp:  # nosec B310 - localhost-only test call  # noqa: S310
             print("Status:", resp.status)
             body = resp.read().decode()
             print("Response body:", body)

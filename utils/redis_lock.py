@@ -17,7 +17,6 @@ Usage:
 import logging
 import os
 import time
-from typing import Optional
 
 try:
     import redis.asyncio as aioredis
@@ -34,8 +33,8 @@ class RedisLock:
         self,
         name: str,
         ttl: int = 30,
-        redis_url: Optional[str] = None,
-        owner: Optional[str] = None,
+        redis_url: str | None = None,
+        owner: str | None = None,
     ):
         """
         Args:
@@ -48,14 +47,13 @@ class RedisLock:
         self._ttl = ttl
         self._redis_url = redis_url or os.getenv("REDIS_URL") or ""
         self._owner = owner or f"pid:{os.getpid()}:{id(self)}"
-        self._client: Optional[aioredis.Redis] = None
+        self._client: aioredis.Redis | None = None
         self._last_connect_attempt: float = 0
         self._acquired = False
 
-    async def _get_client(self) -> Optional[aioredis.Redis]:
+    async def _get_client(self) -> aioredis.Redis | None:
         if self._client is not None:
             return self._client
-        import time
         now = time.time()
         if now - self._last_connect_attempt < 10:
             return None  # cooldown to avoid hammering Redis

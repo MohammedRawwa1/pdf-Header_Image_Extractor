@@ -12,7 +12,6 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
 
 try:
     from utils.job_queue import get_redis
@@ -35,7 +34,7 @@ class RateLimiter:
         self.per_user = per_user
         self.capacity = max(1.0, calls_per_second)
         initial_tokens = float(self.capacity)
-        self.buckets: Dict[str, Tuple[float, float]] = defaultdict(
+        self.buckets: dict[str, tuple[float, float]] = defaultdict(
             lambda: (initial_tokens, time.time())
         )
         self._lock = asyncio.Lock()
@@ -78,7 +77,7 @@ class RateLimiter:
             )
         return waited
 
-    def get_stats(self, user_id: Optional[str] = None) -> Dict:
+    def get_stats(self, user_id: str | None = None) -> dict:
         """Return rate limiter statistics."""
         stats = {}
         if user_id:
@@ -121,7 +120,7 @@ class TelegramAPIRateLimiter:
         user_ok = await self.per_user_limiter.acquire(user_id=user_id, tokens=1)
         return global_ok and user_ok
 
-    async def wait_if_needed(self, user_id: str = "global") -> Tuple[float, float]:
+    async def wait_if_needed(self, user_id: str = "global") -> tuple[float, float]:
         """Wait until both limiters allow a call.
 
         Returns (global_wait, per_user_wait) in seconds.
@@ -136,7 +135,7 @@ class TelegramAPIRateLimiter:
             )
         return gw, uw
 
-    def get_stats(self, user_id: Optional[str] = None) -> Dict:
+    def get_stats(self, user_id: str | None = None) -> dict:
         return {
             "global": self.global_limiter.get_stats(),
             "per_user": self.per_user_limiter.get_stats(user_id) if user_id else {},
@@ -150,9 +149,9 @@ class ConversionRateLimiter:
         self.conversions_per_hour = conversions_per_hour
         self.per_second = conversions_per_hour / 3600
         self.limiter = RateLimiter(self.per_second, per_user=True)
-        self.history: Dict[str, list] = defaultdict(list)
+        self.history: dict[str, list] = defaultdict(list)
 
-    async def can_convert(self, user_id: str) -> Tuple[bool, str]:
+    async def can_convert(self, user_id: str) -> tuple[bool, str]:
         """Check if user can start a conversion (non-consuming)."""
         now = time.time()
         cutoff = now - 3600

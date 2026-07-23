@@ -6,8 +6,8 @@ If `redis` is not installed, it falls back to a TCP connectivity check.
 """
 
 import os
-import sys
 import socket
+import sys
 from pathlib import Path
 
 

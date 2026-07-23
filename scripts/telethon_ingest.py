@@ -16,14 +16,13 @@ Run: `python tools/telethon_ingest.py` (ensure TELETHON env vars present).
 """
 
 import asyncio
-import os
-import logging
-import uuid
-import time
-from typing import Optional
-import sys
-from pathlib import Path
 import json
+import logging
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
 
 try:
     from telethon import TelegramClient, events
@@ -80,7 +79,7 @@ logger = logging.getLogger("telethon_ingest")
 # Per-run file logger for Telethon debug info
 try:
     from logging.handlers import RotatingFileHandler
-    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", os.path.join(os.environ.get("TEMP_PATH", "/tmp"), "telethon_ingest.log")))  # nosec B108 - /tmp is last fallback, prefers env vars
+    LOG_PATH = Path(os.environ.get("TELETHON_LOG_PATH", os.path.join(os.environ.get("TEMP_PATH", "/tmp"), "telethon_ingest.log")))  # nosec B108 - /tmp is last fallback, prefers env vars  # noqa: S108
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = RotatingFileHandler(str(LOG_PATH), maxBytes=5_000_000, backupCount=3)
     fh.setLevel(logging.DEBUG)
@@ -202,7 +201,8 @@ async def _get_backend_instance():
             pass
     # Last-ditch: attempt on-the-fly import
     try:
-        from storage import get_storage_backend as _g, get_storage_backend_sync as _gs
+        from storage import get_storage_backend as _g
+        from storage import get_storage_backend_sync as _gs
 
         get_storage_backend = _g
         get_storage_backend_sync = _gs
@@ -233,7 +233,7 @@ async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
             logger.debug("telethon_ingest: no storage backend for log upload")
             return None
         ts_key = f"telethon/{int(time.time())}_{suffix}"
-        latest_key = f"telethon/telethon_ingest.latest.log"
+        latest_key = "telethon/telethon_ingest.latest.log"
         try:
             await backend.upload_file(str(LOG_PATH), ts_key)
             logger.info("telethon_ingest: uploaded log to %s", ts_key)
@@ -260,7 +260,7 @@ async def upload_telethon_log(suffix: str = "telethon_ingest.log"):
         return None
 
 
-async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Optional[int], message_id: Optional[int]):
+async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: int | None, message_id: int | None):
     job_id = uuid.uuid4().hex
     size = None
     try:
@@ -300,7 +300,7 @@ async def _upload_and_enqueue(local_path: str, original_name: str, chat_id: Opti
         # Some storage backends may reject Windows-style paths; copy to a
         # temporary POSIX-like path before uploading to ensure compatibility.
         try:
-            import shutil, tempfile
+            import shutil
             tmp_dir = os.environ.get("TEMP_UPLOAD_DIR") or _Path(getattr(config, "TEMP_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "temp"))).as_posix()
             os.makedirs(tmp_dir, exist_ok=True)
             tmp_dst = os.path.join(tmp_dir, os.path.basename(abs_path))
@@ -650,7 +650,7 @@ async def main():
     try:
         if not string_session_loaded:
             # Prefer TELETHON_SESSION_DIR, then TEMP_PATH from config, then /tmp
-            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"  # nosec B108 - /tmp is last fallback, prefers env vars
+            session_dir = os.environ.get("TELETHON_SESSION_DIR") or os.environ.get("TEMP_PATH") or getattr(config, "TEMP_PATH", None) or "/tmp"  # nosec B108 - /tmp is last fallback, prefers env vars  # noqa: S108
             try:
                 os.makedirs(session_dir, exist_ok=True)
             except Exception:
@@ -695,7 +695,8 @@ async def main():
                         cand_dirs.append(str(Path.home()))
                     except Exception:
                         pass
-                    import glob, shutil
+                    import glob
+                    import shutil
                     for d in cand_dirs:
                         try:
                             # remove common explicit names and any files starting with session_name
@@ -817,7 +818,7 @@ async def main():
             backend = None
         if backend is not None:
             try:
-                dest_key = f"telethon/telethon_ingest.started"
+                dest_key = "telethon/telethon_ingest.started"
                 await backend.upload_file(marker, dest_key)
                 logger.info("Uploaded telethon_ingest.started to storage: %s", dest_key)
             except Exception:

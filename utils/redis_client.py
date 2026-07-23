@@ -9,9 +9,10 @@ can safely ``await r.close()`` without affecting the shared persistent connectio
 Use ``close_async_redis()`` for actual cleanup.
 """
 
+from __future__ import annotations
+
 import logging
 import os
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def get_redis_url() -> str:
 
 # ── Sync client ───────────────────────────────────────────────
 
-def get_sync_redis(decode_responses: bool = True) -> Optional['redis.Redis']:
+def get_sync_redis(decode_responses: bool = True) -> redis.Redis | None:  # noqa: F821
     """Return a cached sync Redis client (lazy singleton).
 
     Args:
@@ -94,10 +95,10 @@ class _AsyncRedisWrapper:
 
 async def get_async_redis(
     decode_responses: bool = True,
-    max_connections: Optional[int] = None,
-    socket_connect_timeout: Optional[int] = None,
-    socket_timeout: Optional[int] = None,
-) -> Optional['redis.asyncio.Redis']:
+    max_connections: int | None = None,
+    socket_connect_timeout: int | None = None,
+    socket_timeout: int | None = None,
+) -> redis.asyncio.Redis | None:  # noqa: F821
     """Return a cached async Redis client (lazy singleton).
 
     The returned wrapper's ``.close()`` is a no-op (see ``_AsyncRedisWrapper``

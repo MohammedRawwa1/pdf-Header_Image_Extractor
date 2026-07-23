@@ -3,13 +3,12 @@
 
 import asyncio
 import logging
-import time
-from datetime import datetime
-from typing import Dict
-import aiohttp
 import os
-from urllib.parse import urlparse
 import random
+from datetime import datetime
+from urllib.parse import urlparse
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +128,7 @@ class WebhookMonitor:
                 pass
         logger.info("Webhook monitoring stopped")
 
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         return {
             "healthy": self.is_healthy,
             "url": self.webhook_url,
@@ -183,7 +182,7 @@ class WebhookRecoveryManager:
         await self.monitor.stop_monitoring()
         logger.info("Webhook recovery manager stopped")
 
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         status = self.monitor.get_status()
         status["recovery_attempts"] = self.recovery_attempts
         status["max_recovery_attempts"] = self.max_recovery_attempts

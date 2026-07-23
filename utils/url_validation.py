@@ -35,7 +35,6 @@ def _validate_url_safe(url: str) -> bool:
         if not parsed.netloc:
             return False
         # Check for private/internal IPs
-        import socket
         hostname = parsed.netloc.split(":")[0].split("@")[-1]
         try:
             import ipaddress

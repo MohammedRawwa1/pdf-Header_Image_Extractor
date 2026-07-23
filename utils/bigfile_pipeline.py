@@ -11,8 +11,8 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,9 @@ except Exception:
 class IngestResult:
     """Result of a big file ingestion attempt."""
     ok: bool
-    job_id: Optional[str] = None
-    s3_key: Optional[str] = None
-    error: Optional[str] = None
+    job_id: str | None = None
+    s3_key: str | None = None
+    error: str | None = None
 
 
 class BigFilePipeline:
@@ -80,10 +80,10 @@ class BigFilePipeline:
         chat_id: int,
         message_id: int,
         file_size: int,
-        file_unique_id: Optional[str] = None,
-        user_id: Optional[int] = None,
-        original_filename: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        file_unique_id: str | None = None,
+        user_id: int | None = None,
+        original_filename: str | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> IngestResult:
         """Download a large PDF file via userbot, upload to S3, enqueue a processing job.
 

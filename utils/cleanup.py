@@ -140,7 +140,7 @@ class CleanupManager:
             import redis as _redis
 
             r = _redis.from_url(config.REDIS_URL)
-            now = time.time()
+            time.time()
             removed = 0
 
             for pattern in ("io:in:*", "io:out:*"):

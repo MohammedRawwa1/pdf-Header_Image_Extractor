@@ -4,11 +4,9 @@ Adapted from media_conersion_bot for PDF-only use (no video/FFmpeg).
 Used when Telegram Bot API cannot upload files >50MB.
 """
 
-import os
-import asyncio
 import logging
-import tempfile
-from typing import Union, Optional, Callable
+import os
+from collections.abc import Callable
 
 try:
     from telethon import TelegramClient
@@ -25,7 +23,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-async def _normalize_target(chat_id: Union[int, str], client=None):
+async def _normalize_target(chat_id: int | str, client=None):
     try:
         if isinstance(chat_id, str) and chat_id.startswith("@"):
             return chat_id
@@ -38,9 +36,9 @@ async def _normalize_target(chat_id: Union[int, str], client=None):
 
 
 async def _send_with_telethon(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    thumb_path: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    thumb_path: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Telethon.
 
@@ -50,7 +48,11 @@ async def _send_with_telethon(
     if TelegramClient is None:
         return False
 
-    from utils.telethon_session import build_telethon_client, get_userbot_credentials, has_usable_telethon_session
+    from utils.telethon_session import (
+        build_telethon_client,
+        get_userbot_credentials,
+        has_usable_telethon_session,
+    )
 
     if not has_usable_telethon_session():
         logger.info("userbot: Telethon session not configured; skipping Telethon upload")
@@ -82,9 +84,9 @@ async def _send_with_telethon(
 
 
 async def _send_with_pyrogram(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    thumb_path: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    thumb_path: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
 
@@ -124,9 +126,9 @@ async def _send_with_pyrogram(
 
 
 async def send_file_via_userbot(
-    chat_id: Union[int, str], file_path: str, caption: Optional[str] = None,
-    thumb_path: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chat_id: int | str, file_path: str, caption: str | None = None,
+    thumb_path: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> bool:
     """Send a file using a user account.
 

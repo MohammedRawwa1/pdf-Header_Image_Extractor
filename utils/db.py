@@ -31,11 +31,10 @@ Usage (Laravel-style prepared statements):
 All operations use field whitelists and parameter binding to prevent NoSQL injection.
 """
 
-import os
 import logging
+import os
 import time
-import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +69,7 @@ TTL_TELETHON = 7 * 24 * 3600      # 7 days
 # Only these fields can be used in where(), select(), or set() calls.
 # This prevents injection of arbitrary field names into MongoDB queries.
 
-_ALLOWED_FIELDS: Dict[str, set] = {
+_ALLOWED_FIELDS: dict[str, set] = {
     COL_JOBS: {
         "job_id", "status", "created_at", "updated_at",
         "io_in", "io_out", "type", "unique_id",
@@ -201,12 +200,12 @@ class MongoQueryBuilder:
         """
         self._collection = collection
         self._db = db_session
-        self._filters: List[Dict[str, Any]] = []      # where clauses (parameterized)
-        self._projection: Optional[Dict[str, int]] = None  # select fields
-        self._sort_field: Optional[str] = None
+        self._filters: list[dict[str, Any]] = []      # where clauses (parameterized)
+        self._projection: dict[str, int] | None = None  # select fields
+        self._sort_field: str | None = None
         self._sort_order: int = -1
-        self._limit_count: Optional[int] = None
-        self._skip_count: Optional[int] = None
+        self._limit_count: int | None = None
+        self._skip_count: int | None = None
 
     # ── Public API: Query building (method chaining) ──────────
 
@@ -256,14 +255,14 @@ class MongoQueryBuilder:
 
         return self
 
-    def where_in(self, field: str, values: List[Any]) -> "MongoQueryBuilder":
+    def where_in(self, field: str, values: list[Any]) -> "MongoQueryBuilder":
         """Add a WHERE IN clause.
 
         Like Laravel: ->whereIn('field', [1, 2, 3])
         """
         return self.where(field, 'in', values)
 
-    def where_nin(self, field: str, values: List[Any]) -> "MongoQueryBuilder":
+    def where_nin(self, field: str, values: list[Any]) -> "MongoQueryBuilder":
         """Add a WHERE NOT IN clause."""
         return self.where(field, 'nin', values)
 
@@ -274,7 +273,7 @@ class MongoQueryBuilder:
 
         Automatically excludes _id unless explicitly included.
         """
-        proj: Dict[str, int] = {}
+        proj: dict[str, int] = {}
         for f in fields:
             _validate_field(f, self._collection)
             proj[f] = 1
@@ -318,7 +317,7 @@ class MongoQueryBuilder:
             self._db = await get_db()
         return self._db is not None
 
-    def _build_filter(self) -> Dict[str, Any]:
+    def _build_filter(self) -> dict[str, Any]:
         """Build the MongoDB filter dict from the parameterized where clauses.
 
         Each where() call appends a parameterized filter. They are combined
@@ -330,7 +329,7 @@ class MongoQueryBuilder:
             return self._filters[0]
         return {"$and": self._filters}
 
-    def _validate_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_doc(self, doc: dict[str, Any]) -> dict[str, Any]:
         """Validate and sanitize a document for write operations.
 
         Like Laravel's $fillable protection — only allowed fields pass through.
@@ -348,7 +347,7 @@ class MongoQueryBuilder:
             validated[key] = _validate_value(value)
         return validated
 
-    async def first(self) -> Optional[Dict[str, Any]]:
+    async def first(self) -> dict[str, Any] | None:
         """Execute the query and return the first matching document.
 
         Like Laravel: ->first()
@@ -369,7 +368,7 @@ class MongoQueryBuilder:
             logger.debug("MongoQueryBuilder.first failed: %s", e)
             return None
 
-    async def get(self) -> List[Dict[str, Any]]:
+    async def get(self) -> list[dict[str, Any]]:
         """Execute the query and return all matching documents.
 
         Like Laravel: ->get()
@@ -393,7 +392,7 @@ class MongoQueryBuilder:
             logger.debug("MongoQueryBuilder.get failed: %s", e)
             return []
 
-    async def insert(self, data: Dict[str, Any]) -> bool:
+    async def insert(self, data: dict[str, Any]) -> bool:
         """Insert a new document.
 
         Like Laravel: ->insert({...})
@@ -413,7 +412,7 @@ class MongoQueryBuilder:
             logger.debug("MongoQueryBuilder.insert failed: %s", e)
             return False
 
-    async def update(self, data: Dict[str, Any]) -> bool:
+    async def update(self, data: dict[str, Any]) -> bool:
         """Update matching documents.
 
         Like Laravel: ->where(...)->update({...})
@@ -442,7 +441,7 @@ class MongoQueryBuilder:
             logger.debug("MongoQueryBuilder.update failed: %s", e)
             return False
 
-    async def upsert(self, data: Dict[str, Any]) -> bool:
+    async def upsert(self, data: dict[str, Any]) -> bool:
         """Insert or update a document (upsert).
 
         Like Laravel's updateOrCreate.
@@ -534,7 +533,7 @@ class MongoQueryBuilder:
         result = await self.limit(1).first()
         return result is not None
 
-    async def pluck(self, field: str) -> List[Any]:
+    async def pluck(self, field: str) -> list[Any]:
         """Retrieve a list of values for a single field.
 
         Like Laravel: ->pluck('field')
@@ -543,7 +542,7 @@ class MongoQueryBuilder:
         results = await self.select(field).get()
         return [r[field] for r in results if field in r]
 
-    async def value(self, field: str) -> Optional[Any]:
+    async def value(self, field: str) -> Any | None:
         """Retrieve a single value from the first matching document.
 
         Like Laravel: ->value('field')
@@ -604,12 +603,12 @@ class SyncMongoQueryBuilder:
     def __init__(self, collection: str, db_session=None):
         self._collection = collection
         self._db = db_session
-        self._filters: List[Dict[str, Any]] = []
-        self._projection: Optional[Dict[str, int]] = None
-        self._sort_field: Optional[str] = None
+        self._filters: list[dict[str, Any]] = []
+        self._projection: dict[str, int] | None = None
+        self._sort_field: str | None = None
         self._sort_order: int = -1
-        self._limit_count: Optional[int] = None
-        self._skip_count: Optional[int] = None
+        self._limit_count: int | None = None
+        self._skip_count: int | None = None
 
     # ── Public API: Query building (method chaining) ──────────
 
@@ -636,17 +635,17 @@ class SyncMongoQueryBuilder:
 
         return self
 
-    def where_in(self, field: str, values: List[Any]) -> "SyncMongoQueryBuilder":
+    def where_in(self, field: str, values: list[Any]) -> "SyncMongoQueryBuilder":
         """Add a WHERE IN clause."""
         return self.where(field, 'in', values)
 
-    def where_nin(self, field: str, values: List[Any]) -> "SyncMongoQueryBuilder":
+    def where_nin(self, field: str, values: list[Any]) -> "SyncMongoQueryBuilder":
         """Add a WHERE NOT IN clause."""
         return self.where(field, 'nin', values)
 
     def select(self, *fields: str) -> "SyncMongoQueryBuilder":
         """Specify which fields to return (projection)."""
-        proj: Dict[str, int] = {}
+        proj: dict[str, int] = {}
         for f in fields:
             _validate_field(f, self._collection)
             proj[f] = 1
@@ -680,7 +679,7 @@ class SyncMongoQueryBuilder:
             self._db = get_sync_db()
         return self._db is not None
 
-    def _build_filter(self) -> Dict[str, Any]:
+    def _build_filter(self) -> dict[str, Any]:
         """Build the MongoDB filter dict from parameterized where clauses."""
         if not self._filters:
             return {}
@@ -688,7 +687,7 @@ class SyncMongoQueryBuilder:
             return self._filters[0]
         return {"$and": self._filters}
 
-    def _validate_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_doc(self, doc: dict[str, Any]) -> dict[str, Any]:
         """Validate and sanitize a document for write operations.
 
         Like Laravel's $fillable protection — only whitelisted fields pass through.
@@ -709,7 +708,7 @@ class SyncMongoQueryBuilder:
 
     # ── Terminal methods (execute the query) ──────────────────
 
-    def first(self) -> Optional[Dict[str, Any]]:
+    def first(self) -> dict[str, Any] | None:
         """Return the first matching document."""
         if not self._resolve_db():
             return None
@@ -728,7 +727,7 @@ class SyncMongoQueryBuilder:
             logger.debug("SyncMongoQueryBuilder.first failed: %s", e)
             return None
 
-    def get(self) -> List[Dict[str, Any]]:
+    def get(self) -> list[dict[str, Any]]:
         """Return all matching documents."""
         if not self._resolve_db():
             return []
@@ -749,7 +748,7 @@ class SyncMongoQueryBuilder:
             logger.debug("SyncMongoQueryBuilder.get failed: %s", e)
             return []
 
-    def insert(self, data: Dict[str, Any]) -> bool:
+    def insert(self, data: dict[str, Any]) -> bool:
         """Insert a new document with field validation."""
         if not self._resolve_db():
             return False
@@ -763,7 +762,7 @@ class SyncMongoQueryBuilder:
             logger.debug("SyncMongoQueryBuilder.insert failed: %s", e)
             return False
 
-    def update(self, data: Dict[str, Any]) -> bool:
+    def update(self, data: dict[str, Any]) -> bool:
         """Update matching documents. Requires a WHERE clause."""
         if not self._resolve_db():
             return False
@@ -783,7 +782,7 @@ class SyncMongoQueryBuilder:
             logger.debug("SyncMongoQueryBuilder.update failed: %s", e)
             return False
 
-    def upsert(self, data: Dict[str, Any]) -> bool:
+    def upsert(self, data: dict[str, Any]) -> bool:
         """Insert or update a document (upsert). Requires a WHERE clause."""
         if not self._resolve_db():
             return False
@@ -854,13 +853,13 @@ class SyncMongoQueryBuilder:
         """Check if any matching documents exist."""
         return self.limit(1).first() is not None
 
-    def pluck(self, field: str) -> List[Any]:
+    def pluck(self, field: str) -> list[Any]:
         """Retrieve a list of values for a single field."""
         _validate_field(field, self._collection)
         results = self.select(field).get()
         return [r[field] for r in results if field in r]
 
-    def value(self, field: str) -> Optional[Any]:
+    def value(self, field: str) -> Any | None:
         """Retrieve a single value from the first matching document."""
         _validate_field(field, self._collection)
         result = self.select(field).first()
@@ -896,7 +895,7 @@ def get_db_name() -> str:
     return os.environ.get("MONGODB_NAME", DEFAULT_DB_NAME)
 
 
-def get_mongo_uri() -> Optional[str]:
+def get_mongo_uri() -> str | None:
     """Return the MongoDB connection URI from environment."""
     for key in MONGO_URI_KEYS:
         val = os.environ.get(key, "").strip()
@@ -1039,7 +1038,7 @@ def close_sync_db():
 # Stores RQ job lifecycle, io metadata, progress, and errors.
 # Keyed by job_id (unique).
 
-async def save_job_metadata(job_id: str, meta: Dict[str, Any]) -> bool:
+async def save_job_metadata(job_id: str, meta: dict[str, Any]) -> bool:
     """Persist job metadata (io:in, io:out, progress) to MongoDB.
 
     Uses prepared statement parameter binding via the query builder.
@@ -1056,7 +1055,7 @@ async def save_job_metadata(job_id: str, meta: Dict[str, Any]) -> bool:
         return False
 
 
-async def get_job_metadata(job_id: str) -> Optional[Dict[str, Any]]:
+async def get_job_metadata(job_id: str) -> dict[str, Any] | None:
     """Retrieve job metadata from MongoDB.
 
     Uses prepared statement parameter binding.
@@ -1071,7 +1070,7 @@ async def get_job_metadata(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def update_job_metadata(job_id: str, fields: Dict[str, Any]) -> bool:
+async def update_job_metadata(job_id: str, fields: dict[str, Any]) -> bool:
     """Update specific fields in job metadata.
 
     Uses prepared statement parameter binding.
@@ -1087,7 +1086,7 @@ async def update_job_metadata(job_id: str, fields: Dict[str, Any]) -> bool:
         return False
 
 
-async def list_jobs(status: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+async def list_jobs(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     """List recent jobs, optionally filtered by status.
 
     Uses prepared statement parameter binding for the status filter.
@@ -1120,7 +1119,7 @@ async def count_jobs() -> int:
 # Tracks user interactions: last action, last seen, role flags.
 # Keyed by user_id (unique).
 
-async def save_user_session(user_id: int, session_data: Dict[str, Any]) -> bool:
+async def save_user_session(user_id: int, session_data: dict[str, Any]) -> bool:
     """Persist user session data to MongoDB.
 
     Uses prepared statement parameter binding.
@@ -1137,7 +1136,7 @@ async def save_user_session(user_id: int, session_data: Dict[str, Any]) -> bool:
         return False
 
 
-async def get_user_session(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user_session(user_id: int) -> dict[str, Any] | None:
     """Retrieve user session from MongoDB.
 
     Uses prepared statement parameter binding.
@@ -1152,7 +1151,7 @@ async def get_user_session(user_id: int) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
+async def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     """List recent user sessions."""
     db = await get_db()
     if not db:
@@ -1201,7 +1200,7 @@ async def save_forward_batch(chat_id: int, user_id: int, items: list) -> bool:
         return False
 
 
-async def get_forward_batch(chat_id: int, user_id: int) -> Optional[list]:
+async def get_forward_batch(chat_id: int, user_id: int) -> list | None:
     """Retrieve forward batch items from MongoDB.
 
     Uses prepared statement parameter binding.
@@ -1268,7 +1267,7 @@ async def count_telethon_forwards() -> int:
 
 # ── Diagnostics ───────────────────────────────────────────────
 
-async def db_stats() -> Dict[str, Any]:
+async def db_stats() -> dict[str, Any]:
     """Return a summary of all collection sizes."""
     db = await get_db()
     if not db:

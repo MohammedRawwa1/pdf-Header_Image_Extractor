@@ -1,0 +1,55 @@
+# Ruff linter configuration
+# https://docs.astral.sh/ruff/configuration/
+
+# Target Python version
+target-version = "py312"
+
+# Exclude directories (in addition to .gitignore)
+exclude = [
+    ".venv",
+    "env",
+    "__pycache__",
+    "node_modules",
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".github",
+]
+
+[lint]
+# Select rule categories:
+#   E/W - pycodestyle (errors/warnings)
+#   F   - Pyflakes (logic errors, undefined names, syntax errors)
+#   I   - isort (import sorting)
+#   N   - pep8-naming
+#   S   - flake8-bandit (security rules)
+#   UP  - pyupgrade (modernize Python syntax)
+select = [
+    "E4",   # Import warnings
+    "E7",   # Statement warnings
+    "E9",   # Runtime errors (catches syntax errors)
+    "F",    # Pyflakes (undefined names, syntax errors)
+    "I",    # Import sorting
+    "N",    # Naming conventions
+    "S",    # Bandit security rules
+    "UP",   # Python upgrade
+]
+
+# Ignore specific rules (customize as needed)
+ignore = [
+    "S101",  # Allow asserts in non-test files
+    "S110",  # Allow try-except-pass (intentional error swallowing across codebase)
+    "S112",  # Allow try-except-continue (intentional pattern)
+    "N802",  # Allow lower-case function names in non-PEP8 contexts
+    "N803",  # Allow argument name overrides
+    "N806",  # Allow non-lower-case variable names
+]
+
+[lint.per-file-ignores]
+# S104: Binding to all interfaces (0.0.0.0) is intentional for web serving
+# S603: subprocess calls are intentional in helper scripts
+# S311: standard random is fine for backoff jitter, not cryptographic use
+"*.py" = ["S104", "S311", "S603"]
+
+# S603 in scripts/telethon_ingest.py uses subprocess for legitimate ingestion operations
+"scripts/*.py" = ["S603"]

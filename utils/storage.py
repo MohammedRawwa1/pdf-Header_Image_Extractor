@@ -13,12 +13,11 @@ Usage example:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any
 
 try:
     import aioboto3
@@ -50,11 +49,11 @@ class AsyncStorageBackend(ABC):
         """Download a storage object `key` to local `dest_path`. Return True on success."""
 
     @abstractmethod
-    async def generate_presigned_post(self, key: str, expires: Optional[int] = None) -> Dict[str, Any]:
+    async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         """Return a dict with presigned POST upload info (url/fields) or raise when unsupported."""
 
     @abstractmethod
-    async def generate_presigned_get(self, key: str, expires: Optional[int] = None) -> str:
+    async def generate_presigned_get(self, key: str, expires: int | None = None) -> str:
         """Return a presigned GET URL for `key` or raise when unsupported."""
 
     @abstractmethod
@@ -67,7 +66,7 @@ class AsyncStorageBackend(ABC):
 
 
 class LocalStorageBackend(AsyncStorageBackend):
-    def __init__(self, base_path: Optional[str] = None):
+    def __init__(self, base_path: str | None = None):
         self.base = base_path or config.STORAGE_PATH
 
     def _abs_path(self, key: str) -> str:
@@ -87,10 +86,10 @@ class LocalStorageBackend(AsyncStorageBackend):
         await asyncio.to_thread(shutil.copy2, src, dest_path)
         return True
 
-    async def generate_presigned_post(self, key: str, expires: Optional[int] = None) -> Dict[str, Any]:
+    async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         raise NotImplementedError("Presigned uploads are not supported for local backend")
 
-    async def generate_presigned_get(self, key: str, expires: Optional[int] = None) -> str:
+    async def generate_presigned_get(self, key: str, expires: int | None = None) -> str:
         # Provide a file:// URL for convenience (may not be usable remotely)
         return "file://" + os.path.abspath(self._abs_path(key))
 
@@ -115,12 +114,12 @@ class LocalStorageBackend(AsyncStorageBackend):
 class S3AsyncBackend(AsyncStorageBackend):
     def __init__(
         self,
-        bucket: Optional[str] = None,
-        endpoint_url: Optional[str] = None,
-        region: Optional[str] = None,
-        aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None,
-        aws_session_token: Optional[str] = None,
+        bucket: str | None = None,
+        endpoint_url: str | None = None,
+        region: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
         use_ssl: bool = True,
     ):
         # Support both async aioboto3 (preferred) and sync boto3 (fallback).
@@ -154,7 +153,7 @@ class S3AsyncBackend(AsyncStorageBackend):
             except Exception:
                 self._boto_config = None
 
-    def _client_kwargs(self) -> Dict[str, Any]:
+    def _client_kwargs(self) -> dict[str, Any]:
         kw = {}
         if self.region:
             kw["region_name"] = self.region
@@ -330,7 +329,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 await asyncio.sleep(backoff + random.random())
 
-    async def generate_presigned_post(self, key: str, expires: Optional[int] = None) -> Dict[str, Any]:
+    async def generate_presigned_post(self, key: str, expires: int | None = None) -> dict[str, Any]:
         expires = expires or config.PRESIGN_EXPIRES
         if self._use_aioboto3:
             async with self._session.client("s3", **self._client_kwargs()) as client:
@@ -347,7 +346,7 @@ class S3AsyncBackend(AsyncStorageBackend):
             return {"url": post["url"], "fields": post["fields"], "key": key, "get_url": get_url}
         return await asyncio.to_thread(_sync_post)
 
-    async def generate_presigned_get(self, key: str, expires: Optional[int] = None) -> str:
+    async def generate_presigned_get(self, key: str, expires: int | None = None) -> str:
         expires = expires or config.PRESIGN_EXPIRES
         if self._use_aioboto3:
             async with self._session.client("s3", **self._client_kwargs()) as client:
@@ -422,7 +421,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 await asyncio.sleep(backoff + random.random())
 
 
-_STORAGE_SINGLETON: Optional[AsyncStorageBackend] = None
+_STORAGE_SINGLETON: AsyncStorageBackend | None = None
 
 
 async def get_storage_backend() -> AsyncStorageBackend:

@@ -3,12 +3,12 @@
 Refactored to use the prepared-statement MongoQueryBuilder from utils.db
 for consistent NoSQL injection prevention across the codebase.
 """
-from typing import Optional, Dict, Any
+from typing import Any
 
-from utils.db import query, COL_JOBS
+from utils.db import COL_JOBS, query
 
 
-async def save_job(job: Dict[str, Any]) -> None:
+async def save_job(job: dict[str, Any]) -> None:
     """Insert a new job document using the prepared statement query builder.
 
     Only fields in the COL_JOBS whitelist are persisted (like Laravel's $fillable).
@@ -24,7 +24,7 @@ async def save_job(job: Dict[str, Any]) -> None:
     await query(COL_JOBS).insert(doc)
 
 
-async def update_job(job_id: str, fields: Dict[str, Any]) -> None:
+async def update_job(job_id: str, fields: dict[str, Any]) -> None:
     """Update job fields using parameter binding in the WHERE clause.
 
     Only whitelisted fields are applied to the document.
@@ -32,6 +32,6 @@ async def update_job(job_id: str, fields: Dict[str, Any]) -> None:
     await query(COL_JOBS).where("job_id", "=", job_id).update(fields)
 
 
-async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+async def get_job(job_id: str) -> dict[str, Any] | None:
     """Retrieve a job by job_id using parameterized queries."""
     return await query(COL_JOBS).where("job_id", "=", job_id).first()

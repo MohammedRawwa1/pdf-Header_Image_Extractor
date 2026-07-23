@@ -1,5 +1,5 @@
-from pathlib import Path
 import os
+from pathlib import Path
 
 
 def load_env_file(path: str = ".env") -> dict:
