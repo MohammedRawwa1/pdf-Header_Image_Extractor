@@ -1392,89 +1392,70 @@ async def cmd_loginpyro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current Telethon/Pyrogram login status (owner only).
-
-    Enhanced to show session sources:
-    - Environment variables
-    - JSON persistence file
-    - MongoDB storage
-    - File-based .session files
-    """
+    """Show a clean Telethon/Pyrogram login status overview (owner only)."""
     user = update.effective_user
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
         await update.effective_message.reply_text("\u26d4 Only the bot owner can run this command.")
         return
 
-    data = context.user_data
-    sent_at = data.get("login_code_sent_at")
-    resend_count = data.get("login_resend_count", 0)
-    code_hash = data.get("login_code_hash")
-    session_path = data.get("login_session_path")
-    awaiting = {
-        "phone": bool(data.get("awaiting_login_phone")),
-        "code": bool(data.get("awaiting_login_code")),
-        "password": bool(data.get("awaiting_login_password")),
-    }
+    # ── Userbot enabled (Telethon or Pyrogram) ──
+    userbot_ok = _check_userbot_available()
 
-    # ── Telethon session status (multi-source) ──
+    # ── API credentials ──
+    api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
+    api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
+    creds_ok = bool(api_id and api_hash)
+
+    # ── Telethon session status & source ──
     telethon_ready = False
-    telethon_source = "missing"
-    telethon_path = ""
+    telethon_source = ""
     try:
         from utils.telethon_session import (
             has_usable_telethon_session,
             get_telethon_session_path,
             _get_configured_session_string,
-            _get_persisted_session_path,
             _load_session_string_from_file,
         )
         telethon_ready = has_usable_telethon_session()
-        telethon_path = get_telethon_session_path()
-
         if _get_configured_session_string():
             telethon_source = "env"
         elif _load_session_string_from_file(client_type="telethon"):
-            telethon_source = "json_file"
-        elif os.path.exists(telethon_path) or os.path.exists(telethon_path + ".session"):
-            telethon_source = "dot_session"
+            telethon_source = "json"
         else:
-            telethon_source = "missing"
+            tpath = get_telethon_session_path()
+            if os.path.exists(tpath) or os.path.exists(tpath + ".session"):
+                telethon_source = "file"
     except Exception:
         pass
 
-    # ── Pyrogram session status (multi-source) ──
+    # ── Pyrogram session status & source ──
     pyrogram_ready = False
-    pyrogram_source = "missing"
+    pyrogram_source = ""
     try:
-        from utils.telethon_session import (
-            get_pyrogram_session_string,
-            _load_session_string_from_file,
-        )
+        from utils.telethon_session import get_pyrogram_session_string, _load_session_string_from_file
         pg_env = os.getenv("PYROGRAM_SESSION") or os.getenv("USERBOT_PYROGRAM_SESSION")
         if pg_env:
             pyrogram_ready = True
             pyrogram_source = "env"
-        else:
-            pg_file = _load_session_string_from_file(client_type="pyrogram")
-            if pg_file:
-                pyrogram_ready = True
-                pyrogram_source = "json_file"
-            else:
-                pyrogram_ready = bool(get_pyrogram_session_string())
-                if pyrogram_ready:
-                    pyrogram_source = "env"
+        elif _load_session_string_from_file(client_type="pyrogram"):
+            pyrogram_ready = True
+            pyrogram_source = "json"
+        elif get_pyrogram_session_string():
+            pyrogram_ready = True
+            pyrogram_source = "env"
     except Exception:
         pass
 
-    # ── JSON persistence file status ──
-    json_path = ""
+    # ── Persisted JSON file status ──
+    json_exists = False
     json_has_telethon = False
     json_has_pyrogram = False
     try:
         from utils.telethon_session import _get_persisted_session_path
         json_path = _get_persisted_session_path()
-        if os.path.exists(json_path):
+        json_exists = os.path.exists(json_path)
+        if json_exists:
             import json as _json
             with open(json_path, "r") as _f:
                 _data = _json.load(_f)
@@ -1483,58 +1464,32 @@ async def cmd_loginstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         pass
 
-    # ── MongoDB session status ──
-    mongo_has_session = False
-    try:
-        from utils.db import get_user_session
-        mongo_session = await get_user_session(uid)
-        mongo_has_session = bool(mongo_session and (
-            mongo_session.get("telethon_session") or
-            mongo_session.get("pyrogram_session") or
-            mongo_session.get("string_session")
-        ))
-    except Exception:
-        pass
+    # ── Build output ──
+    yes = "\u2705"
+    no = "\u274c"
 
-    masked_hash = None
-    try:
-        if code_hash:
-            s = str(code_hash)
-            masked_hash = s[:4] + "..." + s[-4:]
-    except Exception:
-        pass
+    def src_label(src: str) -> str:
+        return {"env": "(env)", "json": "(json)", "file": "(file)"}.get(src, "")
 
-    telethon_emoji = "\u2705" if telethon_ready else "\u274c"
-    pyrogram_emoji = "\u2705" if pyrogram_ready else "\u274c"
-    source_labels = {
-        "env": "\ud83d\udce1 Environment Variable",
-        "json_file": "\ud83d\udcc4 JSON Persistence File",
-        "dot_session": "\ud83d\udcc1 .session File",
-        "mongodb": "\ud83c\udfdb\ufe0f MongoDB",
-        "missing": "\u274c Not Configured",
-    }
+    tel_line = f"{yes} Available {src_label(telethon_source)}" if telethon_ready else f"{no} Not available"
+    pyr_line = f"{yes} Available {src_label(pyrogram_source)}" if pyrogram_ready else f"{no} Not available"
+
+    json_line = f"{yes} Exists" if json_exists else f"{no} Not found"
 
     lines = [
         "\U0001f510 **Login Status**",
         "",
-        f"{telethon_emoji} **Telethon session:** {source_labels.get(telethon_source, telethon_source)}",
-        f"{pyrogram_emoji} **Pyrogram session:** {source_labels.get(pyrogram_source, pyrogram_source)}",
+        f"Userbot enabled: {yes} Yes" if userbot_ok else f"Userbot enabled: {no}",
+        f"API credentials: {yes} Set" if creds_ok else f"API credentials: {no}",
         "",
-        "**Session persistence:**",
-        f"  \ud83d\udcc4 JSON file: {"\u2705 Exists" if os.path.exists(json_path) else "\u274c Not found"}",
-        f"    {json_path}" if json_path else "",
-        f"    Telethon key: {"\u2705 Present" if json_has_telethon else "\u274c Empty"}",
-        f"    Pyrogram key: {"\u2705 Present" if json_has_pyrogram else "\u274c Empty"}",
-        f"  \ud83c\udfdb\ufe0f MongoDB: {"\u2705 Session stored" if mongo_has_session else "\u274c No session"}",
+        f"Telethon session: {tel_line}",
+        f"Pyrogram session: {pyr_line}",
         "",
-        "**Active login flow:**",
-        "  awaiting: " + str(awaiting),
-        "  sent_at: " + str(sent_at),
-        "  resend_count: " + str(resend_count),
-        "  code_hash: " + str(masked_hash),
-        "  session_path: " + str(session_path),
-        "  telethon_path: " + telethon_path,
+        f"Persisted JSON file: {json_line}",
+        f"  Telethon in JSON: {yes if json_has_telethon else no}",
+        f"  Pyrogram in JSON: {yes if json_has_pyrogram else no}",
     ]
+
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
