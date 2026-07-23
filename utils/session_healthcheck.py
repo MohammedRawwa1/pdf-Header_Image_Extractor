@@ -573,7 +573,7 @@ class SessionHealthChecker:
         (for the downloader/uploader fallback chain). Best-effort.
         """
         try:
-            session_str = client.session.save()
+            session_str = TelethonStringSession.save(client.session)
             if not session_str:
                 return
             session_str = str(session_str)

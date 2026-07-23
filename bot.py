@@ -2430,6 +2430,7 @@ async def _process_login_text(
 
         try:
             from telethon import TelegramClient
+            from telethon.sessions import StringSession
         except ImportError:
             await update.message.reply_text(
                 "Telethon is not installed. Install telethon to use /login."
@@ -2471,7 +2472,7 @@ async def _process_login_text(
                 _tel_saved_file = False
                 _tel_saved_mongo = False
                 try:
-                    _tel_session_str = client.session.save()
+                    _tel_session_str = StringSession.save(client.session)
                     if _tel_session_str:
                         _tel_session_str = str(_tel_session_str)
                         from utils.telethon_session import (
@@ -2638,7 +2639,7 @@ async def _process_login_text(
                         _tel_saved_file = False
                         _tel_saved_mongo = False
                         try:
-                            _tel_session_str = client.session.save()
+                            _tel_session_str = StringSession.save(client.session)
                             if _tel_session_str:
                                 _tel_session_str = str(_tel_session_str)
                                 from utils.telethon_session import (
