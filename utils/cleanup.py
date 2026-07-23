@@ -24,9 +24,15 @@ class CleanupManager:
     """Manages periodic cleanup of temporary files and stale data."""
 
     def __init__(self):
-        self.cleanup_interval = int(os.getenv("CLEANUP_INTERVAL", "3600"))  # 1 hour
-        self.max_file_age = int(os.getenv("CLEANUP_MAX_FILE_AGE", "86400"))  # 24 hours
-        self.max_temp_age = int(os.getenv("CLEANUP_MAX_TEMP_AGE", "3600"))  # 1 hour
+        self.cleanup_interval = int(
+            os.getenv("CLEANUP_INTERVAL", "3600")
+        )  # 1 hour
+        self.max_file_age = int(
+            os.getenv("CLEANUP_MAX_FILE_AGE", "86400")
+        )  # 24 hours
+        self.max_temp_age = int(
+            os.getenv("CLEANUP_MAX_TEMP_AGE", "3600")
+        )  # 1 hour
         self.s3_ttl = int(os.getenv("CLEANUP_S3_TTL", "86400"))  # 24 hours
         self.io_ttl = int(os.getenv("CLEANUP_IO_TTL", "604800"))  # 7 days
         self.is_running = False
@@ -36,7 +42,10 @@ class CleanupManager:
         self.is_running = True
         logger.info(
             "CleanupManager started (interval=%ds, file_age=%ds, temp_age=%ds, s3_ttl=%ds)",
-            self.cleanup_interval, self.max_file_age, self.max_temp_age, self.s3_ttl,
+            self.cleanup_interval,
+            self.max_file_age,
+            self.max_temp_age,
+            self.s3_ttl,
         )
 
         while self.is_running:
@@ -55,19 +64,27 @@ class CleanupManager:
         """Run all cleanup operations and return counts."""
         results = {
             "temp_files": await self._cleanup_directory(
-                getattr(config, "TEMP_PATH", "storage/temp") if config else "storage/temp",
+                getattr(config, "TEMP_PATH", "storage/temp")
+                if config
+                else "storage/temp",
                 self.max_temp_age,
             ),
             "input_files": await self._cleanup_directory(
-                getattr(config, "INPUT_PATH", "storage/input") if config else "storage/input",
+                getattr(config, "INPUT_PATH", "storage/input")
+                if config
+                else "storage/input",
                 self.max_file_age,
             ),
             "output_files": await self._cleanup_directory(
-                getattr(config, "OUTPUT_PATH", "storage/output") if config else "storage/output",
+                getattr(config, "OUTPUT_PATH", "storage/output")
+                if config
+                else "storage/output",
                 self.max_file_age,
             ),
             "thumbnails": await self._cleanup_directory(
-                getattr(config, "THUMBNAIL_PATH", "storage/thumbnails") if config else "storage/thumbnails",
+                getattr(config, "THUMBNAIL_PATH", "storage/thumbnails")
+                if config
+                else "storage/thumbnails",
                 self.max_file_age,
             ),
             "s3_objects": await self._cleanup_s3(),
@@ -99,7 +116,11 @@ class CleanupManager:
                             os.remove(item_path)
                             removed += 1
                         except Exception as e:
-                            logger.debug("Cleanup: failed to remove %s: %s", item_path, e)
+                            logger.debug(
+                                "Cleanup: failed to remove %s: %s",
+                                item_path,
+                                e,
+                            )
 
                 elif os.path.isdir(item_path):
                     sub = await self._cleanup_directory(item_path, max_age)
@@ -124,7 +145,9 @@ class CleanupManager:
             from storage import purge_objects_older_than
 
             loop = asyncio.get_running_loop()
-            deleted = await loop.run_in_executor(None, purge_objects_older_than, self.s3_ttl, "pdf-bot/")
+            deleted = await loop.run_in_executor(
+                None, purge_objects_older_than, self.s3_ttl, "pdf-bot/"
+            )
             if deleted and deleted > 0:
                 logger.info("Cleanup: purged %d old S3 objects", deleted)
             return deleted or 0
@@ -163,7 +186,9 @@ class CleanupManager:
     async def force_cleanup(self, directory: str = None) -> int:
         """Force-clean a specific directory or all locations."""
         if directory and os.path.exists(directory):
-            return await self._cleanup_directory(directory, 0)  # Remove everything
+            return await self._cleanup_directory(
+                directory, 0
+            )  # Remove everything
         results = await self.cleanup_all()
         return sum(results.values())
 
@@ -178,7 +203,8 @@ class CleanupManager:
         ):
             directory = (
                 getattr(config, path_key, f"storage/{name}")
-                if config else f"storage/{name}"
+                if config
+                else f"storage/{name}"
             )
             size_bytes = 0
             file_count = 0

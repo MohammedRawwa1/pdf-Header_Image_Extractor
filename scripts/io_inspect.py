@@ -6,6 +6,7 @@ Usage:
 
 The script reads `REDIS_URL` from environment if `--redis` is not provided.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,7 +18,10 @@ from typing import Any
 try:
     import redis
 except Exception:
-    print("Missing dependency: redis. Install with `pip install redis`.", file=sys.stderr)
+    print(
+        "Missing dependency: redis. Install with `pip install redis`.",
+        file=sys.stderr,
+    )
     raise
 
 
@@ -28,7 +32,7 @@ def fetch_and_parse(r: redis.Redis, key: str) -> Any:
     # redis-py with decode_responses=True returns str already
     if isinstance(v, (bytes, bytearray)):
         try:
-            v = v.decode('utf-8')
+            v = v.decode("utf-8")
         except Exception:
             # return raw bytes if decode fails
             return v
@@ -39,15 +43,29 @@ def fetch_and_parse(r: redis.Redis, key: str) -> Any:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Inspect io:in/io:out Redis keys for a job")
-    p.add_argument("id", help="Unique id (file_id or file_unique_id) to inspect")
-    p.add_argument("--redis", help="Redis URL (e.g. redis://:pass@host:6379/0). Defaults to $REDIS_URL")
-    p.add_argument("--raw", action="store_true", help="Print Python reprs instead of pretty JSON")
+    p = argparse.ArgumentParser(
+        description="Inspect io:in/io:out Redis keys for a job"
+    )
+    p.add_argument(
+        "id", help="Unique id (file_id or file_unique_id) to inspect"
+    )
+    p.add_argument(
+        "--redis",
+        help="Redis URL (e.g. redis://:pass@host:6379/0). Defaults to $REDIS_URL",
+    )
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print Python reprs instead of pretty JSON",
+    )
     args = p.parse_args()
 
     redis_url = args.redis or os.getenv("REDIS_URL")
     if not redis_url:
-        print("Redis URL not provided. Set REDIS_URL env var or pass --redis", file=sys.stderr)
+        print(
+            "Redis URL not provided. Set REDIS_URL env var or pass --redis",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -91,5 +109,5 @@ def main() -> int:
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

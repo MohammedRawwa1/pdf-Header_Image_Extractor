@@ -30,10 +30,10 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 # Default TTLs (seconds)
-DEFAULT_TTL = 3600          # 1 hour
-SHORT_TTL = 300             # 5 minutes
-MEDIUM_TTL = 1800           # 30 minutes
-LONG_TTL = 86400            # 24 hours
+DEFAULT_TTL = 3600  # 1 hour
+SHORT_TTL = 300  # 5 minutes
+MEDIUM_TTL = 1800  # 30 minutes
+LONG_TTL = 86400  # 24 hours
 
 # Key prefixes
 PREFIX_JOB = "cache:job:"
@@ -122,7 +122,9 @@ class RedisCache:
         except Exception:
             return False
 
-    async def incr(self, key: str, amount: int = 1, ttl: int = DEFAULT_TTL) -> int | None:
+    async def incr(
+        self, key: str, amount: int = 1, ttl: int = DEFAULT_TTL
+    ) -> int | None:
         """Increment a counter. Returns new value or None on error."""
         client = await self._get_client()
         if client is None:
@@ -156,7 +158,9 @@ class RedisCache:
             logger.debug("Cache MGET failed: %s", e)
             return {}
 
-    async def set_many(self, mapping: dict[str, Any], ttl: int = DEFAULT_TTL) -> bool:
+    async def set_many(
+        self, mapping: dict[str, Any], ttl: int = DEFAULT_TTL
+    ) -> bool:
         """Set multiple values at once with TTL."""
         client = await self._get_client()
         if client is None:
@@ -211,7 +215,9 @@ class RedisCache:
             self._binary_client = None
             return None
 
-    async def set_binary(self, key: str, data: bytes, ttl: int = DEFAULT_TTL) -> bool:
+    async def set_binary(
+        self, key: str, data: bytes, ttl: int = DEFAULT_TTL
+    ) -> bool:
         """Store raw bytes in Redis (binary-safe).
 
         Uses the dedicated ``_binary_client`` with ``decode_responses=False``
@@ -219,7 +225,9 @@ class RedisCache:
         """
         client = await self._get_binary_client()
         if client is None:
-            logger.debug("Binary client unavailable, falling back to main client for set_binary")
+            logger.debug(
+                "Binary client unavailable, falling back to main client for set_binary"
+            )
             main = await self._get_client()
             if main is None:
                 return False
@@ -227,7 +235,9 @@ class RedisCache:
                 await main.setex(key, ttl, data)
                 return True
             except Exception as e:
-                logger.debug("Cache SET_BINARY (fallback) failed for %s: %s", key, e)
+                logger.debug(
+                    "Cache SET_BINARY (fallback) failed for %s: %s", key, e
+                )
                 return False
         try:
             await client.setex(key, ttl, data)
@@ -240,7 +250,9 @@ class RedisCache:
         """Retrieve raw bytes from Redis (binary-safe)."""
         client = await self._get_binary_client()
         if client is None:
-            logger.debug("Binary client unavailable, falling back to main client for get_binary")
+            logger.debug(
+                "Binary client unavailable, falling back to main client for get_binary"
+            )
             main = await self._get_client()
             if main is None:
                 return None
@@ -252,7 +264,9 @@ class RedisCache:
                     return raw.encode("latin-1")
                 return raw
             except (UnicodeDecodeError, Exception) as e:
-                logger.debug("Cache GET_BINARY (fallback) failed for %s: %s", key, e)
+                logger.debug(
+                    "Cache GET_BINARY (fallback) failed for %s: %s", key, e
+                )
                 return None
         try:
             raw = await client.get(key)
@@ -263,7 +277,9 @@ class RedisCache:
             logger.debug("Cache GET_BINARY failed for %s: %s", key, e)
             return None
 
-    async def cache_file_bytes(self, file_key: str, data: bytes, ttl: int = LONG_TTL) -> bool:
+    async def cache_file_bytes(
+        self, file_key: str, data: bytes, ttl: int = LONG_TTL
+    ) -> bool:
         """Cache raw file bytes by a unique file key (e.g. file_unique_id).
 
         This allows re-using previously downloaded file bytes without hitting
@@ -274,7 +290,9 @@ class RedisCache:
             ttl = int(os.getenv("BIGFILE_CACHE_TTL", str(ttl)))
         except Exception:
             pass
-        return await self.set_binary(f"{PREFIX_FILE}bytes:{file_key}", data, ttl=ttl)
+        return await self.set_binary(
+            f"{PREFIX_FILE}bytes:{file_key}", data, ttl=ttl
+        )
 
     async def get_cached_file_bytes(self, file_key: str) -> bytes | None:
         """Retrieve previously cached file bytes by file key."""
@@ -306,7 +324,9 @@ class RedisCache:
 
     # \u2500\u2500 Convenience methods for common patterns \u2500\u2500
 
-    async def cache_job_metadata(self, job_id: str, metadata: dict[str, Any], ttl: int = MEDIUM_TTL) -> bool:
+    async def cache_job_metadata(
+        self, job_id: str, metadata: dict[str, Any], ttl: int = MEDIUM_TTL
+    ) -> bool:
         """Cache job metadata (status, progress, etc.)."""
         return await self.set(f"{PREFIX_JOB}{job_id}", metadata, ttl=ttl)
 
@@ -314,13 +334,17 @@ class RedisCache:
         """Get cached job metadata."""
         return await self.get(f"{PREFIX_JOB}{job_id}")
 
-    async def update_job_metadata(self, job_id: str, fields: dict[str, Any], ttl: int = MEDIUM_TTL) -> bool:
+    async def update_job_metadata(
+        self, job_id: str, fields: dict[str, Any], ttl: int = MEDIUM_TTL
+    ) -> bool:
         """Update specific fields in cached job metadata (read-modify-write)."""
         existing = await self.get_job_metadata(job_id) or {}
         existing.update(fields)
         return await self.cache_job_metadata(job_id, existing, ttl=ttl)
 
-    async def cache_file_info(self, file_key: str, info: dict[str, Any], ttl: int = LONG_TTL) -> bool:
+    async def cache_file_info(
+        self, file_key: str, info: dict[str, Any], ttl: int = LONG_TTL
+    ) -> bool:
         """Cache file metadata (size, type, hash, ffprobe output)."""
         return await self.set(f"{PREFIX_FILE}{file_key}", info, ttl=ttl)
 
@@ -328,7 +352,9 @@ class RedisCache:
         """Get cached file metadata."""
         return await self.get(f"{PREFIX_FILE}{file_key}")
 
-    async def cache_user_session(self, user_id: str, session_data: dict[str, Any], ttl: int = LONG_TTL) -> bool:
+    async def cache_user_session(
+        self, user_id: str, session_data: dict[str, Any], ttl: int = LONG_TTL
+    ) -> bool:
         """Cache user session/preferences."""
         return await self.set(f"{PREFIX_USER}{user_id}", session_data, ttl=ttl)
 
@@ -336,7 +362,9 @@ class RedisCache:
         """Get cached user session."""
         return await self.get(f"{PREFIX_USER}{user_id}")
 
-    async def cache_response(self, key: str, response: Any, ttl: int = SHORT_TTL) -> bool:
+    async def cache_response(
+        self, key: str, response: Any, ttl: int = SHORT_TTL
+    ) -> bool:
         """Cache a bot response for deduplication."""
         return await self.set(f"{PREFIX_RESPONSE}{key}", response, ttl=ttl)
 
@@ -344,11 +372,17 @@ class RedisCache:
         """Get a cached bot response."""
         return await self.get(f"{PREFIX_RESPONSE}{key}")
 
-    async def cache_media_analysis(self, file_hash: str, analysis: dict[str, Any], ttl: int = LONG_TTL) -> bool:
+    async def cache_media_analysis(
+        self, file_hash: str, analysis: dict[str, Any], ttl: int = LONG_TTL
+    ) -> bool:
         """Cache ffprobe/media analysis results."""
-        return await self.set(f"{PREFIX_META}analysis:{file_hash}", analysis, ttl=ttl)
+        return await self.set(
+            f"{PREFIX_META}analysis:{file_hash}", analysis, ttl=ttl
+        )
 
-    async def get_media_analysis(self, file_hash: str) -> dict[str, Any] | None:
+    async def get_media_analysis(
+        self, file_hash: str
+    ) -> dict[str, Any] | None:
         """Get cached media analysis."""
         return await self.get(f"{PREFIX_META}analysis:{file_hash}")
 

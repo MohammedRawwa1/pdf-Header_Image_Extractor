@@ -3,6 +3,7 @@
 
 # Target Python version
 target-version = "py312"
+line-length = 79
 
 # Exclude directories (in addition to .gitignore)
 exclude = [

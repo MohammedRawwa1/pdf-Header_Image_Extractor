@@ -19,6 +19,7 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
     if not bot_token:
         try:
             import config as _config
+
             bot_token = _config.BOT_TOKEN
         except Exception:
             bot_token = None
@@ -29,7 +30,11 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
         try:
             r = requests.get(url, params={"file_id": file_id}, timeout=30)
         except Exception:
-            logger.exception("Network error fetching getFile for %s (attempt %s)", file_id, attempt + 1)
+            logger.exception(
+                "Network error fetching getFile for %s (attempt %s)",
+                file_id,
+                attempt + 1,
+            )
             if attempt < 2:
                 time.sleep(1 + attempt)
                 continue
@@ -42,11 +47,21 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
                 desc = body.get("description") or body
             except Exception:
                 desc = r.text
-            msg = f"Telegram getFile failed: status={r.status_code} desc={desc}"
+            msg = (
+                f"Telegram getFile failed: status={r.status_code} desc={desc}"
+            )
             logger.error(msg)
             # record diagnostic info in Redis io:out key for this file_id
             try:
-                _set_io_keys(file_id, output_meta={"status": "getfile_failed", "http_status": r.status_code, "desc": str(desc), "timestamp": int(time.time())})
+                _set_io_keys(
+                    file_id,
+                    output_meta={
+                        "status": "getfile_failed",
+                        "http_status": r.status_code,
+                        "desc": str(desc),
+                        "timestamp": int(time.time()),
+                    },
+                )
             except Exception:
                 pass
             # For server errors or rate limits, retry a couple times
@@ -65,7 +80,16 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
             # On 400 errors like 'file is too big' record diagnostic info in io:out key
             try:
                 unique_key = file_id
-                _set_io_keys(unique_key, output_meta={"status": "getfile_failed", "error": str(e), "http_status": r.status_code, "desc": r.text, "timestamp": int(time.time())})
+                _set_io_keys(
+                    unique_key,
+                    output_meta={
+                        "status": "getfile_failed",
+                        "error": str(e),
+                        "http_status": r.status_code,
+                        "desc": r.text,
+                        "timestamp": int(time.time()),
+                    },
+                )
             except Exception:
                 pass
             raise
@@ -75,6 +99,7 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
     if not bot_token:
         try:
             import config as _config
+
             bot_token = _config.BOT_TOKEN
         except Exception:
             bot_token = None
@@ -90,10 +115,12 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
                     )
                     logger.warning(
                         "_tg_download_to_bytes: HTTP %s on attempt %d for %s",
-                        r.status_code, attempt + 1, tg_file_path,
+                        r.status_code,
+                        attempt + 1,
+                        tg_file_path,
                     )
                     if attempt < 2:
-                        time.sleep(2 ** attempt)
+                        time.sleep(2**attempt)
                         continue
                     raise last_exc
                 r.raise_for_status()
@@ -102,26 +129,42 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
                     if chunk:
                         buf.write(chunk)
                 return buf.getvalue()
-        except (requests.ConnectionError, requests.Timeout, requests.ChunkedEncodingError) as e:
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.ChunkedEncodingError,
+        ) as e:
             # Transient network errors — retry with exponential backoff
             last_exc = e
             logger.warning(
                 "_tg_download_to_bytes: transient error %s on attempt %d for %s",
-                type(e).__name__, attempt + 1, tg_file_path,
+                type(e).__name__,
+                attempt + 1,
+                tg_file_path,
             )
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
                 continue
         except requests.HTTPError:
             # Non-retryable HTTP errors (e.g., 400, 404) — raise immediately
             raise
-    raise last_exc or RuntimeError(f"Failed to download {tg_file_path} after 3 attempts")
+    raise last_exc or RuntimeError(
+        f"Failed to download {tg_file_path} after 3 attempts"
+    )
 
 
-def _tg_send_document(bot_token: str | None, chat_id: int, doc_fileobj, filename: str, thumb_fileobj=None, caption: str | None = None):
+def _tg_send_document(
+    bot_token: str | None,
+    chat_id: int,
+    doc_fileobj,
+    filename: str,
+    thumb_fileobj=None,
+    caption: str | None = None,
+):
     if not bot_token:
         try:
             import config as _config
+
             bot_token = _config.BOT_TOKEN
         except Exception:
             bot_token = None
@@ -141,6 +184,7 @@ def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
     if not bot_token:
         try:
             import config as _config
+
             bot_token = _config.BOT_TOKEN
         except Exception:
             bot_token = None
@@ -151,13 +195,16 @@ def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
     return r.json()
 
 
-def _tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown"):
+def _tg_edit_message_text(
+    chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown"
+):
     """Edit a previously-sent message using Bot API's editMessageText.
 
     Returns the API response dict on success, or None on failure (non-fatal).
     """
     try:
         import config as _config
+
         bot_token = _config.BOT_TOKEN
     except Exception:
         bot_token = None
@@ -192,9 +239,6 @@ _PROGRESS_STAGES = {
     "done": 100,
     "failed": 0,
 }
-
-
-
 
 
 def _tg_send_progress(
@@ -266,7 +310,10 @@ from tools import (  # noqa: E402
     create_thumbnail_from_pdf,
     create_thumbnail_from_pdf_bytes,
 )
-from utils.progress_tracker import _build_progress_bar, _format_size  # noqa: E402
+from utils.progress_tracker import (  # noqa: E402
+    _build_progress_bar,
+    _format_size,
+)
 
 try:
     from rq import get_current_job
@@ -291,24 +338,28 @@ def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
         logger.exception("boto3 not available for downloading S3 key %s", key)
         return False
 
-    bucket = getattr(config, 'S3_BUCKET', None)
+    bucket = getattr(config, "S3_BUCKET", None)
     if not bucket:
         logger.error("S3 bucket not configured; cannot download key %s", key)
         return False
 
     client_kwargs = {}
-    if getattr(config, 'S3_REGION', None):
-        client_kwargs['region_name'] = config.S3_REGION
-    if getattr(config, 'S3_ENDPOINT', None):
-        client_kwargs['endpoint_url'] = config.S3_ENDPOINT
-    if getattr(config, 'AWS_ACCESS_KEY_ID', None) or getattr(config, 'AWS_SECRET_ACCESS_KEY', None):
-        client_kwargs['aws_access_key_id'] = config.AWS_ACCESS_KEY_ID or None
-        client_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY or None
+    if getattr(config, "S3_REGION", None):
+        client_kwargs["region_name"] = config.S3_REGION
+    if getattr(config, "S3_ENDPOINT", None):
+        client_kwargs["endpoint_url"] = config.S3_ENDPOINT
+    if getattr(config, "AWS_ACCESS_KEY_ID", None) or getattr(
+        config, "AWS_SECRET_ACCESS_KEY", None
+    ):
+        client_kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID or None
+        client_kwargs["aws_secret_access_key"] = (
+            config.AWS_SECRET_ACCESS_KEY or None
+        )
 
     try:
-        sig = getattr(config, 'S3_SIGNATURE_VERSION', 's3v4')
+        sig = getattr(config, "S3_SIGNATURE_VERSION", "s3v4")
         boto_cfg = BotoConfig(signature_version=sig)
-        s3 = boto3.client('s3', config=boto_cfg, **client_kwargs)
+        s3 = boto3.client("s3", config=boto_cfg, **client_kwargs)
     except Exception:
         logger.exception("Failed to create S3 client for download of %s", key)
         return False
@@ -322,16 +373,22 @@ def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
         logger.exception("Failed to download S3 key %s to %s", key, dest_path)
         # fallback: try to generate a presigned URL and download via requests
         try:
-            url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=int(getattr(config, 'S3_PRESIGNED_EXPIRY', 3600)))
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=int(getattr(config, "S3_PRESIGNED_EXPIRY", 3600)),
+            )
             with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                with open(dest_path, 'wb') as fh:
+                with open(dest_path, "wb") as fh:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             fh.write(chunk)
             return True
         except Exception:
-            logger.exception("Presigned GET fallback failed for S3 key %s", key)
+            logger.exception(
+                "Presigned GET fallback failed for S3 key %s", key
+            )
             return False
 
 
@@ -342,29 +399,38 @@ def process_input_key_job(job: dict) -> dict:
     This will download the object to a temp dir and run the disk-mode flow (thumbnail, compress, send).
     Returns the Telegram send response or an error dict.
     """
-    job_id = job.get('job_id') or uuid.uuid4().hex
-    input_key = job.get('input_key')
-    filename = job.get('original_filename') or os.path.basename(input_key or '') or f"{job_id}.bin"
-    chat_id = job.get('chat_id')
-    cleanup_input = job.get('cleanup_input', True)
+    job_id = job.get("job_id") or uuid.uuid4().hex
+    input_key = job.get("input_key")
+    filename = (
+        job.get("original_filename")
+        or os.path.basename(input_key or "")
+        or f"{job_id}.bin"
+    )
+    chat_id = job.get("chat_id")
+    cleanup_input = job.get("cleanup_input", True)
 
     unique_key = job_id
 
     # write input metadata for observability
     try:
         input_meta = {
-            'job_id': job_id,
-            'input_key': input_key,
-            'filename': filename,
-            'size': job.get('size') or job.get('file_size'),
-            'chat_id': chat_id,
-            'enqueued_at': int(time.time()),
+            "job_id": job_id,
+            "input_key": input_key,
+            "filename": filename,
+            "size": job.get("size") or job.get("file_size"),
+            "chat_id": chat_id,
+            "enqueued_at": int(time.time()),
         }
         _set_io_keys(unique_key, input_meta=input_meta)
     except Exception:
         logger.exception("Failed to write io:in for job %s", unique_key)
 
-    out_meta = {'status': 'processing', 'timestamps': {'start': int(time.time())}, 'durations': {}, 'sizes': {}}
+    out_meta = {
+        "status": "processing",
+        "timestamps": {"start": int(time.time())},
+        "durations": {},
+        "sizes": {},
+    }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
     except Exception:
@@ -373,14 +439,16 @@ def process_input_key_job(job: dict) -> dict:
     tmpdir = None
     _progress_msg_id = None
     try:
-        tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None))
+        tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
         dest_path = os.path.join(tmpdir, filename)
 
         # Send initial progress
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "downloading",
+            chat_id,
+            filename,
+            "downloading",
             detail="\U0001f4e5 Downloading from S3 storage...",
-            file_size=job.get('size') or job.get('file_size') or 0,
+            file_size=job.get("size") or job.get("file_size") or 0,
         )
 
         dl_start = time.time()
@@ -389,24 +457,32 @@ def process_input_key_job(job: dict) -> dict:
             ok = _download_s3_key_to_file(input_key, dest_path)
         if not ok:
             _tg_send_progress(
-                chat_id, filename, "failed",
+                chat_id,
+                filename,
+                "failed",
                 detail="\u274c Failed to download from S3 storage.",
                 message_id=_progress_msg_id,
             )
-            out_meta.setdefault('status', 'download_failed')
-            out_meta.setdefault('error', 's3_download_failed')
-            out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+            out_meta.setdefault("status", "download_failed")
+            out_meta.setdefault("error", "s3_download_failed")
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
             except Exception:
                 pass
-            return {'error': 's3_download_failed'}
+            return {"error": "s3_download_failed"}
         dl_elapsed = time.time() - dl_start
-        out_meta.setdefault('durations', {})['download_ms'] = int(dl_elapsed * 1000)
-        out_meta.setdefault('timestamps', {})['download_end'] = int(time.time())
+        out_meta.setdefault("durations", {})["download_ms"] = int(
+            dl_elapsed * 1000
+        )
+        out_meta.setdefault("timestamps", {})["download_end"] = int(
+            time.time()
+        )
         _dl_size_post = os.path.getsize(dest_path)
         try:
-            out_meta.setdefault('sizes', {})['orig_bytes'] = _dl_size_post
+            out_meta.setdefault("sizes", {})["orig_bytes"] = _dl_size_post
         except Exception:
             pass
         try:
@@ -416,25 +492,34 @@ def process_input_key_job(job: dict) -> dict:
 
         # Update progress: download complete
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "downloaded",                detail=f"\u2705 Download complete ({_format_size(_dl_size_post)})",
+            chat_id,
+            filename,
+            "downloaded",
+            detail=f"\u2705 Download complete ({_format_size(_dl_size_post)})",
             file_size=_dl_size_post,
             message_id=_progress_msg_id,
         )
 
         # Now reuse disk-mode flow: thumbnail, compress, s3-fallback if needed, send
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "thumbnailing",
+            chat_id,
+            filename,
+            "thumbnailing",
             detail="\U0001f5bc\ufe0f Creating cover preview...",
             file_size=_dl_size_post,
             message_id=_progress_msg_id,
         )
-        thumb_path = os.path.join(tmpdir, 'thumb.jpg')
-        if filename.lower().endswith('.pdf'):
+        thumb_path = os.path.join(tmpdir, "thumb.jpg")
+        if filename.lower().endswith(".pdf"):
             create_thumbnail_from_pdf(dest_path, thumb_path)
         else:
             create_thumbnail_from_image(dest_path, thumb_path)
 
-        upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+        upload_limit = (
+            config.MAX_FILE_SIZE
+            if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
+            else 50 * 1024 * 1024
+        )
         upload_path = dest_path
         try:
             orig_size = os.path.getsize(dest_path)
@@ -444,7 +529,9 @@ def process_input_key_job(job: dict) -> dict:
         compress_total = 0.0
         if orig_size and upload_limit and orig_size > upload_limit:
             _progress_msg_id = _tg_send_progress(
-                chat_id, filename, "compressing",
+                chat_id,
+                filename,
+                "compressing",
                 detail="\U0001f5dc\ufe0f Compressing with /ebook quality...",
                 file_size=orig_size,
                 message_id=_progress_msg_id,
@@ -452,12 +539,16 @@ def process_input_key_job(job: dict) -> dict:
             # first attempt
             try:
                 a_start = time.time()
-                c1 = dest_path + '.compressed.pdf'
-                ok1 = compress_pdf(dest_path, c1, gs_quality='/ebook')
+                c1 = dest_path + ".compressed.pdf"
+                ok1 = compress_pdf(dest_path, c1, gs_quality="/ebook")
                 a_elapsed = time.time() - a_start
                 compress_total += a_elapsed
-                out_meta.setdefault('durations', {})['compress_ms'] = int(compress_total * 1000)
-                out_meta.setdefault('timestamps', {})['compress_attempt_1_end'] = int(time.time())
+                out_meta.setdefault("durations", {})["compress_ms"] = int(
+                    compress_total * 1000
+                )
+                out_meta.setdefault("timestamps", {})[
+                    "compress_attempt_1_end"
+                ] = int(time.time())
                 try:
                     _set_io_keys(unique_key, output_meta=out_meta)
                 except Exception:
@@ -469,25 +560,33 @@ def process_input_key_job(job: dict) -> dict:
                         csize = None
                     if csize and csize <= upload_limit:
                         upload_path = c1
-                        out_meta.setdefault('sizes', {})['compressed_bytes'] = csize
+                        out_meta.setdefault("sizes", {})[
+                            "compressed_bytes"
+                        ] = csize
             except Exception:
                 pass
 
             if upload_path == dest_path:
                 _progress_msg_id = _tg_send_progress(
-                    chat_id, filename, "compressing",
+                    chat_id,
+                    filename,
+                    "compressing",
                     detail="\U0001f5dc\ufe0f /ebook too large; trying /screen...",
                     file_size=orig_size,
                     message_id=_progress_msg_id,
                 )
                 try:
                     b_start = time.time()
-                    c2 = dest_path + '.compressed.screen.pdf'
-                    ok2 = compress_pdf(dest_path, c2, gs_quality='/screen')
+                    c2 = dest_path + ".compressed.screen.pdf"
+                    ok2 = compress_pdf(dest_path, c2, gs_quality="/screen")
                     b_elapsed = time.time() - b_start
                     compress_total += b_elapsed
-                    out_meta.setdefault('durations', {})['compress_ms'] = int(compress_total * 1000)
-                    out_meta.setdefault('timestamps', {})['compress_attempt_2_end'] = int(time.time())
+                    out_meta.setdefault("durations", {})["compress_ms"] = int(
+                        compress_total * 1000
+                    )
+                    out_meta.setdefault("timestamps", {})[
+                        "compress_attempt_2_end"
+                    ] = int(time.time())
                     try:
                         _set_io_keys(unique_key, output_meta=out_meta)
                     except Exception:
@@ -499,68 +598,111 @@ def process_input_key_job(job: dict) -> dict:
                             c2size = None
                         if c2size and c2size <= upload_limit:
                             upload_path = c2
-                            out_meta.setdefault('sizes', {})['compressed_bytes'] = c2size
+                            out_meta.setdefault("sizes", {})[
+                                "compressed_bytes"
+                            ] = c2size
                 except Exception:
                     pass
 
         # If still too large, try S3 fallback (should rarely be needed since input was uploaded already)
-        if upload_path == dest_path and orig_size and upload_limit and orig_size > upload_limit:
-            if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+        if (
+            upload_path == dest_path
+            and orig_size
+            and upload_limit
+            and orig_size > upload_limit
+        ):
+            if (
+                getattr(config, "ENABLE_S3_FALLBACK", False)
+                and getattr(config, "S3_BUCKET", None)
+                and upload_file_and_get_presigned_url
+            ):
                 try:
                     up_start = time.time()
-                    url = upload_file_and_get_presigned_url(dest_path, filename)
+                    url = upload_file_and_get_presigned_url(
+                        dest_path, filename
+                    )
                     up_elapsed = time.time() - up_start
                     if url:
                         try:
-                            _tg_send_message(None, chat_id, "\U0001f4ce File was too large for Telegram; uploaded to external storage.")
+                            _tg_send_message(
+                                None,
+                                chat_id,
+                                "\U0001f4ce File was too large for Telegram; uploaded to external storage.",
+                            )
                         except Exception:
                             pass
-                        out_meta.setdefault('durations', {})['s3_upload_ms'] = int(up_elapsed * 1000)
-                        out_meta.setdefault('timestamps', {})['s3_upload_end'] = int(time.time())
-                        out_meta.setdefault('status', 's3_fallback')
-                        out_meta.setdefault('s3', {})['url'] = url
+                        out_meta.setdefault("durations", {})[
+                            "s3_upload_ms"
+                        ] = int(up_elapsed * 1000)
+                        out_meta.setdefault("timestamps", {})[
+                            "s3_upload_end"
+                        ] = int(time.time())
+                        out_meta.setdefault("status", "s3_fallback")
+                        out_meta.setdefault("s3", {})["url"] = url
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:
                             pass
-                        return {'s3_url': url}
+                        return {"s3_url": url}
                 except Exception:
                     logger.exception("S3 fallback failed for job %s", job_id)
 
             # fallback notify and persist
             try:
-                _tg_send_message(None, chat_id, "\U0001f4e6 File too large to upload via bot; compression couldn't reduce it enough. Try a smaller file or external storage.")
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\U0001f4e6 File too large to upload via bot; compression couldn't reduce it enough. Try a smaller file or external storage.",
+                )
             except Exception:
                 pass
-            out_meta.setdefault('status', 'too_large_after_compress')
-            out_meta.setdefault('sizes', {})['orig_bytes'] = orig_size
-            out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+            out_meta.setdefault("status", "too_large_after_compress")
+            out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
             except Exception:
                 pass
-            return {'error': 'file too large after compression'}
+            return {"error": "file too large after compression"}
 
         # send final document via Telegram
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "sending",
+            chat_id,
+            filename,
+            "sending",
             detail="\U0001f4e4 Sending result to Telegram...",
             file_size=os.path.getsize(upload_path),
             message_id=_progress_msg_id,
         )
         send_start = time.time()
-        with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
-            res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
+        with (
+            open(upload_path, "rb") as f_doc,
+            open(thumb_path, "rb") as f_thumb,
+        ):
+            res = _tg_send_document(
+                None,
+                chat_id,
+                f_doc,
+                filename,
+                thumb_fileobj=f_thumb,
+                caption="Here is your file with an auto-generated cover preview.",
+            )
         send_elapsed = time.time() - send_start
-        out_meta.setdefault('durations', {})['tg_send_ms'] = int(send_elapsed * 1000)
-        out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
-        out_meta.setdefault('status', 'done')
+        out_meta.setdefault("durations", {})["tg_send_ms"] = int(
+            send_elapsed * 1000
+        )
+        out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+        out_meta.setdefault("status", "done")
         try:
-            out_meta.setdefault('sizes', {})['out_bytes'] = os.path.getsize(upload_path)
+            out_meta.setdefault("sizes", {})["out_bytes"] = os.path.getsize(
+                upload_path
+            )
         except Exception:
             pass
         try:
-            out_meta['tg_response'] = res
+            out_meta["tg_response"] = res
         except Exception:
             pass
         try:
@@ -569,7 +711,9 @@ def process_input_key_job(job: dict) -> dict:
             pass
 
         _tg_send_progress(
-            chat_id, filename, "done",
+            chat_id,
+            filename,
+            "done",
             detail="\u2705 Processing complete!",
             file_size=os.path.getsize(upload_path),
             message_id=_progress_msg_id,
@@ -579,7 +723,7 @@ def process_input_key_job(job: dict) -> dict:
             if get_current_job is not None:
                 job_obj = get_current_job()
                 if job_obj is not None:
-                    job_obj.meta['tg_response'] = res
+                    job_obj.meta["tg_response"] = res
                     job_obj.save_meta()
         except Exception:
             pass
@@ -589,22 +733,28 @@ def process_input_key_job(job: dict) -> dict:
     except Exception as e:
         logger.exception("Error processing input_key job %s", job_id)
         _tg_send_progress(
-            chat_id, filename, "failed",
+            chat_id,
+            filename,
+            "failed",
             detail="\u274c Processing failed. Check server logs for details.",
             message_id=_progress_msg_id,
         )
-        out_meta.setdefault('status', 'error')
-        out_meta.setdefault('error', str(e))
-        out_meta.setdefault('timestamps', {})['finished'] = int(time.time())
+        out_meta.setdefault("status", "error")
+        out_meta.setdefault("error", str(e))
+        out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
         except Exception:
             pass
         try:
-            _tg_send_message(None, chat_id, "\u274c Error processing uploaded file. Check server logs for details.")
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error processing uploaded file. Check server logs for details.",
+            )
         except Exception:
             pass
-        return {'error': 'processing_error'}
+        return {"error": "processing_error"}
     finally:
         try:
             if tmpdir and os.path.exists(tmpdir):
@@ -623,7 +773,12 @@ from utils.redis_client import get_sync_redis  # noqa: E402
 from utils.url_validation import _validate_url_safe  # noqa: E402
 
 
-def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: dict | None = None, ttl: int | None = None) -> bool:
+def _set_io_keys(
+    unique_id: str,
+    input_meta: dict | None = None,
+    output_meta: dict | None = None,
+    ttl: int | None = None,
+) -> bool:
     """Set input and/or output JSON blobs in Redis under `io:in:{id}` and `io:out:{id}`.
 
     Also writes a best-effort backup to MongoDB (sync) so
@@ -657,7 +812,9 @@ def _set_io_keys(unique_id: str, input_meta: dict | None = None, output_meta: di
             # Use the prepared statement query builder (field whitelist + parameter binding)
             mongo_db = get_sync_db()
             if mongo_db is not None:
-                sync_query(COL_JOBS, mongo_db).where("job_id", "=", f"io:{unique_id}").upsert(mongo_meta)
+                sync_query(COL_JOBS, mongo_db).where(
+                    "job_id", "=", f"io:{unique_id}"
+                ).upsert(mongo_meta)
     except Exception:
         pass
 
@@ -699,10 +856,17 @@ def process_document_job(
         }
         _set_io_keys(unique_key, input_meta=input_meta)
     except Exception:
-        logger.exception("Failed to write initial io input key for %s", unique_key)
+        logger.exception(
+            "Failed to write initial io input key for %s", unique_key
+        )
 
     # init output meta / timings
-    out_meta = {"status": "processing", "timestamps": {"start": int(time.time())}, "durations": {}, "sizes": {}}
+    out_meta = {
+        "status": "processing",
+        "timestamps": {"start": int(time.time())},
+        "durations": {},
+        "sizes": {},
+    }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
     except Exception:
@@ -712,7 +876,11 @@ def process_document_job(
     # Flag for userbot fallback data (large files that Bot API can't handle)
     _userbot_dl_data = None
     # Calculate upload limit BEFORE getFile so the early size check can use it
-    upload_limit = config.MAX_FILE_SIZE if getattr(config, 'MAX_FILE_SIZE', 0) and config.MAX_FILE_SIZE > 0 else 50 * 1024 * 1024
+    upload_limit = (
+        config.MAX_FILE_SIZE
+        if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
+        else 50 * 1024 * 1024
+    )
     # Track progress message ID so we can edit the same message
     _progress_msg_id = None
     try:
@@ -727,17 +895,22 @@ def process_document_job(
         gf_start = time.time()
         try:
             # If we already know the file exceeds Bot API limits, skip getFile entirely
-            _skip_bot_api = file_size and upload_limit and file_size > upload_limit
+            _skip_bot_api = (
+                file_size and upload_limit and file_size > upload_limit
+            )
             if _skip_bot_api:
                 logger.info(
                     "file_size=%d > upload_limit=%d; skipping Bot API getFile, "
                     "proceeding directly to userbot download",
-                    file_size, upload_limit,
+                    file_size,
+                    upload_limit,
                 )
                 raise requests.HTTPError("Bad Request: file is too big")
             # For small files going through Bot API: send initial progress
             _progress_msg_id = _tg_send_progress(
-                chat_id, filename, "downloading",
+                chat_id,
+                filename,
+                "downloading",
                 detail="\U0001f4e5 Downloading via Bot API...",
                 file_size=file_size or 0,
             )
@@ -745,16 +918,21 @@ def process_document_job(
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
-                logger.info("Bot API cannot handle large file; trying userbot fallback chain")
+                logger.info(
+                    "Bot API cannot handle large file; trying userbot fallback chain"
+                )
 
                 # Send initial progress message
                 _progress_msg_id = _tg_send_progress(
-                    chat_id, filename, "downloading",
+                    chat_id,
+                    filename,
+                    "downloading",
                     detail="\U0001f504 Connecting to userbot...",
                     file_size=file_size or 0,
                 )
 
                 import asyncio as _asyncio
+
                 _ub_data = None
                 _fallback_errors = []
 
@@ -763,15 +941,21 @@ def process_document_job(
                     from utils.userbot_downloader import (
                         download_bytes_by_file_id_via_userbot as _dl_file_id,
                     )
+
                     _ub_data = _asyncio.run(_dl_file_id(file_id))
                     if _ub_data and len(_ub_data) > 0:
-                        logger.info("Userbot file_id download succeeded: %d bytes", len(_ub_data))
+                        logger.info(
+                            "Userbot file_id download succeeded: %d bytes",
+                            len(_ub_data),
+                        )
                     else:
                         _ub_data = None
                         raise Exception("file_id download returned empty")
                 except Exception as _fb_a:
                     _fallback_errors.append(f"file_id download: {_fb_a}")
-                    logger.warning("Fallback (a) file_id download failed: %s", _fb_a)
+                    logger.warning(
+                        "Fallback (a) file_id download failed: %s", _fb_a
+                    )
 
                 # ── Fallback (b): chat-based download (works with any file_id) ──
                 if _ub_data is None and message_id:
@@ -779,60 +963,82 @@ def process_document_job(
                         from utils.userbot_downloader import (
                             download_bytes_via_userbot as _dl_chat,
                         )
+
                         _progress_msg_id = _tg_send_progress(
-                            chat_id, filename, "downloading",
+                            chat_id,
+                            filename,
+                            "downloading",
                             detail="\U0001f4e5 Downloading via userbot...",
                             file_size=file_size or 0,
                             message_id=_progress_msg_id,
                         )
                         logger.info(
                             "Trying fallback (b) chat-based download: chat=%s msg=%s",
-                            chat_id, message_id,
+                            chat_id,
+                            message_id,
                         )
                         _ub_data = _asyncio.run(_dl_chat(chat_id, message_id))
                         if _ub_data and len(_ub_data) > 0:
-                            logger.info("Userbot chat-based download succeeded: %d bytes", len(_ub_data))
+                            logger.info(
+                                "Userbot chat-based download succeeded: %d bytes",
+                                len(_ub_data),
+                            )
                         else:
                             _ub_data = None
                             raise Exception("chat download returned empty")
                     except Exception as _fb_b:
                         _fallback_errors.append(f"chat download: {_fb_b}")
-                        logger.warning("Fallback (b) chat-based download failed: %s", _fb_b)
+                        logger.warning(
+                            "Fallback (b) chat-based download failed: %s",
+                            _fb_b,
+                        )
 
                 # ── Fallback (d): relay group (forward -> userbot download) ──
                 if _ub_data is None and message_id:
                     try:
-                        relay_chat = getattr(config, 'RELAY_CHAT_ID', None)
+                        relay_chat = getattr(config, "RELAY_CHAT_ID", None)
                         if relay_chat:
                             relay_chat_id = int(relay_chat)
                             bot_token = config.BOT_TOKEN
                             fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
                             _progress_msg_id = _tg_send_progress(
-                                chat_id, filename, "downloading",
+                                chat_id,
+                                filename,
+                                "downloading",
                                 detail="\U0001f504 Forwarding to relay group...",
                                 file_size=file_size or 0,
                                 message_id=_progress_msg_id,
                             )
                             logger.info(
                                 "Trying fallback (d) relay group: forwarding %s/%s -> %s",
-                                chat_id, message_id, relay_chat_id,
+                                chat_id,
+                                message_id,
+                                relay_chat_id,
                             )
-                            fwd_resp = requests.post(fwd_url, data={
-                                "chat_id": relay_chat_id,
-                                "from_chat_id": chat_id,
-                                "message_id": message_id,
-                            }, timeout=30)
+                            fwd_resp = requests.post(
+                                fwd_url,
+                                data={
+                                    "chat_id": relay_chat_id,
+                                    "from_chat_id": chat_id,
+                                    "message_id": message_id,
+                                },
+                                timeout=30,
+                            )
                             if fwd_resp.status_code == 200:
                                 fwd_data = fwd_resp.json()
                                 fwd_msg_id = fwd_data["result"]["message_id"]
                                 logger.info(
                                     "Forwarded to relay %s/%s, trying userbot download",
-                                    relay_chat_id, fwd_msg_id,
+                                    relay_chat_id,
+                                    fwd_msg_id,
                                 )
                                 from utils.userbot_downloader import (
                                     download_bytes_via_userbot as _dl_relay,
                                 )
-                                _ub_data = _asyncio.run(_dl_relay(relay_chat_id, fwd_msg_id))
+
+                                _ub_data = _asyncio.run(
+                                    _dl_relay(relay_chat_id, fwd_msg_id)
+                                )
                                 if _ub_data and len(_ub_data) > 0:
                                     logger.info(
                                         "Relay userbot download succeeded: %d bytes",
@@ -840,17 +1046,24 @@ def process_document_job(
                                     )
                                 else:
                                     _ub_data = None
-                                    raise Exception("relay download returned empty")
+                                    raise Exception(
+                                        "relay download returned empty"
+                                    )
                             else:
                                 raise Exception(
                                     f"forwardMessage failed: {fwd_resp.status_code} "
                                     f"{fwd_resp.text[:200]}"
                                 )
                         else:
-                            logger.info("RELAY_CHAT_ID not configured, skipping fallback (d)")
+                            logger.info(
+                                "RELAY_CHAT_ID not configured, skipping fallback (d)"
+                            )
                     except Exception as _fb_d:
                         _fallback_errors.append(f"relay group: {_fb_d}")
-                        logger.warning("Fallback (d) relay group download failed: %s", _fb_d)
+                        logger.warning(
+                            "Fallback (d) relay group download failed: %s",
+                            _fb_d,
+                        )
 
                 # ── Fallback (c): BigFilePipeline (S3 pipeline) ──
                 if _ub_data is None and message_id:
@@ -858,41 +1071,55 @@ def process_document_job(
                         from utils.bigfile_pipeline import (
                             BigFilePipeline as _BFP,  # noqa: N814
                         )
+
                         _progress_msg_id = _tg_send_progress(
-                            chat_id, filename, "downloading",
+                            chat_id,
+                            filename,
+                            "downloading",
                             detail="\U0001f504 Trying S3 pipeline...",
                             file_size=file_size or 0,
                             message_id=_progress_msg_id,
                         )
                         logger.info(
                             "Trying fallback (c) BigFilePipeline: chat=%s msg=%s size=%s",
-                            chat_id, message_id, file_size or "unknown",
+                            chat_id,
+                            message_id,
+                            file_size or "unknown",
                         )
                         _pipeline = _BFP()
-                        _result = _asyncio.run(_pipeline.ingest_large_file(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            file_size=file_size or 0,
-                            file_unique_id=file_unique_id,
-                            original_filename=filename,
-                        ))
+                        _result = _asyncio.run(
+                            _pipeline.ingest_large_file(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                file_size=file_size or 0,
+                                file_unique_id=file_unique_id,
+                                original_filename=filename,
+                            )
+                        )
                         if _result and _result.ok:
                             logger.info(
                                 "BigFilePipeline job enqueued: job_id=%s s3_key=%s",
-                                _result.job_id, _result.s3_key,
+                                _result.job_id,
+                                _result.s3_key,
                             )
                             _tg_send_progress(
-                                chat_id, filename, "done",
+                                chat_id,
+                                filename,
+                                "done",
                                 detail="\u2705 Large file queued via S3 pipeline. You'll receive the result when ready.",
                                 file_size=file_size or 0,
                                 message_id=_progress_msg_id,
                             )
                             return {"pipeline": _result.job_id}
                         else:
-                            raise Exception(f"BigFilePipeline failed: {_result.error if _result else 'unknown'}")
+                            raise Exception(
+                                f"BigFilePipeline failed: {_result.error if _result else 'unknown'}"
+                            )
                     except Exception as _fb_c:
                         _fallback_errors.append(f"BigFilePipeline: {_fb_c}")
-                        logger.warning("Fallback (c) BigFilePipeline failed: %s", _fb_c)
+                        logger.warning(
+                            "Fallback (c) BigFilePipeline failed: %s", _fb_c
+                        )
 
                 # ── All fallbacks exhausted ──
                 if _ub_data is not None:
@@ -901,12 +1128,16 @@ def process_document_job(
                 else:
                     logger.error(
                         "All download methods failed for file_id=%s chat=%s msg=%s. Errors: %s",
-                        file_id, chat_id, message_id,
+                        file_id,
+                        chat_id,
+                        message_id,
                         "; ".join(_fallback_errors),
                     )
                     # Update progress to failed with details
                     _tg_send_progress(
-                        chat_id, filename, "failed",
+                        chat_id,
+                        filename,
+                        "failed",
                         detail="\u274c All download methods failed. Check server logs.",
                         file_size=file_size or 0,
                         message_id=_progress_msg_id,
@@ -918,7 +1149,9 @@ def process_document_job(
             else:
                 raise
         gf_elapsed = time.time() - gf_start
-        out_meta.setdefault("durations", {})["getfile_ms"] = int(gf_elapsed * 1000)
+        out_meta.setdefault("durations", {})["getfile_ms"] = int(
+            gf_elapsed * 1000
+        )
         out_meta.setdefault("timestamps", {})["getfile_end"] = int(time.time())
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
@@ -936,25 +1169,38 @@ def process_document_job(
             dl_start = time.time()
             if _userbot_dl_data is not None:
                 # Already downloaded via userbot; write bytes to disk
-                with open(file_path, 'wb') as fh:
+                with open(file_path, "wb") as fh:
                     fh.write(_userbot_dl_data)
-                logger.info("Used userbot-fallback data for file_id=%s (%d bytes written)", file_id, len(_userbot_dl_data))
+                logger.info(
+                    "Used userbot-fallback data for file_id=%s (%d bytes written)",
+                    file_id,
+                    len(_userbot_dl_data),
+                )
             else:
                 try:
                     import config as _conf
+
                     bot_token = _conf.BOT_TOKEN
                 except Exception:
                     bot_token = None
 
-                with requests.get(f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}", stream=True, timeout=60) as r:
+                with requests.get(
+                    f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}",
+                    stream=True,
+                    timeout=60,
+                ) as r:
                     r.raise_for_status()
-                    with open(file_path, 'wb') as fh:
+                    with open(file_path, "wb") as fh:
                         for chunk in r.iter_content(chunk_size=64 * 1024):
                             if chunk:
                                 fh.write(chunk)
             dl_elapsed = time.time() - dl_start
-            out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
-            out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
+            out_meta.setdefault("durations", {})["download_ms"] = int(
+                dl_elapsed * 1000
+            )
+            out_meta.setdefault("timestamps", {})["download_end"] = int(
+                time.time()
+            )
             _dl_size_post = os.path.getsize(file_path)
             try:
                 out_meta.setdefault("sizes", {})["orig_bytes"] = _dl_size_post
@@ -967,7 +1213,9 @@ def process_document_job(
 
             # Update progress: download complete
             _progress_msg_id = _tg_send_progress(
-                chat_id, filename, "downloaded",
+                chat_id,
+                filename,
+                "downloaded",
                 detail=f"\u2705 Download complete ({_format_size(_dl_size_post)})",
                 file_size=_dl_size_post,
                 message_id=_progress_msg_id,
@@ -975,13 +1223,18 @@ def process_document_job(
 
             # thumbnail
             _progress_msg_id = _tg_send_progress(
-                chat_id, filename, "thumbnailing",
+                chat_id,
+                filename,
+                "thumbnailing",
                 detail="\U0001f5bc\ufe0f Creating cover preview...",
                 file_size=_dl_size_post,
                 message_id=_progress_msg_id,
             )
             thumb_path = os.path.join(tmpdir, "thumb.jpg")
-            if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
+            if (
+                filename.lower().endswith(".pdf")
+                or "pdf" in (mime or "").lower()
+            ):
                 create_thumbnail_from_pdf(file_path, thumb_path)
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
@@ -996,7 +1249,9 @@ def process_document_job(
             compress_total = 0.0
             if orig_size and upload_limit and orig_size > upload_limit:
                 _progress_msg_id = _tg_send_progress(
-                    chat_id, filename, "compressing",
+                    chat_id,
+                    filename,
+                    "compressing",
                     detail="\U0001f5dc\ufe0f Compressing with /ebook quality...",
                     file_size=orig_size,
                     message_id=_progress_msg_id,
@@ -1004,12 +1259,16 @@ def process_document_job(
                 # attempt first pass
                 try:
                     a_start = time.time()
-                    c1 = file_path + '.compressed.pdf'
-                    ok1 = compress_pdf(file_path, c1, gs_quality='/ebook')
+                    c1 = file_path + ".compressed.pdf"
+                    ok1 = compress_pdf(file_path, c1, gs_quality="/ebook")
                     a_elapsed = time.time() - a_start
                     compress_total += a_elapsed
-                    out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
-                    out_meta.setdefault("timestamps", {})["compress_attempt_1_end"] = int(time.time())
+                    out_meta.setdefault("durations", {})["compress_ms"] = int(
+                        compress_total * 1000
+                    )
+                    out_meta.setdefault("timestamps", {})[
+                        "compress_attempt_1_end"
+                    ] = int(time.time())
                     try:
                         _set_io_keys(unique_key, output_meta=out_meta)
                     except Exception:
@@ -1021,26 +1280,34 @@ def process_document_job(
                             csize = None
                         if csize and csize <= upload_limit:
                             upload_path = c1
-                            out_meta.setdefault("sizes", {})["compressed_bytes"] = csize
+                            out_meta.setdefault("sizes", {})[
+                                "compressed_bytes"
+                            ] = csize
                 except Exception:
                     pass
 
                 if upload_path == file_path:
                     # try second, more aggressive pass
                     _progress_msg_id = _tg_send_progress(
-                        chat_id, filename, "compressing",
+                        chat_id,
+                        filename,
+                        "compressing",
                         detail="\U0001f5dc\ufe0f /ebook too large; trying /screen...",
                         file_size=orig_size,
                         message_id=_progress_msg_id,
                     )
                     try:
                         b_start = time.time()
-                        c2 = file_path + '.compressed.screen.pdf'
-                        ok2 = compress_pdf(file_path, c2, gs_quality='/screen')
+                        c2 = file_path + ".compressed.screen.pdf"
+                        ok2 = compress_pdf(file_path, c2, gs_quality="/screen")
                         b_elapsed = time.time() - b_start
                         compress_total += b_elapsed
-                        out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
-                        out_meta.setdefault("timestamps", {})["compress_attempt_2_end"] = int(time.time())
+                        out_meta.setdefault("durations", {})["compress_ms"] = (
+                            int(compress_total * 1000)
+                        )
+                        out_meta.setdefault("timestamps", {})[
+                            "compress_attempt_2_end"
+                        ] = int(time.time())
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:
@@ -1052,24 +1319,45 @@ def process_document_job(
                                 c2size = None
                             if c2size and c2size <= upload_limit:
                                 upload_path = c2
-                                out_meta.setdefault("sizes", {})["compressed_bytes"] = c2size
+                                out_meta.setdefault("sizes", {})[
+                                    "compressed_bytes"
+                                ] = c2size
                     except Exception:
                         pass
 
             # if still too large, try S3 fallback
-            if upload_path == file_path and orig_size and upload_limit and orig_size > upload_limit:
-                if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+            if (
+                upload_path == file_path
+                and orig_size
+                and upload_limit
+                and orig_size > upload_limit
+            ):
+                if (
+                    getattr(config, "ENABLE_S3_FALLBACK", False)
+                    and getattr(config, "S3_BUCKET", None)
+                    and upload_file_and_get_presigned_url
+                ):
                     try:
                         up_start = time.time()
-                        url = upload_file_and_get_presigned_url(file_path, filename)
+                        url = upload_file_and_get_presigned_url(
+                            file_path, filename
+                        )
                         up_elapsed = time.time() - up_start
                         if url:
                             try:
-                                _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                _tg_send_message(
+                                    None,
+                                    chat_id,
+                                    f"File was too large for Telegram; uploaded to external storage: {url}",
+                                )
                             except Exception:
                                 pass
-                            out_meta.setdefault("durations", {})["s3_upload_ms"] = int(up_elapsed * 1000)
-                            out_meta.setdefault("timestamps", {})["s3_upload_end"] = int(time.time())
+                            out_meta.setdefault("durations", {})[
+                                "s3_upload_ms"
+                            ] = int(up_elapsed * 1000)
+                            out_meta.setdefault("timestamps", {})[
+                                "s3_upload_end"
+                            ] = int(time.time())
                             out_meta.setdefault("status", "s3_fallback")
                             out_meta.setdefault("s3", {})["url"] = url
                             try:
@@ -1078,16 +1366,24 @@ def process_document_job(
                                 pass
                             return {"s3_url": url}
                     except Exception:
-                        logger.exception("S3 fallback failed for file_id=%s", file_id)
+                        logger.exception(
+                            "S3 fallback failed for file_id=%s", file_id
+                        )
 
                 # otherwise notify user and persist io entry
                 try:
-                    _tg_send_message(None, chat_id, "\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.")
+                    _tg_send_message(
+                        None,
+                        chat_id,
+                        "\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.",
+                    )
                 except Exception:
                     pass
                 out_meta.setdefault("status", "too_large_after_compress")
                 out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
-                out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+                out_meta.setdefault("timestamps", {})["finished"] = int(
+                    time.time()
+                )
                 try:
                     _set_io_keys(unique_key, output_meta=out_meta)
                 except Exception:
@@ -1096,20 +1392,38 @@ def process_document_job(
 
             # send final document via Telegram
             _progress_msg_id = _tg_send_progress(
-                chat_id, filename, "sending",
+                chat_id,
+                filename,
+                "sending",
                 detail="\U0001f4e4 Sending result...",
                 file_size=os.path.getsize(upload_path),
                 message_id=_progress_msg_id,
             )
             send_start = time.time()
-            with open(upload_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
-                res = _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb, caption="Here is your file with an auto-generated cover preview.")
+            with (
+                open(upload_path, "rb") as f_doc,
+                open(thumb_path, "rb") as f_thumb,
+            ):
+                res = _tg_send_document(
+                    None,
+                    chat_id,
+                    f_doc,
+                    filename,
+                    thumb_fileobj=f_thumb,
+                    caption="Here is your file with an auto-generated cover preview.",
+                )
             send_elapsed = time.time() - send_start
-            out_meta.setdefault("durations", {})["tg_send_ms"] = int(send_elapsed * 1000)
-            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            out_meta.setdefault("durations", {})["tg_send_ms"] = int(
+                send_elapsed * 1000
+            )
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
             out_meta.setdefault("status", "done")
             try:
-                out_meta.setdefault("sizes", {})["out_bytes"] = os.path.getsize(upload_path)
+                out_meta.setdefault("sizes", {})["out_bytes"] = (
+                    os.path.getsize(upload_path)
+                )
             except Exception:
                 pass
             try:
@@ -1123,7 +1437,9 @@ def process_document_job(
 
             # Update progress to done
             _tg_send_progress(
-                chat_id, filename, "done",
+                chat_id,
+                filename,
+                "done",
                 detail="\u2705 Processing complete!",
                 file_size=os.path.getsize(upload_path),
                 message_id=_progress_msg_id,
@@ -1133,7 +1449,7 @@ def process_document_job(
                 if get_current_job is not None:
                     job = get_current_job()
                     if job is not None:
-                        job.meta['tg_response'] = res
+                        job.meta["tg_response"] = res
                         job.save_meta()
             except Exception:
                 pass
@@ -1145,14 +1461,23 @@ def process_document_job(
             dl_start = time.time()
             if _userbot_dl_data is not None:
                 file_bytes = _userbot_dl_data
-                logger.info("Used userbot-fallback data for in-memory path (%d bytes)", len(file_bytes))
+                logger.info(
+                    "Used userbot-fallback data for in-memory path (%d bytes)",
+                    len(file_bytes),
+                )
             else:
                 file_bytes = _tg_download_to_bytes(None, tg_file_path)
             dl_elapsed = time.time() - dl_start
-            out_meta.setdefault("durations", {})["download_ms"] = int(dl_elapsed * 1000)
-            out_meta.setdefault("timestamps", {})["download_end"] = int(time.time())
+            out_meta.setdefault("durations", {})["download_ms"] = int(
+                dl_elapsed * 1000
+            )
+            out_meta.setdefault("timestamps", {})["download_end"] = int(
+                time.time()
+            )
             try:
-                out_meta.setdefault("sizes", {})["orig_bytes"] = len(file_bytes)
+                out_meta.setdefault("sizes", {})["orig_bytes"] = len(
+                    file_bytes
+                )
             except Exception:
                 pass
             try:
@@ -1160,7 +1485,10 @@ def process_document_job(
             except Exception:
                 pass
 
-            if filename.lower().endswith('.pdf') or 'pdf' in (mime or '').lower():
+            if (
+                filename.lower().endswith(".pdf")
+                or "pdf" in (mime or "").lower()
+            ):
                 thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
             else:
                 thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
@@ -1170,18 +1498,22 @@ def process_document_job(
                 td = tempfile.mkdtemp()
                 try:
                     tmp_in = os.path.join(td, filename)
-                    with open(tmp_in, 'wb') as fh:
+                    with open(tmp_in, "wb") as fh:
                         fh.write(file_bytes)
 
                     compress_total = 0.0
                     try:
                         a_start = time.time()
-                        c1 = tmp_in + '.compressed.pdf'
-                        ok1 = compress_pdf(tmp_in, c1, gs_quality='/ebook')
+                        c1 = tmp_in + ".compressed.pdf"
+                        ok1 = compress_pdf(tmp_in, c1, gs_quality="/ebook")
                         a_elapsed = time.time() - a_start
                         compress_total += a_elapsed
-                        out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
-                        out_meta.setdefault("timestamps", {})["compress_attempt_1_end"] = int(time.time())
+                        out_meta.setdefault("durations", {})["compress_ms"] = (
+                            int(compress_total * 1000)
+                        )
+                        out_meta.setdefault("timestamps", {})[
+                            "compress_attempt_1_end"
+                        ] = int(time.time())
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:
@@ -1192,21 +1524,29 @@ def process_document_job(
                             except Exception:
                                 csize = None
                             if csize and csize <= upload_limit:
-                                with open(c1, 'rb') as cf:
+                                with open(c1, "rb") as cf:
                                     file_bytes = cf.read()
-                                out_meta.setdefault("sizes", {})["compressed_bytes"] = csize
+                                out_meta.setdefault("sizes", {})[
+                                    "compressed_bytes"
+                                ] = csize
                     except Exception:
                         pass
 
                     if len(file_bytes) > upload_limit:
                         try:
                             b_start = time.time()
-                            c2 = tmp_in + '.compressed.screen.pdf'
-                            ok2 = compress_pdf(tmp_in, c2, gs_quality='/screen')
+                            c2 = tmp_in + ".compressed.screen.pdf"
+                            ok2 = compress_pdf(
+                                tmp_in, c2, gs_quality="/screen"
+                            )
                             b_elapsed = time.time() - b_start
                             compress_total += b_elapsed
-                            out_meta.setdefault("durations", {})["compress_ms"] = int(compress_total * 1000)
-                            out_meta.setdefault("timestamps", {})["compress_attempt_2_end"] = int(time.time())
+                            out_meta.setdefault("durations", {})[
+                                "compress_ms"
+                            ] = int(compress_total * 1000)
+                            out_meta.setdefault("timestamps", {})[
+                                "compress_attempt_2_end"
+                            ] = int(time.time())
                             try:
                                 _set_io_keys(unique_key, output_meta=out_meta)
                             except Exception:
@@ -1217,15 +1557,21 @@ def process_document_job(
                                 except Exception:
                                     c2size = None
                                 if c2size and c2size <= upload_limit:
-                                    with open(c2, 'rb') as cf:
+                                    with open(c2, "rb") as cf:
                                         file_bytes = cf.read()
-                                    out_meta.setdefault("sizes", {})["compressed_bytes"] = c2size
+                                    out_meta.setdefault("sizes", {})[
+                                        "compressed_bytes"
+                                    ] = c2size
                         except Exception:
                             pass
 
                     # if still too big, try S3
                     if len(file_bytes) > upload_limit:
-                        if getattr(config, 'ENABLE_S3_FALLBACK', False) and getattr(config, 'S3_BUCKET', None) and upload_file_and_get_presigned_url:
+                        if (
+                            getattr(config, "ENABLE_S3_FALLBACK", False)
+                            and getattr(config, "S3_BUCKET", None)
+                            and upload_file_and_get_presigned_url
+                        ):
                             try:
                                 up_start = time.time()
                                 # prefer candidate compressed file if present
@@ -1236,30 +1582,55 @@ def process_document_job(
                                     candidate = c1
                                 else:
                                     candidate = tmp_in
-                                url = upload_file_and_get_presigned_url(candidate, filename)
+                                url = upload_file_and_get_presigned_url(
+                                    candidate, filename
+                                )
                                 up_elapsed = time.time() - up_start
                                 if url:
                                     try:
-                                        _tg_send_message(None, chat_id, f"File was too large for Telegram; uploaded to external storage: {url}")
+                                        _tg_send_message(
+                                            None,
+                                            chat_id,
+                                            f"File was too large for Telegram; uploaded to external storage: {url}",
+                                        )
                                     except Exception:
                                         pass
-                                    out_meta.setdefault("durations", {})["s3_upload_ms"] = int(up_elapsed * 1000)
-                                    out_meta.setdefault("timestamps", {})["s3_upload_end"] = int(time.time())
-                                    out_meta.setdefault("status", "s3_fallback")
+                                    out_meta.setdefault("durations", {})[
+                                        "s3_upload_ms"
+                                    ] = int(up_elapsed * 1000)
+                                    out_meta.setdefault("timestamps", {})[
+                                        "s3_upload_end"
+                                    ] = int(time.time())
+                                    out_meta.setdefault(
+                                        "status", "s3_fallback"
+                                    )
                                     out_meta.setdefault("s3", {})["url"] = url
                                     try:
-                                        _set_io_keys(unique_key, output_meta=out_meta)
+                                        _set_io_keys(
+                                            unique_key, output_meta=out_meta
+                                        )
                                     except Exception:
                                         pass
                                     return {"s3_url": url}
                             except Exception:
-                                logger.exception("S3 fallback failed for in-memory file for chat_id=%s", chat_id)
+                                logger.exception(
+                                    "S3 fallback failed for in-memory file for chat_id=%s",
+                                    chat_id,
+                                )
                         try:
-                            _tg_send_message(None, chat_id, f"File too large to upload via bot after compression; size={len(file_bytes)} bytes")
+                            _tg_send_message(
+                                None,
+                                chat_id,
+                                f"File too large to upload via bot after compression; size={len(file_bytes)} bytes",
+                            )
                         except Exception:
                             pass
-                        out_meta.setdefault("status", "too_large_after_compress")
-                        out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+                        out_meta.setdefault(
+                            "status", "too_large_after_compress"
+                        )
+                        out_meta.setdefault("timestamps", {})["finished"] = (
+                            int(time.time())
+                        )
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:
@@ -1274,10 +1645,21 @@ def process_document_job(
             thumb_buf = io.BytesIO(thumb_bytes)
             doc_buf.seek(0)
             thumb_buf.seek(0)
-            res = _tg_send_document(None, chat_id, doc_buf, filename, thumb_fileobj=thumb_buf, caption="Here is your file with an auto-generated cover preview.")
+            res = _tg_send_document(
+                None,
+                chat_id,
+                doc_buf,
+                filename,
+                thumb_fileobj=thumb_buf,
+                caption="Here is your file with an auto-generated cover preview.",
+            )
             send_elapsed = time.time() - send_start
-            out_meta.setdefault("durations", {})["tg_send_ms"] = int(send_elapsed * 1000)
-            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            out_meta.setdefault("durations", {})["tg_send_ms"] = int(
+                send_elapsed * 1000
+            )
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
             out_meta.setdefault("status", "done")
             try:
                 out_meta["tg_response"] = res
@@ -1291,7 +1673,7 @@ def process_document_job(
                 if get_current_job is not None:
                     job = get_current_job()
                     if job is not None:
-                        job.meta['tg_response'] = res
+                        job.meta["tg_response"] = res
                         job.save_meta()
             except Exception:
                 pass
@@ -1302,21 +1684,29 @@ def process_document_job(
         try:
             out_meta.setdefault("status", "error")
             out_meta.setdefault("error", str(e))
-            out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
             _set_io_keys(unique_key, output_meta=out_meta)
         except Exception:
             pass
         # Update progress to failed if a progress message exists
         try:
             _tg_send_progress(
-                chat_id, filename, "failed",
+                chat_id,
+                filename,
+                "failed",
                 detail="\u274c Processing failed. Check server logs for details.",
                 message_id=_progress_msg_id,
             )
         except Exception:
             pass
         try:
-            _tg_send_message(None, chat_id, "\u274c Error processing file in background. Check server logs for details.")
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error processing file in background. Check server logs for details.",
+            )
         except Exception:
             pass
         return {"error": str(e)}
@@ -1335,19 +1725,23 @@ def process_document_batch_job(chat_id: int, items: list) -> None:
     """
     results = []
     for item in items:
-        file_id = item.get('file_id')
-        filename = item.get('filename', 'unknown')
-        mime = item.get('mime', '')
+        file_id = item.get("file_id")
+        filename = item.get("filename", "unknown")
+        mime = item.get("mime", "")
         if not file_id:
-            logger.warning('Skipping batch item with no file_id: %s', item)
+            logger.warning("Skipping batch item with no file_id: %s", item)
             continue
         try:
             res = process_document_job(chat_id, file_id, filename, mime)
             results.append(res)
         except Exception:
-            logger.exception('Failed processing batch item %s', filename)
-            results.append({'error': f'failed: {filename}'})
-    _tg_send_message(None, chat_id, f'Batch processing complete: {len(results)} items processed.')
+            logger.exception("Failed processing batch item %s", filename)
+            results.append({"error": f"failed: {filename}"})
+    _tg_send_message(
+        None,
+        chat_id,
+        f"Batch processing complete: {len(results)} items processed.",
+    )
     return results
 
 
@@ -1358,40 +1752,59 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
     """
     # SSRF prevention: validate the URL before making any requests
     if not _validate_url_safe(url):
-        logger.warning("SSRF prevention: blocked invalid/dangerous URL in process_url_job: %s", url[:100])
+        logger.warning(
+            "SSRF prevention: blocked invalid/dangerous URL in process_url_job: %s",
+            url[:100],
+        )
         try:
-            _tg_send_message(None, chat_id, "\u274c Invalid or blocked URL. Only http/https URLs to public servers are allowed.")
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Invalid or blocked URL. Only http/https URLs to public servers are allowed.",
+            )
         except Exception:
             pass
         return
 
     tmpdir = None
     try:
-        tmpdir = tempfile.mkdtemp(dir=getattr(config, 'TMP_DIR', None) or None)
+        tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None) or None)
         file_path = os.path.join(tmpdir, filename)
 
         # download
         # Disable redirects to prevent SSRF bypass via redirect chains
-        with requests.get(url, stream=True, allow_redirects=False, timeout=120) as r:
+        with requests.get(
+            url, stream=True, allow_redirects=False, timeout=120
+        ) as r:
             r.raise_for_status()
-            with open(file_path, 'wb') as fh:
+            with open(file_path, "wb") as fh:
                 for chunk in r.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         fh.write(chunk)
 
-        thumb_path = os.path.join(tmpdir, 'thumb.jpg')
-        if filename.lower().endswith('.pdf'):
+        thumb_path = os.path.join(tmpdir, "thumb.jpg")
+        if filename.lower().endswith(".pdf"):
             create_thumbnail_from_pdf(file_path, thumb_path)
         else:
             create_thumbnail_from_image(file_path, thumb_path)
 
-        with open(file_path, 'rb') as f_doc, open(thumb_path, 'rb') as f_thumb:
-            _tg_send_document(None, chat_id, f_doc, filename, thumb_fileobj=f_thumb,
-                             caption='Here is your file with an auto-generated cover preview.')
+        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+            _tg_send_document(
+                None,
+                chat_id,
+                f_doc,
+                filename,
+                thumb_fileobj=f_thumb,
+                caption="Here is your file with an auto-generated cover preview.",
+            )
     except Exception:
-        logger.exception('Failed processing URL job: %s', url)
+        logger.exception("Failed processing URL job: %s", url)
         try:
-            _tg_send_message(None, chat_id, "\u274c Error processing URL. Check server logs for details.")
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error processing URL. Check server logs for details.",
+            )
         except Exception:
             pass
     finally:

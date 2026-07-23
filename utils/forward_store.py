@@ -12,7 +12,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage", "forwards")
+_STORAGE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "storage", "forwards"
+)
 
 
 def load_forward_metadata(forward_hash: str) -> dict[str, Any] | None:
@@ -23,7 +25,9 @@ def load_forward_metadata(forward_hash: str) -> dict[str, Any] | None:
             with open(path, encoding="utf-8") as fh:
                 return json.load(fh)
     except Exception:
-        logger.debug("forward_store: failed to load metadata for %s", forward_hash)
+        logger.debug(
+            "forward_store: failed to load metadata for %s", forward_hash
+        )
     return None
 
 
@@ -35,5 +39,7 @@ def delete_forward_metadata(forward_hash: str) -> bool:
             os.remove(path)
             return True
     except Exception:
-        logger.debug("forward_store: failed to delete metadata for %s", forward_hash)
+        logger.debug(
+            "forward_store: failed to delete metadata for %s", forward_hash
+        )
     return False

@@ -55,7 +55,9 @@ class TaskProgress:
         elapsed = self.elapsed_time
         if elapsed == 0:
             return 0
-        return (elapsed / self.progress_percentage) * (100 - self.progress_percentage)
+        return (elapsed / self.progress_percentage) * (
+            100 - self.progress_percentage
+        )
 
     def update_progress(self, processed_size: int):
         self.processed_size = processed_size
@@ -110,8 +112,15 @@ class ProgressTracker:
         except Exception:
             pass
 
-    def create_task(self, task_id: str, user_id: int, file_name: str, total_size: int) -> TaskProgress:
-        task = TaskProgress(task_id=task_id, user_id=user_id, file_name=file_name, total_size=total_size)
+    def create_task(
+        self, task_id: str, user_id: int, file_name: str, total_size: int
+    ) -> TaskProgress:
+        task = TaskProgress(
+            task_id=task_id,
+            user_id=user_id,
+            file_name=file_name,
+            total_size=total_size,
+        )
         self.tasks[task_id] = task
         self._persist_to_redis(task)
         logger.info("Created task tracker: %s", task_id)
@@ -184,16 +193,20 @@ class ProgressTracker:
         """Best-effort save completed/failed task to MongoDB for history."""
         try:
             from utils.db import save_job_metadata
-            await save_job_metadata(task.task_id, {
-                "type": "progress",
-                "user_id": task.user_id,
-                "file_name": task.file_name,
-                "total_size": task.total_size,
-                "processed_size": task.processed_size,
-                "status": task.status,
-                "elapsed_time": task.elapsed_time,
-                "error_message": task.error_message,
-            })
+
+            await save_job_metadata(
+                task.task_id,
+                {
+                    "type": "progress",
+                    "user_id": task.user_id,
+                    "file_name": task.file_name,
+                    "total_size": task.total_size,
+                    "processed_size": task.processed_size,
+                    "status": task.status,
+                    "elapsed_time": task.elapsed_time,
+                    "error_message": task.error_message,
+                },
+            )
         except Exception:
             pass
 
@@ -223,7 +236,9 @@ class ProgressTracker:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, callback, task)
         except Exception as e:
-            logger.error("Error executing callback for task %s: %s", task_id, e)
+            logger.error(
+                "Error executing callback for task %s: %s", task_id, e
+            )
 
     def get_all_tasks(self) -> dict[str, TaskProgress]:
         return self.tasks
@@ -232,7 +247,9 @@ class ProgressTracker:
         current_time = time.time()
         tasks_to_remove = []
         for task_id, task in self.tasks.items():
-            if task.end_time and (current_time - task.end_time) > (max_age_hours * 3600):
+            if task.end_time and (current_time - task.end_time) > (
+                max_age_hours * 3600
+            ):
                 tasks_to_remove.append(task_id)
         for task_id in tasks_to_remove:
             self.remove_task(task_id)
@@ -289,7 +306,9 @@ def _format_time(seconds: float) -> str:
         return f"{h}h {m}m"
 
 
-async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: int | None = None):
+async def send_progress_update(
+    chat_id: int, bot, task: TaskProgress, message_id: int | None = None
+):
     """Send or update progress message with visual progress bar.
 
     Uses Unicode block characters for maximum cross-client compatibility.
@@ -319,7 +338,9 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
             elapsed = task.elapsed_time
             if elapsed > 0:
                 bytes_per_sec = task.processed_size / elapsed
-                speed_str = f"\U0001f680 Speed: {_format_size(int(bytes_per_sec))}/s\n"
+                speed_str = (
+                    f"\U0001f680 Speed: {_format_size(int(bytes_per_sec))}/s\n"
+                )
 
         message_text = (
             f"\U0001f4ca **File Processing Progress**\n\n"
@@ -335,9 +356,16 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
         )
 
         if message_id:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, parse_mode="Markdown")
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=message_text,
+                parse_mode="Markdown",
+            )
         else:
-            msg = await bot.send_message(chat_id=chat_id, text=message_text, parse_mode="Markdown")
+            msg = await bot.send_message(
+                chat_id=chat_id, text=message_text, parse_mode="Markdown"
+            )
             return msg.message_id
 
     except Exception as e:
@@ -345,7 +373,11 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
         # "Message to edit not found" / "message not found" are benign — the progress
         # message was already deleted or the task finished before the final edit.
         # Log at DEBUG instead of ERROR to avoid alarming in an otherwise healthy pipeline.
-        if "message to edit not found" in err_msg or "message not found" in err_msg or "message can't be edited" in err_msg:
+        if (
+            "message to edit not found" in err_msg
+            or "message not found" in err_msg
+            or "message can't be edited" in err_msg
+        ):
             logger.debug("Progress update edit skipped (message gone): %s", e)
         else:
             logger.error("Error sending progress update: %s", e)

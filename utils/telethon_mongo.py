@@ -13,6 +13,7 @@ async def save_telethon_forward(job: dict) -> None:
     """Best-effort save of Telethon forward metadata to MongoDB."""
     try:
         from utils.db import save_telethon_forward as _db_save
+
         await _db_save(job)
     except Exception:
         logger.debug("telethon_mongo: failed to save (non-critical)")

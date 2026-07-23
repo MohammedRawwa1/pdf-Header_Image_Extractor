@@ -57,6 +57,7 @@ def _check_boto3() -> str | None:
     """
     try:
         import boto3  # noqa: F401
+
         return None
     except ImportError:
         return "boto3 is not installed (run: pip install boto3)"
@@ -84,37 +85,51 @@ async def consume_loop():
             chat_id = job.get("chat_id")
             logger.info(
                 "Pipeline worker picked up job %s (file=%s, chat=%s)",
-                job_id, filename, chat_id,
+                job_id,
+                filename,
+                chat_id,
             )
 
             start = time.time()
             try:
                 # process_input_key_job is synchronous; run in a thread to avoid
                 # blocking the asyncio event loop (which is needed for pop_job).
-                result = await asyncio.to_thread(tasks.process_input_key_job, job)
+                result = await asyncio.to_thread(
+                    tasks.process_input_key_job, job
+                )
                 elapsed = time.time() - start
 
                 if isinstance(result, dict):
-                    status = result.get("status", result.get("error", "unknown"))
+                    status = result.get(
+                        "status", result.get("error", "unknown")
+                    )
                     logger.info(
                         "Pipeline worker completed job %s in %.2fs: status=%s",
-                        job_id, elapsed, status,
+                        job_id,
+                        elapsed,
+                        status,
                     )
                 else:
                     logger.info(
                         "Pipeline worker completed job %s in %.2fs: %s",
-                        job_id, elapsed, result,
+                        job_id,
+                        elapsed,
+                        result,
                     )
             except Exception as e:
                 elapsed = time.time() - start
                 logger.exception(
                     "Pipeline worker failed job %s after %.2fs: %s",
-                    job_id, elapsed, e,
+                    job_id,
+                    elapsed,
+                    e,
                 )
                 # (process_input_key_job already sends an error message to the user)
 
         except asyncio.CancelledError:
-            logger.info("Pipeline worker received cancellation signal, shutting down...")
+            logger.info(
+                "Pipeline worker received cancellation signal, shutting down..."
+            )
             break
         except Exception as e:
             logger.exception("Pipeline worker loop error: %s", e)
@@ -129,7 +144,9 @@ async def consume_loop():
 def run_pipeline_worker():
     """Entry point for the pipeline worker process."""
     logging.basicConfig(
-        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        level=getattr(
+            logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO
+        ),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
@@ -139,8 +156,12 @@ def run_pipeline_worker():
     logging.getLogger("rq").setLevel(logging.INFO)
     logging.getLogger("telegram").setLevel(logging.INFO)
     logging.getLogger("pyrogram.session.session").setLevel(logging.WARNING)
-    logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(logging.WARNING)
-    logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
+    logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(
+        logging.WARNING
+    )
+    logging.getLogger("pyrogram.connection.connection").setLevel(
+        logging.WARNING
+    )
 
     # ── Startup checks ──────────────────────────────────────────
     missing = _check_env()
@@ -154,7 +175,10 @@ def run_pipeline_worker():
         logger.error("Startup check failed: %s", boto3_err)
         sys.exit(1)
 
-    logger.info("Startup checks passed. Starting pipeline worker (pid=%d)...", os.getpid())
+    logger.info(
+        "Startup checks passed. Starting pipeline worker (pid=%d)...",
+        os.getpid(),
+    )
     try:
         asyncio.run(consume_loop())
     except KeyboardInterrupt:

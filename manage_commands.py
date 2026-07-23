@@ -1,4 +1,5 @@
 """Helper script to set bot commands (async)."""
+
 import asyncio
 import os
 

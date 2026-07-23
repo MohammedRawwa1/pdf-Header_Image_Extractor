@@ -3,7 +3,11 @@ import os
 # Core
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
-USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in ("1", "true", "yes")
+USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 HOST: str = os.getenv("HOST", "0.0.0.0")  # nosec B104 - intentional bind to all interfaces for web serving
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -46,8 +50,12 @@ WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Limits
-MAX_FILE_SIZE: int = int(os.getenv("MAX_FILE_SIZE", str(0)))  # bytes, 0 = unlimited
-BOT_API_MAX_MB: int = int(os.getenv("BOT_API_MAX_MB", "50"))  # Telegram Bot API max in MB
+MAX_FILE_SIZE: int = int(
+    os.getenv("MAX_FILE_SIZE", str(0))
+)  # bytes, 0 = unlimited
+BOT_API_MAX_MB: int = int(
+    os.getenv("BOT_API_MAX_MB", "50")
+)  # Telegram Bot API max in MB
 
 # Temp directory for downloads (optional)
 TMP_DIR: str = os.getenv("TMP_DIR", "")
@@ -57,15 +65,25 @@ PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
 
 # ── Storage backend ────────────────────────────────────────────────────────────
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")  # 'local', 's3', or 'r2'
-STORAGE_PATH: str = os.getenv("STORAGE_PATH", os.path.join(ROOT_DIR, "storage"))
+STORAGE_BACKEND: str = os.getenv(
+    "STORAGE_BACKEND", "local"
+)  # 'local', 's3', or 'r2'
+STORAGE_PATH: str = os.getenv(
+    "STORAGE_PATH", os.path.join(ROOT_DIR, "storage")
+)
 INPUT_PATH: str = os.getenv("INPUT_PATH", os.path.join(STORAGE_PATH, "input"))
-OUTPUT_PATH: str = os.getenv("OUTPUT_PATH", os.path.join(STORAGE_PATH, "output"))
+OUTPUT_PATH: str = os.getenv(
+    "OUTPUT_PATH", os.path.join(STORAGE_PATH, "output")
+)
 TEMP_PATH: str = os.getenv("TEMP_PATH", os.path.join(STORAGE_PATH, "temp"))
-THUMBNAIL_PATH: str = os.getenv("THUMBNAIL_PATH", os.path.join(STORAGE_PATH, "thumbnails"))
+THUMBNAIL_PATH: str = os.getenv(
+    "THUMBNAIL_PATH", os.path.join(STORAGE_PATH, "thumbnails")
+)
 
 # Optional S3 fallback settings
-ENABLE_S3_FALLBACK: bool = os.getenv("ENABLE_S3_FALLBACK", "false").lower() in ("1", "true", "yes")
+ENABLE_S3_FALLBACK: bool = os.getenv(
+    "ENABLE_S3_FALLBACK", "false"
+).lower() in ("1", "true", "yes")
 S3_BUCKET: str = os.getenv("S3_BUCKET", "")
 AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -73,7 +91,12 @@ S3_REGION: str = os.getenv("S3_REGION", "")
 S3_ENDPOINT: str = os.getenv("S3_ENDPOINT", "")
 S3_PRESIGNED_EXPIRY: int = int(os.getenv("S3_PRESIGNED_EXPIRY", "3600"))
 S3_SIGNATURE_VERSION: str = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
-S3_USE_SSL: bool = os.getenv("S3_USE_SSL", "1") not in ("0", "false", "False", "no")
+S3_USE_SSL: bool = os.getenv("S3_USE_SSL", "1") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
 PRESIGN_EXPIRES: int = int(os.getenv("PRESIGN_EXPIRES", "3600"))
 
 # ── Userbot / relay for big files ──────────────────────────────────────────────
@@ -87,6 +110,7 @@ RELAY_CHAT_ID: str = os.getenv("RELAY_CHAT_ID", "")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 def is_admin_user(user_id: int) -> bool:
     """Return True if user_id is in ADMIN_USERS or matches OWNER_ID."""

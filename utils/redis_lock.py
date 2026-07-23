@@ -78,7 +78,10 @@ class RedisLock:
         client = await self._get_client()
         if client is None:
             # No Redis available \u2014 allow operation (degraded mode)
-            logger.debug("RedisLock(%s): no Redis, allowing in degraded mode", self._name)
+            logger.debug(
+                "RedisLock(%s): no Redis, allowing in degraded mode",
+                self._name,
+            )
             self._acquired = True
             return True
         try:
@@ -90,9 +93,13 @@ class RedisLock:
             )
             if acquired:
                 self._acquired = True
-                logger.debug("RedisLock(%s): acquired by %s", self._name, self._owner)
+                logger.debug(
+                    "RedisLock(%s): acquired by %s", self._name, self._owner
+                )
             else:
-                logger.debug("RedisLock(%s): held by another owner", self._name)
+                logger.debug(
+                    "RedisLock(%s): held by another owner", self._name
+                )
             return bool(acquired)
         except Exception as e:
             logger.warning("RedisLock(%s): acquire failed: %s", self._name, e)
@@ -119,7 +126,9 @@ class RedisLock:
             """
             await client.eval(script, 1, self._name, self._owner)
             self._acquired = False
-            logger.debug("RedisLock(%s): released by %s", self._name, self._owner)
+            logger.debug(
+                "RedisLock(%s): released by %s", self._name, self._owner
+            )
             return True
         except Exception as e:
             logger.warning("RedisLock(%s): release failed: %s", self._name, e)
@@ -142,7 +151,9 @@ class RedisLock:
                 return 0
             end
             """
-            result = await client.eval(script, 1, self._name, self._owner, self._ttl)
+            result = await client.eval(
+                script, 1, self._name, self._owner, self._ttl
+            )
             return bool(result)
         except Exception as e:
             logger.debug("RedisLock(%s): renew failed: %s", self._name, e)

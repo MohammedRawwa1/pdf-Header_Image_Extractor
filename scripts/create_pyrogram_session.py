@@ -43,8 +43,16 @@ if str(_ROOT) not in sys.path:
 
 def get_credentials() -> tuple:
     """Return (api_id, api_hash) from env or prompt."""
-    api_id = os.getenv("API_ID") or os.getenv("PYROGRAM_API_ID") or os.getenv("TELEGRAM_APP_ID")
-    api_hash = os.getenv("API_HASH") or os.getenv("PYROGRAM_API_HASH") or os.getenv("TELEGRAM_API_HASH")
+    api_id = (
+        os.getenv("API_ID")
+        or os.getenv("PYROGRAM_API_ID")
+        or os.getenv("TELEGRAM_APP_ID")
+    )
+    api_hash = (
+        os.getenv("API_HASH")
+        or os.getenv("PYROGRAM_API_HASH")
+        or os.getenv("TELEGRAM_API_HASH")
+    )
 
     if not api_id:
         api_id = input("Enter your API_ID: ").strip()
@@ -54,17 +62,23 @@ def get_credentials() -> tuple:
     try:
         api_id = int(api_id)
     except (TypeError, ValueError):
-        print("ERROR: API_ID must be an integer. Get yours from https://my.telegram.org/apps")
+        print(
+            "ERROR: API_ID must be an integer. Get yours from https://my.telegram.org/apps"
+        )
         sys.exit(1)
 
     if not api_hash:
-        print("ERROR: API_HASH is required. Get yours from https://my.telegram.org/apps")
+        print(
+            "ERROR: API_HASH is required. Get yours from https://my.telegram.org/apps"
+        )
         sys.exit(1)
 
     return api_id, api_hash
 
 
-async def create_session(api_id: int, api_hash: str, session_name: str = "pyrogram_session"):
+async def create_session(
+    api_id: int, api_hash: str, session_name: str = "pyrogram_session"
+):
     """Create a new Pyrogram session interactively and export the session string."""
     try:
         from pyrogram import Client
@@ -75,50 +89,56 @@ async def create_session(api_id: int, api_hash: str, session_name: str = "pyrogr
         )
         sys.exit(1)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Pyrogram Session Creator")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"\nCreating session: {session_name}")
     print(f"API_ID: {api_id}")
     print("\nYou will be prompted to enter:")
     print("  1. Your phone number (international format, e.g. +1234567890)")
     print("  2. The login code sent to your Telegram app or SMS")
     print("  3. Your 2FA password (if enabled)")
-    print(f"\n{'='*60}\n")
+    print(f"\n{'=' * 60}\n")
 
-    client = Client(session_name, api_id=api_id, api_hash=api_hash, in_memory=True)
+    client = Client(
+        session_name, api_id=api_id, api_hash=api_hash, in_memory=True
+    )
 
     try:
         await client.start()
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("✅ Login successful!")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Get the session string
         session_string = await client.export_session_string()
-        
+
         me = await client.get_me()
         print(f"\nUser: {me.first_name or ''} {me.last_name or ''}".strip())
         print(f"User ID: {me.id}")
-        print(f"Phone: +{me.phone_number if hasattr(me, 'phone_number') else 'unknown'}")
+        print(
+            f"Phone: +{me.phone_number if hasattr(me, 'phone_number') else 'unknown'}"
+        )
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("📋 SESSION STRING (copy this):")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(session_string)
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print("\nSet this as an environment variable on your server:")
         print(f"  PYROGRAM_SESSION='{session_string[:50]}...'")
         print("\nOr if using Render, add it as a secret environment variable.")
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("⚠️  SECURITY: The session string is a full login token.")
         print("   Never commit it to Git. Delete the .txt file after use.")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Also save to a text file for convenience
         with open(f"{session_name}.txt", "w") as f:
             f.write(session_string)
-        print(f"✅ Saved to {session_name}.txt — DELETE THIS FILE after you've set the env var!")
+        print(
+            f"✅ Saved to {session_name}.txt — DELETE THIS FILE after you've set the env var!"
+        )
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
@@ -132,7 +152,9 @@ async def export_from_file(api_id: int, api_hash: str, session_file: str):
     try:
         from pyrogram import Client
     except ImportError:
-        print("Pyrogram is not installed. Install it with: pip install pyrogram tgcrypto")
+        print(
+            "Pyrogram is not installed. Install it with: pip install pyrogram tgcrypto"
+        )
         sys.exit(1)
 
     if not os.path.exists(session_file):
@@ -150,18 +172,22 @@ async def export_from_file(api_id: int, api_hash: str, session_file: str):
     try:
         await client.start()
         session_string = await client.export_session_string()
-        
-        print(f"\n{'='*60}")
+
+        print(f"\n{'=' * 60}")
         print("📋 SESSION STRING:")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(session_string)
-        print(f"{'='*60}")
-        print("\n⚠️  SECURITY: Treat this like a password. Delete the file after use.")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
+        print(
+            "\n⚠️  SECURITY: Treat this like a password. Delete the file after use."
+        )
+        print(f"{'=' * 60}")
 
         with open(f"{session_name}_exported.txt", "w") as f:
             f.write(session_string)
-        print(f"\n✅ Saved to {session_name}_exported.txt — DELETE THIS FILE after use!")
+        print(
+            f"\n✅ Saved to {session_name}_exported.txt — DELETE THIS FILE after use!"
+        )
     except Exception as e:
         print(f"❌ Error: {e}")
         sys.exit(1)
@@ -171,13 +197,13 @@ async def export_from_file(api_id: int, api_hash: str, session_file: str):
 
 async def main():
     args = sys.argv[1:]
-    
+
     # Parse --from-file flag
     from_file = None
     for i, arg in enumerate(args):
         if arg in ("--from-file", "--export") and i + 1 < len(args):
             from_file = args[i + 1]
-    
+
     api_id, api_hash = get_credentials()
 
     if from_file:

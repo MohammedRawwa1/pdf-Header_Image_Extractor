@@ -25,6 +25,7 @@ _async_wrapper = None
 
 # ── URL source of truth ───────────────────────────────────────
 
+
 def get_redis_url() -> str:
     """Return the Redis URL from the environment (single source of truth).
 
@@ -34,6 +35,7 @@ def get_redis_url() -> str:
 
 
 # ── Sync client ───────────────────────────────────────────────
+
 
 def get_sync_redis(decode_responses: bool = True) -> redis.Redis | None:  # noqa: F821
     """Return a cached sync Redis client (lazy singleton).
@@ -53,6 +55,7 @@ def get_sync_redis(decode_responses: bool = True) -> redis.Redis | None:  # noqa
 
     try:
         import redis
+
         _sync_client = redis.from_url(url, decode_responses=decode_responses)
         logger.info("redis_client: sync Redis connected")
         return _sync_client
@@ -74,6 +77,7 @@ def close_sync_redis():
 
 
 # ── Async client (no-op close wrapper) ────────────────────────
+
 
 class _AsyncRedisWrapper:
     """Delegates all attribute access to the real async Redis client.
@@ -116,7 +120,9 @@ async def get_async_redis(
     """
     if max_connections is None:
         try:
-            max_connections = int(os.environ.get("REDIS_MAX_CONNECTIONS", "50"))
+            max_connections = int(
+                os.environ.get("REDIS_MAX_CONNECTIONS", "50")
+            )
         except (ValueError, TypeError):
             max_connections = 50
     global _async_client, _async_wrapper

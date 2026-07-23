@@ -96,7 +96,9 @@ class BotErrorHandler:
         self.max_log_size = 1000
 
     @staticmethod
-    def categorize_error(exception: Exception, context: str | None = None) -> str:
+    def categorize_error(
+        exception: Exception, context: str | None = None
+    ) -> str:
         """Categorize an exception into a known error type."""
         exc_str = str(exception).lower()
         ctx = (context or "").lower()
@@ -107,7 +109,11 @@ class BotErrorHandler:
             return "file_not_found"
         if "too large" in exc_str or "file size" in exc_str:
             return "file_too_large"
-        if "network" in exc_str or "connection" in exc_str or "econnrefused" in exc_str:
+        if (
+            "network" in exc_str
+            or "connection" in exc_str
+            or "econnrefused" in exc_str
+        ):
             return "network_error"
         if "disk" in exc_str or "space" in exc_str or "disk full" in exc_str:
             return "disk_full"
@@ -192,7 +198,7 @@ class BotErrorHandler:
         # Keep in-memory log with size limit
         self.error_log.append(error_entry)
         if len(self.error_log) > self.max_log_size:
-            self.error_log = self.error_log[-self.max_log_size:]
+            self.error_log = self.error_log[-self.max_log_size :]
 
         return error_entry
 
@@ -245,7 +251,12 @@ async def handle_bot_error(
     handler = get_error_handler()
 
     # Try to get user_id from update if not provided
-    if not user_id and update and hasattr(update, "effective_user") and update.effective_user:
+    if (
+        not user_id
+        and update
+        and hasattr(update, "effective_user")
+        and update.effective_user
+    ):
         user_id = update.effective_user.id
 
     # Log the error
@@ -254,7 +265,9 @@ async def handle_bot_error(
         context,
         severity="error",
         user_id=user_id,
-        additional_info={"update_type": type(update).__name__ if update else None},
+        additional_info={
+            "update_type": type(update).__name__ if update else None
+        },
     )
 
     # Notify user if callback provided
@@ -262,7 +275,9 @@ async def handle_bot_error(
         try:
             await send_user_message(error_info["user_message"])
         except Exception as e:
-            logger.error("Failed to send error message to user %s: %s", user_id, e)
+            logger.error(
+                "Failed to send error message to user %s: %s", user_id, e
+            )
 
     return error_info
 
@@ -305,7 +320,10 @@ def async_error_handler(
                         break
 
                 error_info = await handle_bot_error(
-                    e, context, update=update, user_id=user_id,
+                    e,
+                    context,
+                    update=update,
+                    user_id=user_id,
                     send_user_message=send_user_message_callback,
                 )
 

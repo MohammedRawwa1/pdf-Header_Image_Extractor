@@ -11,12 +11,8 @@ Provides:
 import asyncio
 import logging
 import time
+import uuid
 from collections import defaultdict
-
-try:
-    from utils.job_queue import get_redis
-except Exception:
-    get_redis = None
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +35,9 @@ class RateLimiter:
         )
         self._lock = asyncio.Lock()
 
-    async def acquire(self, user_id: str = "global", tokens: float = 1.0) -> bool:
+    async def acquire(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> bool:
         """Try to acquire tokens from the bucket.
 
         Returns True if tokens were available, False if rate limited.
@@ -51,7 +49,10 @@ class RateLimiter:
             elapsed = now - last_time
 
             # Refill tokens based on elapsed time
-            new_tokens = min(self.capacity, current_tokens + (elapsed * self.calls_per_second))
+            new_tokens = min(
+                self.capacity,
+                current_tokens + (elapsed * self.calls_per_second),
+            )
 
             if new_tokens >= tokens:
                 self.buckets[key] = (new_tokens - tokens, now)
@@ -60,7 +61,9 @@ class RateLimiter:
                 self.buckets[key] = (new_tokens, now)
                 return False
 
-    async def wait_if_needed(self, user_id: str = "global", tokens: float = 1.0) -> float:
+    async def wait_if_needed(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> float:
         """Wait until tokens are available and acquire them.
 
         Returns the wait time in seconds (0 if no wait needed).
@@ -73,7 +76,9 @@ class RateLimiter:
         if waited > 2.0:
             logger.warning(
                 "RateLimiter waited %.2fs for key=%s (tokens=%s)",
-                waited, user_id, tokens,
+                waited,
+                user_id,
+                tokens,
             )
         return waited
 
@@ -81,9 +86,15 @@ class RateLimiter:
         """Return rate limiter statistics."""
         stats = {}
         if user_id:
-            tokens, last_time = self.buckets.get(user_id, (self.capacity, time.time()))
+            tokens, last_time = self.buckets.get(
+                user_id, (self.capacity, time.time())
+            )
             tokens_needed = max(0.0, 1.0 - tokens)
-            secs = tokens_needed / self.calls_per_second if self.calls_per_second > 0 else float("inf")
+            secs = (
+                tokens_needed / self.calls_per_second
+                if self.calls_per_second > 0
+                else float("inf")
+            )
             stats[user_id] = {
                 "available_tokens": tokens,
                 "last_refill": last_time,
@@ -92,7 +103,11 @@ class RateLimiter:
         else:
             for key, (tokens, last_time) in self.buckets.items():
                 tokens_needed = max(0.0, 1.0 - tokens)
-                secs = tokens_needed / self.calls_per_second if self.calls_per_second > 0 else float("inf")
+                secs = (
+                    tokens_needed / self.calls_per_second
+                    if self.calls_per_second > 0
+                    else float("inf")
+                )
                 stats[key] = {
                     "available_tokens": tokens,
                     "last_refill": last_time,
@@ -117,29 +132,123 @@ class TelegramAPIRateLimiter:
     async def acquire(self, user_id: str = "global") -> bool:
         """Check if a call is allowed under both global and per-user limits."""
         global_ok = await self.global_limiter.acquire(tokens=1)
-        user_ok = await self.per_user_limiter.acquire(user_id=user_id, tokens=1)
+        user_ok = await self.per_user_limiter.acquire(
+            user_id=user_id, tokens=1
+        )
         return global_ok and user_ok
 
-    async def wait_if_needed(self, user_id: str = "global") -> tuple[float, float]:
+    async def wait_if_needed(
+        self, user_id: str = "global"
+    ) -> tuple[float, float]:
         """Wait until both limiters allow a call.
 
         Returns (global_wait, per_user_wait) in seconds.
         """
         gw = await self.global_limiter.wait_if_needed(tokens=1)
-        uw = await self.per_user_limiter.wait_if_needed(user_id=user_id, tokens=1)
+        uw = await self.per_user_limiter.wait_if_needed(
+            user_id=user_id, tokens=1
+        )
 
         if gw > 2.0 or uw > 2.0:
             logger.warning(
                 "TelegramAPIRateLimiter: user=%s global_wait=%.2fs user_wait=%.2fs",
-                user_id, gw, uw,
+                user_id,
+                gw,
+                uw,
             )
         return gw, uw
 
     def get_stats(self, user_id: str | None = None) -> dict:
         return {
             "global": self.global_limiter.get_stats(),
-            "per_user": self.per_user_limiter.get_stats(user_id) if user_id else {},
+            "per_user": self.per_user_limiter.get_stats(user_id)
+            if user_id
+            else {},
         }
+
+
+class RedisSlidingWindowRateLimiter:
+    """Sliding window rate limiter backed by Redis, shares state across workers.
+
+    Uses a Redis sorted set per key where each member is a unique request
+    timestamp. Old entries outside the window are pruned on each check.
+
+    Fail-opens (allows requests through) when Redis is unavailable, so the
+    admin API endpoints remain functional during a Redis outage.
+    """
+
+    def __init__(self, max_requests: int = 5, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._redis = None
+
+    async def _get_redis(self):
+        if self._redis is None:
+            from utils.redis_client import get_async_redis
+
+            self._redis = await get_async_redis()
+        return self._redis
+
+    async def acquire(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> tuple[bool, int, float]:
+        """Check if a request is allowed under the rate limit.
+
+        Args:
+            user_id: Key to rate limit on (e.g. client IP).
+            tokens: Ignored — kept for API compatibility with ``RateLimiter``.
+
+        Returns:
+            Tuple of (allowed, remaining, reset_seconds):
+            - allowed: True if under limit, False if rate limited
+            - remaining: Requests remaining in current window
+            - reset_seconds: Seconds until the oldest entry expires
+        """
+        redis = await self._get_redis()
+        if redis is None:
+            return True, self.max_requests, 0.0  # Fail open when Redis is down
+
+        key = f"rate_limit:admin:{user_id}"
+        now = time.time()
+        window_start = now - self.window_seconds
+        member = f"{now}:{uuid.uuid4().hex[:6]}"
+
+        try:
+            async with redis.pipeline() as pipe:
+                # Prune entries older than the window
+                await pipe.zremrangebyscore(key, 0, window_start)
+                # Add current request entry
+                await pipe.zadd(key, {member: now})
+                # Count entries (includes our just-added entry)
+                await pipe.zcard(key)
+                # Set TTL for automatic cleanup
+                await pipe.expire(key, self.window_seconds + 60)
+                # Get oldest entry to calculate when the window resets
+                await pipe.zrange(key, 0, 0, withscores=True)
+                results = await pipe.execute()
+
+            count = results[2]  # zcard result
+
+            # Calculate remaining and reset
+            remaining = max(0, self.max_requests - count)
+            oldest = results[4]  # zrange withscores
+            if oldest and oldest[0]:
+                _, oldest_score = oldest[0]
+                reset_seconds = max(
+                    0.0, (oldest_score + self.window_seconds) - now
+                )
+            else:
+                reset_seconds = 0.0
+
+            if count > self.max_requests:
+                # Over limit — remove our entry so it doesn't count against future requests
+                await redis.zrem(key, member)
+                return False, 0, reset_seconds
+
+            return True, remaining, reset_seconds
+        except Exception as exc:
+            logger.warning("RedisSlidingWindowRateLimiter error: %s", exc)
+            return True, self.max_requests, 0.0  # Fail open on any Redis error
 
 
 class ConversionRateLimiter:
@@ -174,7 +283,9 @@ class ConversionRateLimiter:
         if allowed:
             self.history[user_id].append(time.time())
             cutoff = time.time() - 3600
-            self.history[user_id] = [t for t in self.history[user_id] if t > cutoff]
+            self.history[user_id] = [
+                t for t in self.history[user_id] if t > cutoff
+            ]
             return True
         return False
 

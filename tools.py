@@ -9,7 +9,9 @@ from PIL import Image
 try:
     import fitz  # PyMuPDF
 except Exception as e:
-    raise ImportError("PyMuPDF (fitz) is required. Install with 'pip install PyMuPDF'") from e
+    raise ImportError(
+        "PyMuPDF (fitz) is required. Install with 'pip install PyMuPDF'"
+    ) from e
 
 
 def is_valid_pdf(file_path: str) -> bool:
@@ -68,7 +70,9 @@ def create_thumbnail_from_image_bytes(image_bytes: bytes) -> bytes:
     return _optimize_thumbnail_bytes(im)
 
 
-def _optimize_thumbnail(path: str, max_bytes: int = 200 * 1024, max_size=(320, 320)) -> None:
+def _optimize_thumbnail(
+    path: str, max_bytes: int = 200 * 1024, max_size=(320, 320)
+) -> None:
     """Ensure thumbnail is JPEG, within max dimensions and under max_bytes.
 
     Modifies file at `path` in-place.
@@ -102,7 +106,9 @@ def _optimize_thumbnail(path: str, max_bytes: int = 200 * 1024, max_size=(320, 3
         pass
 
 
-def _optimize_thumbnail_bytes(im: Image.Image, max_bytes: int = 200 * 1024) -> bytes:
+def _optimize_thumbnail_bytes(
+    im: Image.Image, max_bytes: int = 200 * 1024
+) -> bytes:
     """Return JPEG bytes for PIL Image `im`, optimized to be under `max_bytes` when possible."""
     buf = io.BytesIO()
     q = 90
@@ -141,7 +147,9 @@ def _validate_path_safe(path: str) -> bool:
     return os.path.isabs(normalized)
 
 
-def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") -> bool:
+def compress_pdf(
+    input_path: str, output_path: str, gs_quality: str = "/ebook"
+) -> bool:
     """Try to compress a PDF file.
 
     Strategy:
@@ -152,16 +160,30 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
     Returns True if `output_path` was created (and may be smaller), False on failure.
     """
     # Validate paths to prevent command injection / path traversal
-    if not _validate_path_safe(input_path) or not _validate_path_safe(output_path):
+    if not _validate_path_safe(input_path) or not _validate_path_safe(
+        output_path
+    ):
         logger = logging.getLogger(__name__)
-        logger.warning("compress_pdf: path validation failed for input=%s output=%s", input_path, output_path)
+        logger.warning(
+            "compress_pdf: path validation failed for input=%s output=%s",
+            input_path,
+            output_path,
+        )
         return False
 
     # Validate gs_quality is one of the expected Ghostscript presets
-    _VALID_GS_QUALITIES = {"/screen", "/ebook", "/printer", "/prepress", "/default"}
+    _VALID_GS_QUALITIES = {
+        "/screen",
+        "/ebook",
+        "/printer",
+        "/prepress",
+        "/default",
+    }
     if gs_quality not in _VALID_GS_QUALITIES:
         logger = logging.getLogger(__name__)
-        logger.warning("compress_pdf: invalid gs_quality=%s, using /ebook", gs_quality)
+        logger.warning(
+            "compress_pdf: invalid gs_quality=%s, using /ebook", gs_quality
+        )
         gs_quality = "/ebook"
 
     # Remove any existing output
@@ -191,7 +213,13 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
             input_path,
         ]
         try:
-            subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)  # nosec B603 - uses whitelisted exe names + list form (no shell injection)
+            subprocess.run(
+                gs_cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=180,
+            )  # nosec B603 - uses whitelisted exe names + list form (no shell injection)
             return os.path.exists(output_path)
         except subprocess.CalledProcessError:
             # Ghostscript ran but failed for this candidate; try next candidate
@@ -203,6 +231,7 @@ def compress_pdf(input_path: str, output_path: str, gs_quality: str = "/ebook") 
     # 2) PyMuPDF fallback (best-effort)
     try:
         import fitz
+
         doc = fitz.open(input_path)
         # Save with stream deflation and garbage collection to reduce size
         doc.save(output_path, deflate=True, garbage=4, clean=True)

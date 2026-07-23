@@ -3,6 +3,7 @@
 Refactored to use the prepared-statement MongoQueryBuilder from utils.db
 for consistent NoSQL injection prevention across the codebase.
 """
+
 from typing import Any
 
 from utils.db import COL_JOBS, query

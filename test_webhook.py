@@ -36,8 +36,15 @@ def main():
         "message": {
             "message_id": 1,
             "date": int(time.time()),
-            "chat": {"id": int(env.get("TEST_CHAT_ID", "123456")), "type": "private"},
-            "from": {"id": int(env.get("TEST_USER_ID", "123456")), "is_bot": False, "first_name": "Tester"},
+            "chat": {
+                "id": int(env.get("TEST_CHAT_ID", "123456")),
+                "type": "private",
+            },
+            "from": {
+                "id": int(env.get("TEST_USER_ID", "123456")),
+                "is_bot": False,
+                "first_name": "Tester",
+            },
             "text": "test webhook",
         },
     }
@@ -51,7 +58,9 @@ def main():
             urlopen,
         )
 
-        req = Request(post_url, data=data, headers={"Content-Type": "application/json"})
+        req = Request(
+            post_url, data=data, headers={"Content-Type": "application/json"}
+        )
         with urlopen(req, timeout=10) as resp:  # nosec B310 - localhost-only test call  # noqa: S310
             print("Status:", resp.status)
             body = resp.read().decode()

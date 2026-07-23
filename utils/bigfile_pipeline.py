@@ -27,7 +27,9 @@ DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 #
 # Memory usage during in-memory streaming: downloaded_bytes * 2 (buffer + S3 upload),
 # so a 200MB file uses ~400MB RAM.  Stay under ~40% of total RAM to avoid OOM.
-IN_MEMORY_MAX_BYTES = int(os.getenv("BIGFILE_IN_MEMORY_MAX_MB", "200")) * 1024 * 1024
+IN_MEMORY_MAX_BYTES = (
+    int(os.getenv("BIGFILE_IN_MEMORY_MAX_MB", "200")) * 1024 * 1024
+)
 
 try:
     from storage import get_storage_backend
@@ -43,6 +45,7 @@ except Exception:
 @dataclass
 class IngestResult:
     """Result of a big file ingestion attempt."""
+
     ok: bool
     job_id: str | None = None
     s3_key: str | None = None
@@ -127,13 +130,19 @@ class BigFilePipeline:
 
                 logger.info(
                     "BigFilePipeline: in-memory download chat=%s msg=%s size=%dMB",
-                    chat_id, message_id, file_size // (1024 * 1024),
+                    chat_id,
+                    message_id,
+                    file_size // (1024 * 1024),
                 )
-                data = await download_bytes_via_userbot(chat_id, message_id, progress_callback=progress_callback)
+                data = await download_bytes_via_userbot(
+                    chat_id, message_id, progress_callback=progress_callback
+                )
                 if data is not None and len(data) > 0:
                     actual_size = len(data)
                     await self._storage.upload_bytes(data, s3_key)
-                    logger.info("BigFilePipeline: S3 upload via bytes complete")
+                    logger.info(
+                        "BigFilePipeline: S3 upload via bytes complete"
+                    )
                     _in_memory_success = True
 
                     if self._cache and file_unique_id:
@@ -153,7 +162,8 @@ class BigFilePipeline:
                             pass
             except Exception as e:
                 logger.warning(
-                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download", e,
+                    "BigFilePipeline: in-memory path failed (%s); falling back to disk-based download",
+                    e,
                 )
 
         if not _in_memory_success:
@@ -166,16 +176,30 @@ class BigFilePipeline:
                 temp_path = os.path.join(temp_dir, f"{job_id}_src{ext}")
                 logger.info(
                     "BigFilePipeline: downloading via userbot chat=%s msg=%s size=%dMB -> %s",
-                    chat_id, message_id, file_size // (1024 * 1024), temp_path,
+                    chat_id,
+                    message_id,
+                    file_size // (1024 * 1024),
+                    temp_path,
                 )
 
-                from utils.userbot_downloader import download_forward_via_userbot
+                from utils.userbot_downloader import (
+                    download_forward_via_userbot,
+                )
+
                 download_ok = await download_forward_via_userbot(
-                    chat_id, message_id, temp_path,
+                    chat_id,
+                    message_id,
+                    temp_path,
                     progress_callback=progress_callback,
                 )
-                if not download_ok or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                    return IngestResult(ok=False, error="Userbot download failed")
+                if (
+                    not download_ok
+                    or not os.path.exists(temp_path)
+                    or os.path.getsize(temp_path) == 0
+                ):
+                    return IngestResult(
+                        ok=False, error="Userbot download failed"
+                    )
 
                 actual_size = os.path.getsize(temp_path)
 
@@ -186,7 +210,9 @@ class BigFilePipeline:
                             {
                                 "job_id": job_id,
                                 "size": actual_size,
-                                "path": input_s3_key if self._storage is not None else temp_path,
+                                "path": input_s3_key
+                                if self._storage is not None
+                                else temp_path,
                                 "chat_id": chat_id,
                                 "message_id": message_id,
                             },
@@ -196,8 +222,13 @@ class BigFilePipeline:
                         pass
 
             except Exception as e:
-                logger.exception("BigFilePipeline: userbot download error: %s", e)
-                return IngestResult(ok=False, error="Userbot download failed. Check server logs for details.")
+                logger.exception(
+                    "BigFilePipeline: userbot download error: %s", e
+                )
+                return IngestResult(
+                    ok=False,
+                    error="Userbot download failed. Check server logs for details.",
+                )
 
             # Upload to S3
             try:
@@ -207,7 +238,11 @@ class BigFilePipeline:
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
                     except Exception as cleanup_err:
-                        logger.warning("BigFilePipeline: failed to clean up temp file %s: %s", temp_path, cleanup_err)
+                        logger.warning(
+                            "BigFilePipeline: failed to clean up temp file %s: %s",
+                            temp_path,
+                            cleanup_err,
+                        )
                 else:
                     s3_key = temp_path
             except Exception as e:
@@ -225,7 +260,8 @@ class BigFilePipeline:
                 "chat_id": chat_id,
                 "user_id": user_id,
                 "message_id": message_id,
-                "original_filename": original_filename or f"file_{job_id}{ext}",
+                "original_filename": original_filename
+                or f"file_{job_id}{ext}",
                 "file_unique_id": file_unique_id,
                 "file_size": actual_size,
                 "progress_channel": f"pdf:progress:{job_id}",
@@ -235,13 +271,20 @@ class BigFilePipeline:
             }
 
             await enqueue_job(job)
-            logger.info("BigFilePipeline: job %s enqueued (input_key=%s)", job_id, s3_key)
+            logger.info(
+                "BigFilePipeline: job %s enqueued (input_key=%s)",
+                job_id,
+                s3_key,
+            )
 
             return IngestResult(ok=True, job_id=job_id, s3_key=s3_key)
 
         except Exception as e:
             logger.exception("BigFilePipeline: enqueue failed: %s", e)
-            return IngestResult(ok=False, error="Enqueue failed. Check server logs for details.")
+            return IngestResult(
+                ok=False,
+                error="Enqueue failed. Check server logs for details.",
+            )
 
     async def _download_via_userbot(
         self, chat_id: int, message_id: int, dest_path: str
@@ -249,6 +292,7 @@ class BigFilePipeline:
         """Download a message using userbot."""
         try:
             from utils.userbot_downloader import download_forward_via_userbot
+
             ok = await download_forward_via_userbot(
                 chat_id=chat_id,
                 message_id=message_id,

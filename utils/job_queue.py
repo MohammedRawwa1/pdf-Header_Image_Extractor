@@ -27,7 +27,9 @@ async def enqueue_job(job: dict) -> None:
             job["input_path"] = job["input_path"].replace("\\", "/")
     if job.get("output_path"):
         try:
-            job["output_path"] = pathlib.PurePath(job["output_path"]).as_posix()
+            job["output_path"] = pathlib.PurePath(
+                job["output_path"]
+            ).as_posix()
         except Exception:
             job["output_path"] = job["output_path"].replace("\\", "/")
 
@@ -44,7 +46,10 @@ async def enqueue_job(job: dict) -> None:
                 "status": "queued",
                 "progress": 0,
                 "message": "queued",
-                "input": job.get("input_path") or job.get("input_key") or job.get("source_url") or "",
+                "input": job.get("input_path")
+                or job.get("input_key")
+                or job.get("source_url")
+                or "",
                 "input_key": job.get("input_key") or "",
                 "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
@@ -63,7 +68,13 @@ async def enqueue_job(job: dict) -> None:
             try:
                 src = mapping.get("input")
                 out = mapping.get("output")
-                logging.getLogger(__name__).info("Prepared job %s request_id=%s input=%s output=%s", job_id, mapping.get("request_id"), src, out)
+                logging.getLogger(__name__).info(
+                    "Prepared job %s request_id=%s input=%s output=%s",
+                    job_id,
+                    mapping.get("request_id"),
+                    src,
+                    out,
+                )
             except Exception:
                 pass
     except Exception:
@@ -73,7 +84,10 @@ async def enqueue_job(job: dict) -> None:
         await r.lpush(JOB_LIST, json.dumps(job))
     except Exception:
         try:
-            logging.getLogger(__name__).exception("Failed to push job onto Redis list for job %s", job.get("job_id"))
+            logging.getLogger(__name__).exception(
+                "Failed to push job onto Redis list for job %s",
+                job.get("job_id"),
+            )
         except Exception:
             pass
     except Exception:

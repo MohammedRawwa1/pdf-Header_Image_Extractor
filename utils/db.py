@@ -54,10 +54,10 @@ COL_BATCHES = "forward_batches"
 COL_TELETHON = "telethon_forwards"
 
 # TTL in seconds
-TTL_JOBS = 7 * 24 * 3600          # 7 days
-TTL_SESSIONS = 30 * 24 * 3600     # 30 days
-TTL_BATCHES = 24 * 3600           # 24 hours
-TTL_TELETHON = 7 * 24 * 3600      # 7 days
+TTL_JOBS = 7 * 24 * 3600  # 7 days
+TTL_SESSIONS = 30 * 24 * 3600  # 30 days
+TTL_BATCHES = 24 * 3600  # 24 hours
+TTL_TELETHON = 7 * 24 * 3600  # 7 days
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -71,27 +71,68 @@ TTL_TELETHON = 7 * 24 * 3600      # 7 days
 
 _ALLOWED_FIELDS: dict[str, set] = {
     COL_JOBS: {
-        "job_id", "status", "created_at", "updated_at",
-        "io_in", "io_out", "type", "unique_id",
-        "error", "timestamps", "durations", "sizes",
-        "s3", "tg_response", "file_id", "file_unique_id",
-        "filename", "mime", "chat_id", "message_id",
-        "forward_info", "enqueued_at", "bot_id",
+        "job_id",
+        "status",
+        "created_at",
+        "updated_at",
+        "io_in",
+        "io_out",
+        "type",
+        "unique_id",
+        "error",
+        "timestamps",
+        "durations",
+        "sizes",
+        "s3",
+        "tg_response",
+        "file_id",
+        "file_unique_id",
+        "filename",
+        "mime",
+        "chat_id",
+        "message_id",
+        "forward_info",
+        "enqueued_at",
+        "bot_id",
     },
     COL_SESSIONS: {
-        "user_id", "username", "first_name", "last_name",
-        "chat_id", "chat_type", "last_action", "last_seen",
-        "last_active", "created_at", "is_owner", "is_admin",
-        "telethon_session", "pyrogram_session", "string_session",
-        "logged_out", "logged_out_at",
+        "user_id",
+        "username",
+        "first_name",
+        "last_name",
+        "chat_id",
+        "chat_type",
+        "last_action",
+        "last_seen",
+        "last_active",
+        "created_at",
+        "is_owner",
+        "is_admin",
+        "telethon_session",
+        "pyrogram_session",
+        "string_session",
+        "logged_out",
+        "logged_out_at",
     },
     COL_BATCHES: {
-        "chat_id", "user_id", "items", "count", "created_at",
+        "chat_id",
+        "user_id",
+        "items",
+        "count",
+        "created_at",
     },
     COL_TELETHON: {
-        "job_id", "chat_id", "message_id", "file_id",
-        "file_unique_id", "filename", "size", "mime",
-        "input_key", "original_filename", "cleanup_input",
+        "job_id",
+        "chat_id",
+        "message_id",
+        "file_id",
+        "file_unique_id",
+        "filename",
+        "size",
+        "mime",
+        "input_key",
+        "original_filename",
+        "cleanup_input",
         "created_at",
     },
 }
@@ -137,14 +178,20 @@ def _validate_value(value: Any) -> Any:
     """
     if isinstance(value, str):
         # If a string looks like a MongoDB operator ($ne, $gt, etc.), strip it
-        if value.startswith('$') and len(value) > 1 and value[1:].isalnum():
-            logger.warning("NoSQL injection prevention: stripped operator-like value '%s'", value)
-            return '_' + value[1:]
+        if value.startswith("$") and len(value) > 1 and value[1:].isalnum():
+            logger.warning(
+                "NoSQL injection prevention: stripped operator-like value '%s'",
+                value,
+            )
+            return "_" + value[1:]
         # Limit string length to 10MB max (MongoDB BSON limit)
         return value[:10_000_000]
     elif isinstance(value, dict):
-        return {k: _validate_value(v) for k, v in value.items()
-                if not k.startswith('$')}  # Strip $ keys from dicts
+        return {
+            k: _validate_value(v)
+            for k, v in value.items()
+            if not k.startswith("$")
+        }  # Strip $ keys from dicts
     elif isinstance(value, list):
         return [_validate_value(v) for v in value]
     return value
@@ -157,10 +204,13 @@ def _sanitize_doc(doc: dict) -> dict:
     """
     sanitized = {}
     for key, value in doc.items():
-        if key.startswith('$'):
-            logger.warning("NoSQL injection prevention: stripped key starting with '$': '%s'", key)
+        if key.startswith("$"):
+            logger.warning(
+                "NoSQL injection prevention: stripped key starting with '$': '%s'",
+                key,
+            )
             continue
-        safe_key = key.replace('.', '_')
+        safe_key = key.replace(".", "_")
         sanitized[safe_key] = _validate_value(value)
     return sanitized
 
@@ -200,7 +250,9 @@ class MongoQueryBuilder:
         """
         self._collection = collection
         self._db = db_session
-        self._filters: list[dict[str, Any]] = []      # where clauses (parameterized)
+        self._filters: list[
+            dict[str, Any]
+        ] = []  # where clauses (parameterized)
         self._projection: dict[str, int] | None = None  # select fields
         self._sort_field: str | None = None
         self._sort_order: int = -1
@@ -209,7 +261,9 @@ class MongoQueryBuilder:
 
     # ── Public API: Query building (method chaining) ──────────
 
-    def where(self, field: str, operator: str, value: Any) -> "MongoQueryBuilder":
+    def where(
+        self, field: str, operator: str, value: Any
+    ) -> "MongoQueryBuilder":
         """Add a WHERE clause to the query (parameterized).
 
         Like Laravel: ->where('field', '=', value)
@@ -229,26 +283,28 @@ class MongoQueryBuilder:
 
         # Map Laravel-style operators to MongoDB operators
         op_map = {
-            '=': '$eq',
-            '!=': '$ne',
-            '>': '$gt',
-            '>=': '$gte',
-            '<': '$lt',
-            '<=': '$lte',
-            'in': '$in',
-            'nin': '$nin',
+            "=": "$eq",
+            "!=": "$ne",
+            ">": "$gt",
+            ">=": "$gte",
+            "<": "$lt",
+            "<=": "$lte",
+            "in": "$in",
+            "nin": "$nin",
         }
         mongo_op = op_map.get(operator)
         if mongo_op is None:
-            raise ValueError(f"Unsupported operator '{operator}'. "
-                             f"Use: =, !=, >, >=, <, <=, in, nin")
+            raise ValueError(
+                f"Unsupported operator '{operator}'. "
+                f"Use: =, !=, >, >=, <, <=, in, nin"
+            )
 
-        if operator == '=':
+        if operator == "=":
             # Simple equality (most common case)
             self._filters.append({field: safe_value})
-        elif operator == 'in':
+        elif operator == "in":
             self._filters.append({field: {mongo_op: safe_value}})
-        elif operator == 'nin':
+        elif operator == "nin":
             self._filters.append({field: {mongo_op: safe_value}})
         else:
             self._filters.append({field: {mongo_op: safe_value}})
@@ -260,11 +316,11 @@ class MongoQueryBuilder:
 
         Like Laravel: ->whereIn('field', [1, 2, 3])
         """
-        return self.where(field, 'in', values)
+        return self.where(field, "in", values)
 
     def where_nin(self, field: str, values: list[Any]) -> "MongoQueryBuilder":
         """Add a WHERE NOT IN clause."""
-        return self.where(field, 'nin', values)
+        return self.where(field, "nin", values)
 
     def select(self, *fields: str) -> "MongoQueryBuilder":
         """Specify which fields to return (projection).
@@ -278,12 +334,14 @@ class MongoQueryBuilder:
             _validate_field(f, self._collection)
             proj[f] = 1
         # Exclude _id by default unless explicitly asked for
-        if '_id' not in proj:
-            proj['_id'] = 0
+        if "_id" not in proj:
+            proj["_id"] = 0
         self._projection = proj
         return self
 
-    def order_by(self, field: str, direction: str = "desc") -> "MongoQueryBuilder":
+    def order_by(
+        self, field: str, direction: str = "desc"
+    ) -> "MongoQueryBuilder":
         """Add an ORDER BY clause.
 
         Like Laravel: ->orderBy('created_at', 'desc')
@@ -341,7 +399,8 @@ class MongoQueryBuilder:
             except ValueError:
                 logger.warning(
                     "MongoQueryBuilder: skipping field '%s' not in whitelist for '%s'",
-                    key, self._collection,
+                    key,
+                    self._collection,
                 )
                 continue
             validated[key] = _validate_value(value)
@@ -425,12 +484,16 @@ class MongoQueryBuilder:
         try:
             set_data = self._validate_doc(data)
             if not set_data:
-                logger.warning("MongoQueryBuilder.update: no valid fields to update")
+                logger.warning(
+                    "MongoQueryBuilder.update: no valid fields to update"
+                )
                 return False
             set_data["updated_at"] = time.time()
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("MongoQueryBuilder.update: no WHERE clause — refusing to update all documents")
+                logger.warning(
+                    "MongoQueryBuilder.update: no WHERE clause — refusing to update all documents"
+                )
                 return False
             result = await self._db[self._collection].update_one(
                 filter_query,
@@ -453,14 +516,18 @@ class MongoQueryBuilder:
         try:
             set_data = self._validate_doc(data)
             if not set_data:
-                logger.warning("MongoQueryBuilder.upsert: no valid fields to set")
+                logger.warning(
+                    "MongoQueryBuilder.upsert: no valid fields to set"
+                )
                 return False
             set_data["updated_at"] = time.time()
             if "created_at" not in set_data:
                 set_data["created_at"] = time.time()
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("MongoQueryBuilder.upsert: no WHERE clause — refusing to upsert all documents")
+                logger.warning(
+                    "MongoQueryBuilder.upsert: no WHERE clause — refusing to upsert all documents"
+                )
                 return False
             result = await self._db[self._collection].update_one(
                 filter_query,
@@ -484,7 +551,9 @@ class MongoQueryBuilder:
         try:
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("MongoQueryBuilder.delete: no WHERE clause — refusing to delete all documents")
+                logger.warning(
+                    "MongoQueryBuilder.delete: no WHERE clause — refusing to delete all documents"
+                )
                 return False
             result = await self._db[self._collection].delete_one(filter_query)
             return result.deleted_count > 0
@@ -503,7 +572,9 @@ class MongoQueryBuilder:
         try:
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("MongoQueryBuilder.delete_many: no WHERE clause — refusing")
+                logger.warning(
+                    "MongoQueryBuilder.delete_many: no WHERE clause — refusing"
+                )
                 return 0
             result = await self._db[self._collection].delete_many(filter_query)
             return result.deleted_count
@@ -520,7 +591,9 @@ class MongoQueryBuilder:
             return 0
         try:
             query_filter = self._build_filter()
-            return await self._db[self._collection].count_documents(query_filter)
+            return await self._db[self._collection].count_documents(
+                query_filter
+            )
         except Exception as e:
             logger.debug("MongoQueryBuilder.count failed: %s", e)
             return 0
@@ -612,36 +685,50 @@ class SyncMongoQueryBuilder:
 
     # ── Public API: Query building (method chaining) ──────────
 
-    def where(self, field: str, operator: str, value: Any) -> "SyncMongoQueryBuilder":
+    def where(
+        self, field: str, operator: str, value: Any
+    ) -> "SyncMongoQueryBuilder":
         """Add a WHERE clause with parameter binding."""
         _validate_field(field, self._collection)
         safe_value = _validate_value(value)
 
         op_map = {
-            '=': '$eq', '!=': '$ne', '>': '$gt', '>=': '$gte',
-            '<': '$lt', '<=': '$lte', 'in': '$in', 'nin': '$nin',
+            "=": "$eq",
+            "!=": "$ne",
+            ">": "$gt",
+            ">=": "$gte",
+            "<": "$lt",
+            "<=": "$lte",
+            "in": "$in",
+            "nin": "$nin",
         }
         mongo_op = op_map.get(operator)
         if mongo_op is None:
-            raise ValueError(f"Unsupported operator '{operator}'. "
-                             f"Use: =, !=, >, >=, <, <=, in, nin")
+            raise ValueError(
+                f"Unsupported operator '{operator}'. "
+                f"Use: =, !=, >, >=, <, <=, in, nin"
+            )
 
-        if operator == '=':
+        if operator == "=":
             self._filters.append({field: safe_value})
-        elif operator in ('in', 'nin'):
+        elif operator in ("in", "nin"):
             self._filters.append({field: {mongo_op: safe_value}})
         else:
             self._filters.append({field: {mongo_op: safe_value}})
 
         return self
 
-    def where_in(self, field: str, values: list[Any]) -> "SyncMongoQueryBuilder":
+    def where_in(
+        self, field: str, values: list[Any]
+    ) -> "SyncMongoQueryBuilder":
         """Add a WHERE IN clause."""
-        return self.where(field, 'in', values)
+        return self.where(field, "in", values)
 
-    def where_nin(self, field: str, values: list[Any]) -> "SyncMongoQueryBuilder":
+    def where_nin(
+        self, field: str, values: list[Any]
+    ) -> "SyncMongoQueryBuilder":
         """Add a WHERE NOT IN clause."""
-        return self.where(field, 'nin', values)
+        return self.where(field, "nin", values)
 
     def select(self, *fields: str) -> "SyncMongoQueryBuilder":
         """Specify which fields to return (projection)."""
@@ -649,12 +736,14 @@ class SyncMongoQueryBuilder:
         for f in fields:
             _validate_field(f, self._collection)
             proj[f] = 1
-        if '_id' not in proj:
-            proj['_id'] = 0
+        if "_id" not in proj:
+            proj["_id"] = 0
         self._projection = proj
         return self
 
-    def order_by(self, field: str, direction: str = "desc") -> "SyncMongoQueryBuilder":
+    def order_by(
+        self, field: str, direction: str = "desc"
+    ) -> "SyncMongoQueryBuilder":
         """Add an ORDER BY clause."""
         _validate_field(field, self._collection)
         self._sort_field = field
@@ -700,7 +789,8 @@ class SyncMongoQueryBuilder:
             except ValueError:
                 logger.warning(
                     "SyncMongoQueryBuilder: skipping field '%s' not in whitelist for '%s'",
-                    key, self._collection,
+                    key,
+                    self._collection,
                 )
                 continue
             validated[key] = _validate_value(value)
@@ -769,14 +859,20 @@ class SyncMongoQueryBuilder:
         try:
             set_data = self._validate_doc(data)
             if not set_data:
-                logger.warning("SyncMongoQueryBuilder.update: no valid fields to update")
+                logger.warning(
+                    "SyncMongoQueryBuilder.update: no valid fields to update"
+                )
                 return False
             set_data["updated_at"] = time.time()
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("SyncMongoQueryBuilder.update: no WHERE clause — refusing")
+                logger.warning(
+                    "SyncMongoQueryBuilder.update: no WHERE clause — refusing"
+                )
                 return False
-            result = self._db[self._collection].update_one(filter_query, {"$set": set_data})
+            result = self._db[self._collection].update_one(
+                filter_query, {"$set": set_data}
+            )
             return result.modified_count > 0 or result.upserted_id is not None
         except Exception as e:
             logger.debug("SyncMongoQueryBuilder.update failed: %s", e)
@@ -789,14 +885,18 @@ class SyncMongoQueryBuilder:
         try:
             set_data = self._validate_doc(data)
             if not set_data:
-                logger.warning("SyncMongoQueryBuilder.upsert: no valid fields to set")
+                logger.warning(
+                    "SyncMongoQueryBuilder.upsert: no valid fields to set"
+                )
                 return False
             set_data["updated_at"] = time.time()
             if "created_at" not in set_data:
                 set_data["created_at"] = time.time()
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("SyncMongoQueryBuilder.upsert: no WHERE clause — refusing")
+                logger.warning(
+                    "SyncMongoQueryBuilder.upsert: no WHERE clause — refusing"
+                )
                 return False
             result = self._db[self._collection].update_one(
                 filter_query,
@@ -815,7 +915,9 @@ class SyncMongoQueryBuilder:
         try:
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("SyncMongoQueryBuilder.delete: no WHERE clause — refusing")
+                logger.warning(
+                    "SyncMongoQueryBuilder.delete: no WHERE clause — refusing"
+                )
                 return False
             result = self._db[self._collection].delete_one(filter_query)
             return result.deleted_count > 0
@@ -830,7 +932,9 @@ class SyncMongoQueryBuilder:
         try:
             filter_query = self._build_filter()
             if not filter_query:
-                logger.warning("SyncMongoQueryBuilder.delete_many: no WHERE clause — refusing")
+                logger.warning(
+                    "SyncMongoQueryBuilder.delete_many: no WHERE clause — refusing"
+                )
                 return 0
             result = self._db[self._collection].delete_many(filter_query)
             return result.deleted_count
@@ -890,6 +994,7 @@ def sync_query(collection: str, db_session=None) -> SyncMongoQueryBuilder:
 
 # ── Helpers ───────────────────────────────────────────────────
 
+
 def get_db_name() -> str:
     """Return the MongoDB database name."""
     return os.environ.get("MONGODB_NAME", DEFAULT_DB_NAME)
@@ -917,6 +1022,7 @@ async def get_db():
 
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
+
         _client = AsyncIOMotorClient(
             uri,
             serverSelectionTimeoutMS=5000,
@@ -941,9 +1047,7 @@ async def get_db():
 async def _ensure_indexes(db):
     """Create TTL and unique indexes on all collections."""
     try:
-        await db[COL_JOBS].create_index(
-            "job_id", unique=True, background=True
-        )
+        await db[COL_JOBS].create_index("job_id", unique=True, background=True)
         await db[COL_JOBS].create_index(
             "created_at", expireAfterSeconds=TTL_JOBS, background=True
         )
@@ -987,6 +1091,7 @@ def get_sync_db():
 
     try:
         import pymongo
+
         _sync_pymongo_client = pymongo.MongoClient(
             uri,
             serverSelectionTimeoutMS=5000,
@@ -1038,6 +1143,7 @@ def close_sync_db():
 # Stores RQ job lifecycle, io metadata, progress, and errors.
 # Keyed by job_id (unique).
 
+
 async def save_job_metadata(job_id: str, meta: dict[str, Any]) -> bool:
     """Persist job metadata (io:in, io:out, progress) to MongoDB.
 
@@ -1049,7 +1155,11 @@ async def save_job_metadata(job_id: str, meta: dict[str, Any]) -> bool:
         return False
     try:
         meta["job_id"] = str(job_id)
-        return await query(COL_JOBS, db).where("job_id", "=", str(job_id)).upsert(meta)
+        return (
+            await query(COL_JOBS, db)
+            .where("job_id", "=", str(job_id))
+            .upsert(meta)
+        )
     except Exception as e:
         logger.debug("db: save_job_metadata failed for %s: %s", job_id, e)
         return False
@@ -1064,7 +1174,9 @@ async def get_job_metadata(job_id: str) -> dict[str, Any] | None:
     if not db:
         return None
     try:
-        return await query(COL_JOBS, db).where("job_id", "=", str(job_id)).first()
+        return (
+            await query(COL_JOBS, db).where("job_id", "=", str(job_id)).first()
+        )
     except Exception as e:
         logger.debug("db: get_job_metadata failed for %s: %s", job_id, e)
         return None
@@ -1080,13 +1192,19 @@ async def update_job_metadata(job_id: str, fields: dict[str, Any]) -> bool:
     if not db:
         return False
     try:
-        return await query(COL_JOBS, db).where("job_id", "=", str(job_id)).update(fields)
+        return (
+            await query(COL_JOBS, db)
+            .where("job_id", "=", str(job_id))
+            .update(fields)
+        )
     except Exception as e:
         logger.debug("db: update_job_metadata failed for %s: %s", job_id, e)
         return False
 
 
-async def list_jobs(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+async def list_jobs(
+    status: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
     """List recent jobs, optionally filtered by status.
 
     Uses prepared statement parameter binding for the status filter.
@@ -1119,7 +1237,10 @@ async def count_jobs() -> int:
 # Tracks user interactions: last action, last seen, role flags.
 # Keyed by user_id (unique).
 
-async def save_user_session(user_id: int, session_data: dict[str, Any]) -> bool:
+
+async def save_user_session(
+    user_id: int, session_data: dict[str, Any]
+) -> bool:
     """Persist user session data to MongoDB.
 
     Uses prepared statement parameter binding.
@@ -1130,7 +1251,11 @@ async def save_user_session(user_id: int, session_data: dict[str, Any]) -> bool:
         return False
     try:
         session_data["user_id"] = user_id
-        return await query(COL_SESSIONS, db).where("user_id", "=", int(user_id)).upsert(session_data)
+        return (
+            await query(COL_SESSIONS, db)
+            .where("user_id", "=", int(user_id))
+            .upsert(session_data)
+        )
     except Exception as e:
         logger.debug("db: save_user_session failed for %s: %s", user_id, e)
         return False
@@ -1145,7 +1270,11 @@ async def get_user_session(user_id: int) -> dict[str, Any] | None:
     if not db:
         return None
     try:
-        return await query(COL_SESSIONS, db).where("user_id", "=", int(user_id)).first()
+        return (
+            await query(COL_SESSIONS, db)
+            .where("user_id", "=", int(user_id))
+            .first()
+        )
     except Exception as e:
         logger.debug("db: get_user_session failed for %s: %s", user_id, e)
         return None
@@ -1157,7 +1286,12 @@ async def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     if not db:
         return []
     try:
-        return await query(COL_SESSIONS, db).order_by("last_active", "desc").limit(limit).get()
+        return (
+            await query(COL_SESSIONS, db)
+            .order_by("last_active", "desc")
+            .limit(limit)
+            .get()
+        )
     except Exception:
         return []
 
@@ -1177,6 +1311,7 @@ async def count_sessions() -> int:
 # Stores /startbatch forwarded file lists.
 # Keyed by (chat_id, user_id).
 
+
 async def save_forward_batch(chat_id: int, user_id: int, items: list) -> bool:
     """Persist forward batch metadata to MongoDB.
 
@@ -1194,7 +1329,12 @@ async def save_forward_batch(chat_id: int, user_id: int, items: list) -> bool:
             "items": items,
             "count": len(items),
         }
-        return await query(COL_BATCHES, db).where("chat_id", "=", int(chat_id)).where("user_id", "=", int(user_id)).upsert(doc)
+        return (
+            await query(COL_BATCHES, db)
+            .where("chat_id", "=", int(chat_id))
+            .where("user_id", "=", int(user_id))
+            .upsert(doc)
+        )
     except Exception as e:
         logger.debug("db: save_forward_batch failed: %s", e)
         return False
@@ -1209,7 +1349,13 @@ async def get_forward_batch(chat_id: int, user_id: int) -> list | None:
     if not db:
         return None
     try:
-        result = await query(COL_BATCHES, db).where("chat_id", "=", int(chat_id)).where("user_id", "=", int(user_id)).select("items").first()
+        result = (
+            await query(COL_BATCHES, db)
+            .where("chat_id", "=", int(chat_id))
+            .where("user_id", "=", int(user_id))
+            .select("items")
+            .first()
+        )
         return result.get("items") if result else None
     except Exception as e:
         logger.debug("db: get_forward_batch failed: %s", e)
@@ -1225,7 +1371,12 @@ async def delete_forward_batch(chat_id: int, user_id: int) -> bool:
     if not db:
         return False
     try:
-        return await query(COL_BATCHES, db).where("chat_id", "=", int(chat_id)).where("user_id", "=", int(user_id)).delete()
+        return (
+            await query(COL_BATCHES, db)
+            .where("chat_id", "=", int(chat_id))
+            .where("user_id", "=", int(user_id))
+            .delete()
+        )
     except Exception as e:
         logger.debug("db: delete_forward_batch failed: %s", e)
         return False
@@ -1234,6 +1385,7 @@ async def delete_forward_batch(chat_id: int, user_id: int) -> bool:
 # ── Telethon Forwards ─────────────────────────────────────────
 # Stores metadata from Telethon userbot ingestion.
 # Keyed by job_id, appended (not upserted).
+
 
 async def save_telethon_forward(job: dict) -> bool:
     """Save Telethon forward metadata to MongoDB.
@@ -1266,6 +1418,7 @@ async def count_telethon_forwards() -> int:
 
 
 # ── Diagnostics ───────────────────────────────────────────────
+
 
 async def db_stats() -> dict[str, Any]:
     """Return a summary of all collection sizes."""

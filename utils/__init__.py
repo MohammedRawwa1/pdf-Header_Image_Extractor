@@ -1,14 +1,12 @@
 # utils/__init__.py
 """Utilities package for PDF header image extractor bot."""
 
-# ruff: noqa: F401 - re-exports are intentionally imported for package API surface
-
-from .cache import (
+from .cache import (  # noqa: F401
     RedisCache,
     close_cache,
     get_cache,
 )
-from .db import (
+from .db import (  # noqa: F401
     close_db,
     delete_forward_batch,
     get_db,
@@ -21,18 +19,18 @@ from .db import (
     save_user_session,
     update_job_metadata,
 )
-from .error_handler import (
+from .error_handler import (  # noqa: F401
     BotErrorHandler,
     async_error_handler,
     get_error_handler,
     handle_bot_error,
 )
-from .rate_limiter import (
+from .rate_limiter import (  # noqa: F401
     ConversionRateLimiter,
     RateLimiter,
     TelegramAPIRateLimiter,
 )
-from .telethon_session import (
+from .telethon_session import (  # noqa: F401
     build_pyrogram_client,
     build_telethon_client,
     get_pyrogram_session_string,
