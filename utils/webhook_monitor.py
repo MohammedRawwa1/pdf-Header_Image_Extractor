@@ -1,5 +1,5 @@
 # utils/webhook_monitor.py
-"""Webhook heartbeat monitoring for bot reliability and Render spin-down prevention."""
+"""Webhook heartbeat monitoring for bot reliability and free-tier spin-down prevention."""
 
 import asyncio
 import logging

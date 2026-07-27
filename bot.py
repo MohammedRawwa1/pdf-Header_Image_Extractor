@@ -3172,7 +3172,7 @@ async def on_startup() -> None:
     except Exception as e:
         logger.warning("Cleanup manager not started: %s", e)
 
-    # ── Keep-alive heartbeat to prevent Render free-tier spin-down ──
+    # ── Keep-alive heartbeat to prevent free-tier spin-down ──
     try:
         _ka_disabled = os.getenv("KEEP_ALIVE_DISABLED", "").lower() in (
             "1",
@@ -3180,11 +3180,11 @@ async def on_startup() -> None:
             "yes",
         )
         if not _ka_disabled:
-            _ka_url = (
-                os.getenv("KEEP_ALIVE_URL")
-                or os.getenv("RENDER_EXTERNAL_URL")
-                or ""
-            )
+            _ka_url = os.getenv("KEEP_ALIVE_URL") or ""
+            if not _ka_url:
+                _railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+                if _railway_domain:
+                    _ka_url = f"https://{_railway_domain}"
             if not _ka_url and WEBHOOK_URL:
                 try:
                     parsed_ka = urlparse(WEBHOOK_URL)
@@ -3246,7 +3246,7 @@ async def on_startup() -> None:
                 logger.info("Keep-alive heartbeat scheduled")
             else:
                 logger.info(
-                    "Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, RENDER_EXTERNAL_URL, or WEBHOOK_URL)"
+                    "Keep-alive heartbeat disabled: no public URL available (set KEEP_ALIVE_URL, WEBHOOK_URL, or RAILWAY_PUBLIC_DOMAIN)"
                 )
     except Exception as _ka_err:
         logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
@@ -3301,7 +3301,7 @@ async def on_shutdown() -> None:
             pass
 
         # CRITICAL: Do NOT delete the webhook on shutdown.
-        # On Render free tier, the webhook must persist so Telegram can
+        # On free-tier platforms, the webhook must persist so Telegram can
         # wake the service back up on the next incoming message.
         if USE_POLLING:
             await application.stop()

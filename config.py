@@ -2,7 +2,12 @@ import os
 
 # Core
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+# WEBHOOK_URL: explicitly set, or auto-derived from Railway's RAILWAY_PUBLIC_DOMAIN
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+if not WEBHOOK_URL:
+    _railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    if _railway_domain:
+        WEBHOOK_URL = f"https://{_railway_domain}"
 USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in (
     "1",
     "true",

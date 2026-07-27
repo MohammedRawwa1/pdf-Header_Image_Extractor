@@ -50,7 +50,7 @@ def run_worker():
     except Exception as e:
         print("WORKER: exception in run_worker:", e, flush=True)
         traceback.print_exc()
-        # re-raise so the process exits (Render will show the traceback in logs)
+        # re-raise so the process exits (logs will show the traceback)
         raise
 
 

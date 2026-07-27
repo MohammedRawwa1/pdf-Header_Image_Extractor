@@ -21,7 +21,7 @@ DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
 # Files up to this size get streamed through memory instead of temp disk.
-# Default is 200MB — safe for Render free tier (512MB RAM).
+# Default is 200MB — safe for Railway free tier (512MB RAM).
 # Increase via BIGFILE_IN_MEMORY_MAX_MB (e.g., 1024 for 1GB) if your server has more RAM.
 # Files above this threshold fall back to disk-based download → S3 upload.
 #

@@ -1,6 +1,6 @@
 # PDF Header / Cover Image Extractor Bot
 
-A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>50MB) via userbot fallback and runs as a FastAPI webhook service on Render.
+A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>50MB) via userbot fallback and runs as a FastAPI webhook service on Railway.
 
 ## Features
 
@@ -8,7 +8,7 @@ A Telegram bot that extracts a header/cover image (first PDF page) and generates
 - **Automatic Thumb Detection** — Uses visual entropy to pick the most relevant page
 - **Big PDF Support** — Handles files >50MB via Telethon/Pyrogram userbot download
 - **Progress Tracking** — Real-time download/upload progress bars
-- **Keep-Alive Heartbeat** — Prevents Render free-tier spin-down (15min inactivity)
+- **Keep-Alive Heartbeat** — Prevents free-tier spin-down (15min inactivity)
 - **Background Worker** — In-process RQ worker for job processing
 - **S3/R2 Storage** — Optional cloud storage fallback for large files
 - **Owner-Only Security** — `/s` webhook commands protected by `OWNER_ID`
@@ -20,7 +20,7 @@ A Telegram bot that extracts a header/cover image (first PDF page) and generates
 | Variable | Description |
 |----------|-------------|
 | `BOT_TOKEN` | Telegram bot token |
-| `WEBHOOK_URL` | Public URL for webhook (e.g. `https://your-app.onrender.com`) |
+| `WEBHOOK_URL` | Public URL for webhook (auto-derived from Railway's `RAILWAY_PUBLIC_DOMAIN` if left empty) |
 
 ### Optional — Core
 
@@ -171,30 +171,29 @@ docker run \
   pdf-bot:latest
 ```
 
-## Render Deployment
+## Railway Deployment
 
 1. Push to GitHub
-2. Create Web Service → Docker environment
-3. Set env vars: `BOT_TOKEN`, `WEBHOOK_URL`, `USE_POLLING=false`
-4. Deploy — webhook auto-set on startup
+2. Create a new **Service** from your GitHub repo in Railway
+3. Railway auto-detects the `Dockerfile` — no build config needed
+4. Add a domain under **Settings → Networking** → Generate Domain
+5. Set the required environment variables in the dashboard (see below)
+6. Deploy — webhook auto-sets on startup
 
-### Render Environment Variables
+### Key Environment Variables
 
-```yaml
-envVars:
-  - key: BOT_TOKEN
-    sync: false  # secret
-  - key: WEBHOOK_URL
-    value: "https://your-app.onrender.com"
-  - key: OWNER_ID
-    sync: false  # your Telegram user ID
-  - key: REDIS_URL
-    sync: false  # from Render Redis addon
-  - key: RUN_WORKER_IN_PROC
-    value: "true"
-  - key: KEEP_ALIVE_INTERVAL
-    value: "600"
-```
+Configure these in the Railway dashboard under **Variables**:
+
+| Variable | Description |
+|----------|-------------|
+| `BOT_TOKEN` | Your Telegram bot token (secret) |
+| `WEBHOOK_URL` | `https://your-app.up.railway.app` (auto-derived from Railway if left unset) |
+| `OWNER_ID` | Your Telegram user ID (secret) |
+| `REDIS_URL` | From a Railway Redis addon |
+| `RUN_WORKER_IN_PROC` | `true` to run the worker in-process |
+| `KEEP_ALIVE_INTERVAL` | `600` seconds between pings |
+
+> **Tip:** For separate background workers, create additional Services with start commands `python worker.py` and `python pipeline_worker.py`. All services share the same project variables.
 
 ## Big PDF Pipeline
 
@@ -252,7 +251,7 @@ The bot shows real-time progress bars for download/upload operations:
 ├── storage.py          # S3/local storage backend
 ├── requirements.txt    # Python dependencies
 ├── Dockerfile          # Docker build
-├── render.yaml         # Render deployment config
+├── railway.json         # Railway deployment config
 ├── utils/
 │   ├── __init__.py
 │   ├── telethon_session.py    # Telethon/Pyrogram session mgmt

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  },
+  "services": [
+    {
+      "name": "pdf-header-image-bot",
+      "description": "FastAPI webhook service + in-process RQ worker",
+      "startCommand": "uvicorn bot:app --host 0.0.0.0 --port $PORT --log-level ${LOG_LEVEL:-info}"
+    },
+    {
+      "name": "pdf-header-image-worker",
+      "description": "RQ background worker for job processing",
+      "startCommand": "python worker.py"
+    },
+    {
+      "name": "pdf-header-image-pipeline-worker",
+      "description": "Pipeline worker for large file processing via S3",
+      "startCommand": "python pipeline_worker.py"
+    }
+  ]
+}

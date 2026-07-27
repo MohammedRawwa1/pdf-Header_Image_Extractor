@@ -127,7 +127,7 @@ async def create_session(
         print(f"{'=' * 60}")
         print("\nSet this as an environment variable on your server:")
         print(f"  PYROGRAM_SESSION='{session_string[:50]}...'")
-        print("\nOr if using Render, add it as a secret environment variable.")
+        print("\nOr if using Railway, add it as a secret environment variable.")
         print(f"\n{'=' * 60}")
         print("⚠️  SECURITY: The session string is a full login token.")
         print("   Never commit it to Git. Delete the .txt file after use.")
