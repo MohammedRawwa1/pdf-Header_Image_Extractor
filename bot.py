@@ -67,6 +67,7 @@ from config import OWNER_ID  # noqa: E402
 from tools import (  # noqa: E402
     create_thumbnail_from_image,
     create_thumbnail_from_pdf,
+    is_supported_format,
     is_valid_pdf,
 )
 from utils.bigfile_pipeline import BigFilePipeline  # noqa: E402
@@ -794,6 +795,25 @@ async def handle_document(
     chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
     filename = _sanitize_filename(doc.file_name, f"file_{doc.file_id}")
     mime = getattr(doc, "mime_type", "") or ""
+
+    # ── Early format validation: check → validate → compare → process ──
+    # Reject unsupported formats (video files like MKV, AVI, etc.) BEFORE any
+    # download, relay forwarding, enqueue, or thumbnail processing.
+    if not is_supported_format(filename, mime):
+        logger.info(
+            "Rejected unsupported format: filename=%s mime=%s chat_id=%s user_id=%s",
+            filename,
+            mime,
+            chat_id,
+            getattr(update.effective_user, "id", None),
+        )
+        await msg.reply_text(
+            "\u274c Unsupported file format.\n\n"
+            "This bot only processes **PDF documents** and **images** (JPEG, PNG, WEBP, GIF).\n"
+            "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported."
+        )
+        return
+
     # If this was forwarded and a forward-batch is active for this sender, store metadata and return
     is_forwarded = bool(
         getattr(msg, "forward_from", None)

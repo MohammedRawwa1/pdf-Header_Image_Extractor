@@ -42,6 +42,11 @@ class BotErrorHandler:
             "\u274c Invalid file format. "
             "Supported formats: PDF, JPEG, PNG, WEBP."
         ),
+        "unsupported_format": (
+            "\U0001f39e\ufe0f Unsupported file format. "
+            "This bot only processes PDF documents and images. "
+            "Video files (MKV, AVI, MP4, etc.) and other formats are not supported."
+        ),
         "pdf_error": (
             "\U0001f4d5 PDF processing failed. "
             "The file may be corrupted or password-protected."
@@ -133,6 +138,8 @@ class BotErrorHandler:
             return "rate_limited"
         if "compress" in exc_str or "ghostscript" in exc_str:
             return "compression_failed"
+        if "unsupported format" in exc_str:
+            return "unsupported_format"
         if "format" in exc_str or "mime" in exc_str:
             return "invalid_format"
         if "cancel" in exc_str:

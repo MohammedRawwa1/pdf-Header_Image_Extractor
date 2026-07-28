@@ -14,6 +14,71 @@ except Exception as e:
     ) from e
 
 
+# ── Supported file format definitions ─────────────────────────────────
+# Only these MIME types and file extensions are accepted for processing.
+# Video formats (MKV, AVI, MP4, MOV, etc.) sent as documents are rejected
+# early to avoid unnecessary relay forwarding and thumbnail processing.
+SUPPORTED_MIME_TYPES: set[str] = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+    "image/x-tiff",
+}
+
+SUPPORTED_EXTENSIONS: set[str] = {
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".tif",
+}
+
+# Video MIME types that are commonly sent as documents on Telegram
+# These are explicitly blocked and logged for visibility
+VIDEO_MIME_PREFIXES: tuple[str, ...] = (
+    "video/",
+)
+
+
+def is_supported_format(filename: str, mime: str = "") -> bool:
+    """Check whether the given filename/MIME pair is a supported format.
+
+    Uses the file extension as the primary signal (most reliable when users
+    send documents with meaningful names) and the MIME type as secondary.
+
+    Returns True for supported formats (PDF, images), False for everything
+    else (video formats, audio, archives, etc.).
+    """
+    # 1) Check MIME type first (most authoritative when present)
+    if mime:
+        mime_lower = mime.lower().strip()
+        # Explicitly reject video formats early
+        if mime_lower.startswith(VIDEO_MIME_PREFIXES):
+            return False
+        if mime_lower in SUPPORTED_MIME_TYPES:
+            return True
+        # Some image subtypes like image/x-* can slip through — allow them
+        if mime_lower.startswith("image/"):
+            return True
+
+    # 2) Fall back to file extension check
+    if filename:
+        _, ext = os.path.splitext(filename.lower().strip())
+        if ext in SUPPORTED_EXTENSIONS:
+            return True
+
+    # 3) Unknown format — reject
+    return False
+
+
 def is_valid_pdf(file_path: str) -> bool:
     """Check if a file is a valid PDF by attempting to open it with PyMuPDF.
 

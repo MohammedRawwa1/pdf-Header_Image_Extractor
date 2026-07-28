@@ -309,6 +309,7 @@ from tools import (  # noqa: E402
     create_thumbnail_from_image_bytes,
     create_thumbnail_from_pdf,
     create_thumbnail_from_pdf_bytes,
+    is_supported_format,
 )
 from utils.progress_tracker import (  # noqa: E402
     _build_progress_bar,
@@ -841,6 +842,26 @@ def process_document_job(
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
     """
     unique_key = file_unique_id or file_id
+
+    # ── Early format validation: reject unsupported formats before any processing ──
+    if not is_supported_format(filename, mime or ""):
+        logger.info(
+            "process_document_job: rejected unsupported format: filename=%s mime=%s chat_id=%s",
+            filename,
+            mime,
+            chat_id,
+        )
+        try:
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Unsupported file format.\n\n"
+                "This bot only processes **PDF documents** and **images** (JPEG, PNG, WEBP, GIF).\n"
+                "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported.",
+            )
+        except Exception:
+            pass
+        return {"error": "unsupported format", "filename": filename, "mime": mime}
 
     # persist input metadata
     try:
@@ -1730,6 +1751,15 @@ def process_document_batch_job(chat_id: int, items: list) -> None:
         mime = item.get("mime", "")
         if not file_id:
             logger.warning("Skipping batch item with no file_id: %s", item)
+            continue
+        # ── Early format validation: skip unsupported items in batch ──
+        if not is_supported_format(filename, mime):
+            logger.info(
+                "process_document_batch_job: skipping unsupported format: filename=%s mime=%s",
+                filename,
+                mime,
+            )
+            results.append({"skipped": "unsupported format", "filename": filename, "mime": mime})
             continue
         try:
             res = process_document_job(chat_id, file_id, filename, mime)
