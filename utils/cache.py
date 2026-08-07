@@ -151,7 +151,7 @@ class RedisCache:
                 if raw is not None:
                     try:
                         result[key] = json.loads(raw)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
             return result
         except Exception as e:
@@ -288,7 +288,7 @@ class RedisCache:
         """
         try:
             ttl = int(os.getenv("BIGFILE_CACHE_TTL", str(ttl)))
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return await self.set_binary(
             f"{PREFIX_FILE}bytes:{file_key}", data, ttl=ttl
@@ -307,7 +307,7 @@ class RedisCache:
             except Exception:
                 try:
                     await self._client.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             self._client = None
         # Close the binary (decode_responses=False) client if present
@@ -318,7 +318,7 @@ class RedisCache:
             except Exception:
                 try:
                     await bc.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             self._binary_client = None
 

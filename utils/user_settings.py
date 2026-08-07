@@ -20,7 +20,7 @@ def _settings_path() -> str:
     path = getattr(config, "STORAGE_PATH", "storage")
     try:
         os.makedirs(path, exist_ok=True)
-    except Exception:
+    except Exception:  # nosec B110
         pass
     return os.path.join(path, "user_settings.json")
 
@@ -41,7 +41,7 @@ def _save_all(data: dict[str, Any]) -> None:
     try:
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 

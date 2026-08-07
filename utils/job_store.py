@@ -20,7 +20,7 @@ async def save_job(job: dict[str, Any]) -> None:
         bot_id = job.get("bot_id")
         if bot_id:
             doc["bot_id"] = bot_id
-    except Exception:
+    except Exception:  # nosec B110
         pass
     await query(COL_JOBS).insert(doc)
 

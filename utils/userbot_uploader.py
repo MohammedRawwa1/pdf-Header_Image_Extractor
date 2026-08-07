@@ -41,29 +41,33 @@ async def _send_with_telethon(
     caption: str | None = None,
     thumb_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Send a file using Telethon.
 
     Args:
         thumb_path: Optional path to a thumbnail image to attach.
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if TelegramClient is None:
         return False
 
     from utils.telethon_session import (
         build_telethon_client,
+        get_telethon_session_string_for_user,
         get_userbot_credentials,
         has_usable_telethon_session,
     )
 
-    if not has_usable_telethon_session():
+    if not has_usable_telethon_session(user_id=user_id):
         logger.info(
             "userbot: Telethon session not configured; skipping Telethon upload"
         )
         return False
 
     api_id, api_hash = get_userbot_credentials()
-    client = build_telethon_client(api_id, api_hash)
+    _session_str = await get_telethon_session_string_for_user(user_id=user_id)
+    client = build_telethon_client(api_id, api_hash, session_str=_session_str)
     try:
 
         async def _no_phone():
@@ -85,7 +89,7 @@ async def _send_with_telethon(
     finally:
         try:
             await client.disconnect()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -95,23 +99,27 @@ async def _send_with_pyrogram(
     caption: str | None = None,
     thumb_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
 
     Args:
         thumb_path: Optional path to a thumbnail image to attach.
+        user_id: Optional Telegram user ID for per-user session resolution.
     """
     if PyrogramClient is None:
         return False
 
     from utils.telethon_session import (
         build_pyrogram_client,
+        get_pyrogram_session_string,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_pyrogram_client(api_id, api_hash)
+    _pyro_session = get_pyrogram_session_string(user_id=user_id)
+    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
     if client is None:
         return False
 
@@ -135,7 +143,7 @@ async def _send_with_pyrogram(
     finally:
         try:
             await client.stop()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -145,6 +153,7 @@ async def send_file_via_userbot(
     caption: str | None = None,
     thumb_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Send a file using a user account.
 
@@ -153,6 +162,7 @@ async def send_file_via_userbot(
 
     Args:
         thumb_path: Optional path to a thumbnail image to attach.
+        user_id: Optional Telegram user ID for per-user session resolution.
 
     Returns True on success, False on failure. Raises RuntimeError for missing config.
     """
@@ -164,7 +174,7 @@ async def send_file_via_userbot(
 
     from utils.telethon_session import has_usable_telethon_session
 
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
             result = await _send_with_telethon(
                 chat_id,
@@ -172,6 +182,7 @@ async def send_file_via_userbot(
                 caption,
                 thumb_path,
                 progress_callback=progress_callback,
+                user_id=user_id,
             )
             if result:
                 return True
@@ -195,6 +206,7 @@ async def send_file_via_userbot(
             caption,
             thumb_path,
             progress_callback=progress_callback,
+            user_id=user_id,
         )
         if result:
             return True

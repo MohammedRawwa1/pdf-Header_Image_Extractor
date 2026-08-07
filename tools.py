@@ -93,6 +93,48 @@ def is_valid_pdf(file_path: str) -> bool:
         return False
 
 
+def extract_pdf_metadata(pdf_path: str) -> dict:
+    """Extract full PDF metadata via PyMuPDF (best-effort, never raises).
+
+    Returns a dict with ``extracted`` flag, page count, encryption status,
+    document info fields (title/author/subject/keywords/creator/producer/
+    creation date/modification date) and file size.
+    """
+    meta = {"extracted": False, "pages": 0}
+    try:
+        # Magic-byte check first: PyMuPDF happily opens text files as "Tex"
+        # pseudo-documents, so a .txt/.log file would otherwise be reported
+        # as an extracted "PDF" with a bogus page count.
+        with open(pdf_path, "rb") as fh:
+            if not fh.read(5).startswith(b"%PDF-"):
+                return meta
+        doc = fitz.open(pdf_path)
+        try:
+            md = doc.metadata or {}
+            meta = {
+                "extracted": True,
+                "pages": doc.page_count,
+                "encrypted": bool(doc.is_encrypted or doc.needs_pass),
+                "title": (md.get("title") or "").strip() or None,
+                "author": (md.get("author") or "").strip() or None,
+                "subject": (md.get("subject") or "").strip() or None,
+                "keywords": (md.get("keywords") or "").strip() or None,
+                "creator": (md.get("creator") or "").strip() or None,
+                "producer": (md.get("producer") or "").strip() or None,
+                "creation_date": (md.get("creationDate") or "").strip() or None,
+                "modification_date": (md.get("modDate") or "").strip() or None,
+            }
+            try:
+                meta["file_size"] = os.path.getsize(pdf_path)
+            except Exception:  # nosec B110
+                pass
+        finally:
+            doc.close()
+    except Exception:  # nosec B110 - metadata is best-effort
+        pass
+    return meta
+
+
 def create_thumbnail_from_pdf(pdf_path: str, thumb_path: str) -> None:
     doc = fitz.open(pdf_path)
     page = doc.load_page(0)
@@ -160,14 +202,14 @@ def _optimize_thumbnail(
                 # replace original
                 os.replace(tmp_path, path)
                 return
-        except Exception:
+        except Exception:  # nosec B110
             pass
         q -= 10
 
     # fallback: save with low quality
     try:
         im.save(path, "JPEG", quality=30, optimize=True)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
@@ -186,7 +228,7 @@ def _optimize_thumbnail_bytes(
             if size <= max_bytes or q <= 30:
                 buf.seek(0)
                 return buf.read()
-        except Exception:
+        except Exception:  # nosec B110
             pass
         q -= 10
 
@@ -255,7 +297,7 @@ def compress_pdf(
     try:
         if os.path.exists(output_path):
             os.remove(output_path)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     # 1) Ghostscript: try common executable names (Linux/macOS: 'gs', Windows: 'gswin64c'/'gswin32c')
@@ -289,7 +331,7 @@ def compress_pdf(
         except subprocess.CalledProcessError:
             # Ghostscript ran but failed for this candidate; try next candidate
             continue
-        except Exception:
+        except Exception:  # nosec B112
             # Could be permission/timeout/etc. Try next candidate
             continue
 

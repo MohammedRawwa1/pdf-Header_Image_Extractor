@@ -1,7 +1,16 @@
 # Bandit security scanner configuration
 # https://bandit.readthedocs.io/en/latest/config.html
 
-skips: []
+# Accepted informational patterns (all LOW severity; CI fails only on HIGH):
+#   - B110/B112: exception swallowing in cleanup/fallback/retry paths.
+#     213 sites suppressed with an inline `# nosec` marker at each flagged line;
+#     the markers are auditable via git history (no behavior change).
+#   - B101: pytest `assert` statements in tests/ - the idiomatic test assertion
+#     pattern. NOTE: this skip is repo-wide, so future `assert` in runtime code
+#     will also be allowed; the project does not rely on asserts for runtime
+#     enforcement (they are stripped under `python -O`).
+skips:
+  - B101
 exclude_dirs:
   - .venv
   - env

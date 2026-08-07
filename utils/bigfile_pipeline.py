@@ -9,6 +9,7 @@ Adapted from media_conersion_bot for PDF-only use (no video/FFmpeg).
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -75,7 +76,7 @@ class BigFilePipeline:
             try:
                 if get_cache is not None:
                     self._cache = await get_cache()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
     async def ingest_large_file(
@@ -104,13 +105,25 @@ class BigFilePipeline:
         """
         await self._ensure_initialized()
 
+        # The pipeline requires S3 storage: the worker (separate process) only
+        # knows how to fetch the input via `input_key`. Without storage, the
+        # previously-enqueued job could never be downloaded by the worker, so
+        # fail fast with a clear error instead of enqueuing a doomed job.
+        if self._storage is None:
+            return IngestResult(
+                ok=False,
+                error="BigFilePipeline requires S3 storage (S3_BUCKET/credentials) to be configured.",
+            )
+
         job_id = uuid.uuid4().hex
         input_s3_key = f"inputs/{job_id}/source"
 
         ext = ""
         if original_filename:
             _, ext = os.path.splitext(original_filename)
-        if not ext:
+        # Whitelist the extension so a hostile filename can't smuggle path
+        # separators into the temp path below (e.g. `..\evil`).
+        if not ext or len(ext) > 12 or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
             ext = ".pdf"
 
         actual_size = 0
@@ -135,7 +148,10 @@ class BigFilePipeline:
                     file_size // (1024 * 1024),
                 )
                 data = await download_bytes_via_userbot(
-                    chat_id, message_id, progress_callback=progress_callback
+                    chat_id,
+                    message_id,
+                    progress_callback=progress_callback,
+                    user_id=user_id,
                 )
                 if data is not None and len(data) > 0:
                     actual_size = len(data)
@@ -158,7 +174,7 @@ class BigFilePipeline:
                                 },
                                 ttl=86400,
                             )
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
             except Exception as e:
                 logger.warning(
@@ -191,6 +207,7 @@ class BigFilePipeline:
                     message_id,
                     temp_path,
                     progress_callback=progress_callback,
+                    user_id=user_id,
                 )
                 if (
                     not download_ok
@@ -218,7 +235,7 @@ class BigFilePipeline:
                             },
                             ttl=86400,
                         )
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
 
             except Exception as e:
@@ -285,20 +302,3 @@ class BigFilePipeline:
                 ok=False,
                 error="Enqueue failed. Check server logs for details.",
             )
-
-    async def _download_via_userbot(
-        self, chat_id: int, message_id: int, dest_path: str
-    ) -> bool:
-        """Download a message using userbot."""
-        try:
-            from utils.userbot_downloader import download_forward_via_userbot
-
-            ok = await download_forward_via_userbot(
-                chat_id=chat_id,
-                message_id=message_id,
-                dest_path=dest_path,
-            )
-            return ok
-        except Exception as e:
-            logger.exception("BigFilePipeline: userbot download failed: %s", e)
-            return False

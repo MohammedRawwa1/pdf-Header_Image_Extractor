@@ -1117,7 +1117,7 @@ async def close_db():
     if _client is not None:
         try:
             _client.close()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     _client = None
     _db = None
@@ -1129,7 +1129,7 @@ def close_sync_db():
     if _sync_pymongo_client is not None:
         try:
             _sync_pymongo_client.close()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     _sync_pymongo_client = None
     _sync_pymongo_db = None

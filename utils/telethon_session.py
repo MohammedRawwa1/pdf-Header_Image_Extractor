@@ -52,12 +52,12 @@ def get_telethon_session_path() -> str:
     session_dir = get_telethon_session_dir()
     try:
         os.makedirs(session_dir, exist_ok=True)
-    except Exception:
+    except Exception:  # nosec B110
         pass
     return os.path.join(session_dir, get_telethon_session_name())
 
 
-# \u2500\u2500 JSON file persistence bridge \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── JSON file persistence bridge ─────────────────────────────────────────
 #
 # When a session is used via ``StringSession`` / Pyrogram in-memory,
 # Telegram's client library does **not** create a file on disk that can
@@ -73,61 +73,82 @@ def get_telethon_session_path() -> str:
 _KEY_TELETHON = "telethon_session"
 _KEY_PYROGRAM = "pyrogram_session"
 
-# \u2500\u2500 In-memory cache for session file reads \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── In-memory cache for session file reads ──────────────────────────────
 #
-# Both Telethon and Pyrogram checks in the healthchecker read the same
-# JSON file.  To avoid redundant disk I/O within a single cycle, the
-# file contents are cached in-memory with a short TTL.  The cache is
-# invalidated whenever a write occurs.
+# Both Telethon and Pyrogram checks read the same JSON file(s).  To avoid
+# redundant disk I/O within a single cycle, file contents are cached
+# in-memory with a short TTL.  The cache is keyed per user (and by the
+# legacy global file) so per-user session isolation works correctly.
 #
 # A ``threading.Lock`` protects access to the module-level globals
 # because the cache functions are called from thread pool workers
 # (via ``asyncio.to_thread``) when the async readers are used.
 # ------------------------------------------------------------------
-_SESSION_CACHE_DATA = None
-_SESSION_CACHE_EXPIRES = 0.0
+_SESSION_CACHE_DATA = {}
+_SESSION_CACHE_EXPIRES = {}
 _SESSION_CACHE_TTL = 60  # seconds
 _SESSION_CACHE_LOCK = threading.Lock()
 
 
-def _get_cached_sessions() -> dict | None:
-    """Return cached session dict if still fresh, else None."""
+def _cache_key(user_id: int | None = None) -> str:
+    """Return the cache key for a user (``"global"`` when user_id is None)."""
+    return "global" if user_id is None else f"user:{user_id}"
+
+
+def _get_cached_sessions(user_id: int | None = None) -> dict | None:
+    """Return cached session dict for *user_id* if still fresh, else None."""
+    k = _cache_key(user_id)
     with _SESSION_CACHE_LOCK:
-        if (
-            _SESSION_CACHE_DATA is not None
-            and time.time() < _SESSION_CACHE_EXPIRES
-        ):
-            return _SESSION_CACHE_DATA
+        entry = _SESSION_CACHE_DATA.get(k)
+        expires = _SESSION_CACHE_EXPIRES.get(k, 0.0)
+        if entry is not None and time.time() < expires:
+            return entry
         return None
 
 
-def _set_cached_sessions(data: dict):
-    """Cache session data with the module-level TTL."""
+def _set_cached_sessions(data: dict, user_id: int | None = None):
+    """Cache session data for *user_id* with the module-level TTL."""
+    k = _cache_key(user_id)
     with _SESSION_CACHE_LOCK:
-        global _SESSION_CACHE_DATA, _SESSION_CACHE_EXPIRES
-        _SESSION_CACHE_DATA = data
-        _SESSION_CACHE_EXPIRES = time.time() + _SESSION_CACHE_TTL
+        _SESSION_CACHE_DATA[k] = data
+        _SESSION_CACHE_EXPIRES[k] = time.time() + _SESSION_CACHE_TTL
 
 
-def _invalidate_session_cache():
-    """Clear the in-memory cache after a write."""
+def _invalidate_session_cache(user_id: int | None = None):
+    """Clear the in-memory cache for *user_id* after a write.
+
+    When ``user_id`` is ``None``, clears ALL caches (global + per-user).
+    """
     with _SESSION_CACHE_LOCK:
-        global _SESSION_CACHE_DATA, _SESSION_CACHE_EXPIRES
-        _SESSION_CACHE_DATA = None
-        _SESSION_CACHE_EXPIRES = 0.0
+        if user_id is not None:
+            k = _cache_key(user_id)
+            _SESSION_CACHE_DATA.pop(k, None)
+            _SESSION_CACHE_EXPIRES.pop(k, None)
+        else:
+            _SESSION_CACHE_DATA.clear()
+            _SESSION_CACHE_EXPIRES.clear()
 
 
-def _get_persisted_session_path() -> str:
+def _get_persisted_session_path(user_id: int | None = None) -> str:
     """Return the path to the JSON file used for session string persistence.
 
-    The file is stored alongside the Telethon session directory with a
-    ``.session.json`` extension.
+    When ``user_id`` is provided, the file is scoped to that user
+    (``<session>.session.<user_id>.json``) enabling per-phone session
+    isolation.  When ``user_id`` is ``None``, the legacy shared file is
+    returned (``<session>.session.json``), preserving backward
+    compatibility with existing single-phone deployments.
     """
-    return get_telethon_session_path() + ".session.json"
+    base = get_telethon_session_path() + ".session"
+    if user_id is not None:
+        return f"{base}.{user_id}.json"
+    return base + ".json"
 
 
-def _load_all_sessions_from_file() -> dict:
+def _load_all_sessions_from_file(user_id: int | None = None) -> dict:
     """Read the full persisted JSON dict from disk (synchronous).
+
+    When ``user_id`` is provided, the per-user JSON file is read.  When
+    ``user_id`` is ``None``, the legacy global file is read.
 
     Returns a dict (possibly empty) on success, or an empty dict on failure.
 
@@ -138,19 +159,19 @@ def _load_all_sessions_from_file() -> dict:
     which runs the I/O in a thread to avoid blocking the event loop.
     """
     # Check in-memory cache first to avoid redundant disk I/O
-    cached = _get_cached_sessions()
+    cached = _get_cached_sessions(user_id=user_id)
     if cached is not None:
         return cached
 
-    path = _get_persisted_session_path()
+    path = _get_persisted_session_path(user_id=user_id)
     if not os.path.exists(path):
-        _set_cached_sessions({})
+        _set_cached_sessions({}, user_id=user_id)
         return {}
     try:
         with open(path) as f:
             data = json.load(f)
         result = data if isinstance(data, dict) else {}
-        _set_cached_sessions(result)
+        _set_cached_sessions(result, user_id=user_id)
         return result
     except Exception as exc:
         logger.debug(
@@ -160,29 +181,37 @@ def _load_all_sessions_from_file() -> dict:
         # file lock, incomplete write from another process, or a JSON decode glitch)
         # would otherwise poison the in-memory cache with {} for the next 60 seconds.
         # Any call to ``save_session_string_to_file`` during that window would then
-        # read the cached {}, update only one key, and silently drop the other \u2014 which
+        # read the cached {}, update only one key, and silently drop the other — which
         # is exactly how ``telethon_session`` kept disappearing from the JSON file.
         return {}
 
 
-async def _load_all_sessions_from_file_async() -> dict:
+async def _load_all_sessions_from_file_async(
+    user_id: int | None = None,
+) -> dict:
     """Async version of ``_load_all_sessions_from_file``.
 
     Runs the sync file I/O in a thread via ``asyncio.to_thread`` so the
     event loop is not blocked during disk reads.  Intended for callers
     in async contexts (healthchecker).
     """
-    return await asyncio.to_thread(_load_all_sessions_from_file)
+    return await asyncio.to_thread(_load_all_sessions_from_file, user_id)
 
 
 def save_session_string_to_file(
-    session_str: str, client_type: str = "telethon"
+    session_str: str,
+    client_type: str = "telethon",
+    user_id: int | None = None,
 ) -> bool:
-    """Persist a session string to a shared JSON file (synchronous).
+    """Persist a session string to a JSON file (synchronous).
 
     Both Telethon and Pyrogram session strings are stored in the same file
     under different keys (``telethon_session`` / ``pyrogram_session``).
     The ``client_type`` parameter determines which key is updated.
+
+    When ``user_id`` is provided, the file is scoped to that user
+    (per-phone isolation).  When ``user_id`` is ``None``, the legacy
+    shared file is used (backward-compatible).
 
     Best-effort: returns True on success, False on failure (logged).
 
@@ -197,7 +226,7 @@ def save_session_string_to_file(
     after a transient read error, a subsequent write here would
     silently drop the other session key written by the other client.
     """
-    path = _get_persisted_session_path()
+    path = _get_persisted_session_path(user_id=user_id)
     try:
         # Read existing data directly from disk, bypassing the in-memory cache.
         existing = {}
@@ -226,7 +255,7 @@ def save_session_string_to_file(
             len(session_str),
         )
         # Invalidate in-memory cache so subsequent reads see the new data
-        _invalidate_session_cache()
+        _invalidate_session_cache(user_id=user_id)
         return True
     except Exception as exc:
         logger.debug(
@@ -239,7 +268,9 @@ def save_session_string_to_file(
 
 
 async def save_session_string_to_file_async(
-    session_str: str, client_type: str = "telethon"
+    session_str: str,
+    client_type: str = "telethon",
+    user_id: int | None = None,
 ) -> bool:
     """Async version of ``save_session_string_to_file``.
 
@@ -251,13 +282,18 @@ async def save_session_string_to_file_async(
         save_session_string_to_file,
         session_str,
         client_type=client_type,
+        user_id=user_id,
     )
 
 
 def _load_session_string_from_file(
     client_type: str = "telethon",
+    user_id: int | None = None,
 ) -> str | None:
     """Load a session string previously persisted by the healthchecker (synchronous).
+
+    When ``user_id`` is provided, reads from the per-user JSON file.
+    When ``user_id`` is ``None``, reads from the legacy global file.
 
     Parameters
     ----------
@@ -269,7 +305,7 @@ def _load_session_string_from_file(
     For async contexts, prefer ``_load_session_string_from_file_async``
     which runs the I/O in a thread to avoid blocking the event loop.
     """
-    data = _load_all_sessions_from_file()
+    data = _load_all_sessions_from_file(user_id=user_id)
     if not data:
         return None
     key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
@@ -278,7 +314,7 @@ def _load_session_string_from_file(
         logger.info(
             "session: loaded %s session string from %s (%d chars)",
             client_type,
-            _get_persisted_session_path(),
+            _get_persisted_session_path(user_id=user_id),
             len(session_str),
         )
         return session_str
@@ -287,6 +323,7 @@ def _load_session_string_from_file(
 
 async def _load_session_string_from_file_async(
     client_type: str = "telethon",
+    user_id: int | None = None,
 ) -> str | None:
     """Async version of ``_load_session_string_from_file``.
 
@@ -294,7 +331,7 @@ async def _load_session_string_from_file_async(
     event loop is not blocked during disk reads.  Intended for callers
     in async contexts (healthchecker).
     """
-    data = await _load_all_sessions_from_file_async()
+    data = await _load_all_sessions_from_file_async(user_id=user_id)
     if not data:
         return None
     key = _KEY_TELETHON if client_type == "telethon" else _KEY_PYROGRAM
@@ -303,21 +340,34 @@ async def _load_session_string_from_file_async(
         logger.info(
             "session: loaded %s session string from %s (%d chars)",
             client_type,
-            _get_persisted_session_path(),
+            _get_persisted_session_path(user_id=user_id),
             len(session_str),
         )
         return session_str
     return None
 
 
-def _get_configured_session_string() -> str | None:
+def _get_configured_session_string(user_id: int | None = None) -> str | None:
     """Return a Telethon session string from any available source.
 
-    Resolution order:
-    1. Environment variable (``TELETHON_SESSION`` / ``API_SESSION`` etc.)
-    2. Persisted JSON file (``telethon_session`` key, written by healthchecker)
+    Resolution order (per-user aware):
+    1. Per-user persisted JSON file (``telethon_session`` key) — when
+       ``user_id`` is provided, the user's OWN session wins so each user
+       uses their own account (multi-user).
+    2. Environment variable (``TELETHON_SESSION`` / ``API_SESSION`` etc.) —
+       shared admin-configured session, used as fallback for users who
+       have not logged in themselves.
+    3. Global persisted JSON file (legacy single-phone deployment fallback).
     """
-    # 1. Check env vars first (highest priority)
+    # 1. Per-user JSON file first (strictly scoped to the requesting user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(
+            client_type="telethon", user_id=user_id
+        )
+        if file_str:
+            return file_str
+
+    # 2. Check env vars (shared admin session, fallback)
     env_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -330,7 +380,7 @@ def _get_configured_session_string() -> str | None:
     if env_str:
         return env_str
 
-    # 2. Fall back to the JSON file persisted by the healthchecker
+    # 3. Fall back to the global JSON file (legacy single-phone deployment)
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return file_str
@@ -343,17 +393,28 @@ async def get_telethon_session_string_for_user(
 ) -> str | None:
     """Return a usable Telethon session string for the given user, if available.
 
-    Checks env vars first, then a MongoDB-persisted session when db_model is supplied.
+    Resolution order (per-user aware):
+    1. Per-user JSON file (when ``user_id`` is provided — the user's OWN
+       session wins, so each user uses their own account)
+    2. Environment variables (shared admin-configured session fallback)
+    3. Global JSON file (legacy single-phone fallback)
+    4. MongoDB-persisted session (when ``db_model`` or ``utils.db`` is available)
     """
-    # 1. Check env vars + persisted JSON file
-    session_str = _get_configured_session_string()
+    # 1. Check env vars + per-user JSON + global JSON
+    session_str = _get_configured_session_string(user_id=user_id)
     if session_str:
         return session_str
 
     # 2. Check MongoDB-persisted session for the given user
-    if user_id is not None and db_model is not None:
+    if user_id is not None:
         try:
-            saved_session = await db_model.load_session(user_id)
+            # Prefer an explicit db_model object (e.g. MediaConversionModel).
+            if db_model is not None and hasattr(db_model, "load_session"):
+                saved_session = await db_model.load_session(user_id)
+            else:
+                from utils.db import get_user_session
+
+                saved_session = await get_user_session(user_id)
         except Exception as exc:
             logger.warning(
                 "Failed to inspect MongoDB Telethon session for user %s: %s",
@@ -363,9 +424,11 @@ async def get_telethon_session_string_for_user(
             saved_session = None
 
         if isinstance(saved_session, dict):
-            session_value = saved_session.get(
-                "string_session"
-            ) or saved_session.get("session_string")
+            session_value = (
+                saved_session.get("string_session")
+                or saved_session.get("session_string")
+                or saved_session.get("telethon_session")
+            )
             if session_value:
                 logger.info(
                     "session: loaded Telethon session string from MongoDB for user %s",
@@ -386,6 +449,7 @@ async def get_telethon_session_status(
 
     Checks the same sources the bot can actually use for login fallback:
     - explicit session string in env vars
+    - a per-user JSON file (when ``user_id`` is provided)
     - a local .session file on disk
     - a MongoDB-persisted session for a specific user when db_model is provided
     """
@@ -395,7 +459,7 @@ async def get_telethon_session_status(
     )
 
     if session_str:
-        env_session = _get_configured_session_string()
+        env_session = _get_configured_session_string(user_id=user_id)
         return {
             "ready": True,
             "source": "env" if env_session else "mongodb",
@@ -415,9 +479,14 @@ async def get_telethon_session_status(
             "details": "Telethon session file exists on disk",
         }
 
-    if user_id is not None and db_model is not None:
+    if user_id is not None:
         try:
-            saved_session = await db_model.load_session(user_id)
+            if db_model is not None and hasattr(db_model, "load_session"):
+                saved_session = await db_model.load_session(user_id)
+            else:
+                from utils.db import get_user_session
+
+                saved_session = await get_user_session(user_id)
         except Exception as exc:
             logger.warning(
                 "Failed to inspect MongoDB Telethon session for user %s: %s",
@@ -426,8 +495,9 @@ async def get_telethon_session_status(
             )
             saved_session = None
 
-        if isinstance(saved_session, dict) and saved_session.get(
-            "string_session"
+        if isinstance(saved_session, dict) and (
+            saved_session.get("string_session")
+            or saved_session.get("telethon_session")
         ):
             return {
                 "ready": True,
@@ -450,7 +520,8 @@ def build_telethon_client(
     """Build a Telethon client with session persistence.
 
     Session resolution order:
-    1. ``session_str`` parameter (explicit call-site override, e.g. from MongoDB)
+    1. ``session_str`` parameter (explicit call-site override, e.g. a per-user
+       session string resolved via ``get_telethon_session_string_for_user``)
     2. ``TELETHON_SESSION`` / ``API_SESSION`` env var (StringSession)
     3. File-based ``.session`` file on disk (persistent, auto-saved by Telethon)
 
@@ -519,7 +590,7 @@ def build_telethon_client(
             )
             # Fall through to file-based session below
 
-    # No session string or StringSession failed \u2014 use file-based session.
+    # No session string or StringSession failed — use file-based session.
     session_path = get_telethon_session_path()
     logger.info(
         "session: building Telethon client with file-based session at %s.session",
@@ -536,14 +607,27 @@ def build_telethon_client(
     )
 
 
-def get_pyrogram_session_string() -> str | None:
+def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     """Return a Pyrogram session string from any available source.
 
-    Resolution order:
-    1. Environment variable (``PYROGRAM_SESSION`` etc.)
-    2. Persisted JSON file (``pyrogram_session`` key, written by healthchecker)
+    Resolution order (per-user aware):
+    1. Per-user persisted JSON file (``pyrogram_session`` key) — when
+       ``user_id`` is provided, the user's OWN session wins so each user
+       uses their own account (multi-user).
+    2. Environment variable (``PYROGRAM_SESSION`` etc.) — shared
+       admin-configured session, used as fallback for users who have not
+       logged in themselves.
+    3. Global persisted JSON file (legacy single-phone deployment fallback).
     """
-    # 1. Check env vars first (highest priority)
+    # 1. Per-user JSON file first (strictly scoped to the requesting user)
+    if user_id is not None:
+        file_str = _load_session_string_from_file(
+            client_type="pyrogram", user_id=user_id
+        )
+        if file_str:
+            return file_str
+
+    # 2. Check env vars (shared admin session, fallback)
     env_str = _get_env_value(
         "PYROGRAM_SESSION",
         "pyrogram_session",
@@ -553,11 +637,60 @@ def get_pyrogram_session_string() -> str | None:
     if env_str:
         return env_str
 
-    # 2. Fall back to the JSON file persisted by the healthchecker
+    # 3. Fall back to the global JSON file (legacy single-phone deployment)
     file_str = _load_session_string_from_file(client_type="pyrogram")
     if file_str:
         return file_str
 
+    return None
+
+
+async def get_pyrogram_session_string_for_user(
+    user_id: int | None = None, db_model: object | None = None
+) -> str | None:
+    """Return a usable Pyrogram session string for the given user, if available.
+
+    Resolution order (per-user aware):
+    1. Per-user JSON file (when ``user_id`` is provided — the user's OWN
+       session wins, so each user uses their own account)
+    2. Environment variables (shared admin-configured session fallback)
+    3. Global JSON file (legacy single-phone fallback)
+    4. MongoDB-persisted session (when ``db_model`` or ``utils.db`` is available)
+    """
+    # 1. Check env vars + per-user JSON + global JSON
+    session_str = get_pyrogram_session_string(user_id=user_id)
+    if session_str:
+        return session_str
+
+    # 2. Check MongoDB-persisted session for the given user
+    if user_id is not None:
+        try:
+            if db_model is not None and hasattr(db_model, "load_session"):
+                saved_session = await db_model.load_session(user_id)
+            else:
+                from utils.db import get_user_session
+
+                saved_session = await get_user_session(user_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect MongoDB Pyrogram session for user %s: %s",
+                user_id,
+                exc,
+            )
+            saved_session = None
+
+        if isinstance(saved_session, dict):
+            session_value = saved_session.get("pyrogram_session")
+            if session_value:
+                logger.info(
+                    "session: loaded Pyrogram session string from MongoDB for user %s",
+                    user_id,
+                )
+                return str(session_value)
+
+    logger.debug(
+        "session: no Pyrogram session string found for user %s", user_id
+    )
     return None
 
 
@@ -574,11 +707,11 @@ def build_pyrogram_client(
         Telegram API hash.
     session_str:
         Optional explicit session string.  If not provided, the function
-        resolves the session from env vars -> persisted JSON file
+        resolves the session from env vars -> per-user JSON -> global JSON
         (same resolution as ``get_pyrogram_session_string()``).
 
     When ``session_str`` is provided explicitly, the internal resolution
-    is skipped entirely, avoiding redundant file I/O \u2014 useful when the
+    is skipped entirely, avoiding redundant file I/O — useful when the
     caller has already loaded the session string asynchronously.
 
     Reads the following env vars for retry/timeout configuration:
@@ -634,23 +767,32 @@ def build_pyrogram_client(
         return None
 
 
-def is_pyrogram_available() -> bool:
+def is_pyrogram_available(user_id: int | None = None) -> bool:
     """Return True if Pyrogram is installed and a session string is configured.
 
-    Checks env vars first, then the persisted JSON file written by the
-    healthchecker.
+    Checks env vars first, then the persisted JSON files (per-user when
+    ``user_id`` is provided, plus the legacy global file).
     """
     if PyrogramClient is None:
         return False
-    return bool(get_pyrogram_session_string())
+    return bool(get_pyrogram_session_string(user_id=user_id))
 
 
-def has_usable_telethon_session() -> bool:
+def has_usable_telethon_session(user_id: int | None = None) -> bool:
     """Return True when Telethon can use a pre-existing session without prompting for login."""
     if TelegramClient is None:
         return False
 
-    # 1. Check env vars
+    # 1. Check per-user JSON file first (when user_id is provided) — the
+    #    user's OWN session wins so each user uses their own account.
+    if user_id is not None:
+        file_str = _load_session_string_from_file(
+            client_type="telethon", user_id=user_id
+        )
+        if file_str:
+            return True
+
+    # 2. Check env vars (shared admin session, fallback)
     session_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -663,26 +805,26 @@ def has_usable_telethon_session() -> bool:
     if session_str:
         return True
 
-    # 2. Check persisted JSON file (written by healthchecker)
+    # 3. Check global persisted JSON file (written by healthchecker)
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return True
 
-    # 3. Check file-based .session files on disk
+    # 4. Check file-based .session files on disk
     session_path = get_telethon_session_path()
     return os.path.exists(session_path) or os.path.exists(
         session_path + ".session"
     )
 
 
-def is_telethon_available() -> bool:
+def is_telethon_available(user_id: int | None = None) -> bool:
     """Return True if Telethon is installed and configured."""
-    return has_usable_telethon_session()
+    return has_usable_telethon_session(user_id=user_id)
 
 
-def get_preferred_client_type() -> str:
-    """Return 'pyrogram' if Pyrogram session is available, else 'telethon'."""
-    if is_pyrogram_available():
+def get_preferred_client_type(user_id: int | None = None) -> str:
+    """Return 'pyrogram' if a Pyrogram session is available, else 'telethon'."""
+    if is_pyrogram_available(user_id=user_id):
         return "pyrogram"
     return "telethon"
 

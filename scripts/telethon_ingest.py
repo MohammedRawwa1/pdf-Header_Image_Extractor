@@ -102,7 +102,7 @@ try:
         _tel = _logging.getLogger("telethon")
         _tel.setLevel(logging.DEBUG)
         _tel.addHandler(fh)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 except Exception:
     LOG_PATH = None
@@ -175,7 +175,7 @@ async def _start_aiohttp_debug_server():
                             status["redis"] = "ok" if pong else "pong_failed"
                             try:
                                 await r.close()
-                            except Exception:
+                            except Exception:  # nosec B110
                                 pass
                         except Exception:
                             status["redis"] = "error"
@@ -204,7 +204,7 @@ async def _start_aiohttp_debug_server():
         logger.exception("telethon_ingest: failed to start debug HTTP server")
         try:
             await runner.cleanup()
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return None
 
@@ -218,12 +218,12 @@ async def _get_backend_instance():
     if get_storage_backend:
         try:
             return await get_storage_backend()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     if get_storage_backend_sync:
         try:
             return get_storage_backend_sync()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     # Last-ditch: attempt on-the-fly import
     try:
@@ -235,11 +235,11 @@ async def _get_backend_instance():
         if get_storage_backend:
             try:
                 return await get_storage_backend()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
         if get_storage_backend_sync:
             return get_storage_backend_sync()
-    except Exception:
+    except Exception:  # nosec B110
         pass
     return None
 
@@ -398,9 +398,9 @@ async def _upload_and_enqueue(
                 if upload_src != abs_path and not keep_local:
                     try:
                         os.remove(upload_src)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
-            except Exception:
+            except Exception:  # nosec B110
                 pass
         # Only remove local temp copy if operator did NOT request to keep uploads.
         # Prefer leaving cleanup responsibility to the worker which also respects
@@ -416,7 +416,7 @@ async def _upload_and_enqueue(
         if not keep_local:
             try:
                 os.remove(local_path)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
     except Exception:
         logger.exception("Failed to upload to storage for %s", local_path)
@@ -470,12 +470,12 @@ async def _upload_and_enqueue(
                     try:
                         loop = asyncio.get_event_loop()
                         loop.create_task(save_telethon_forward(job))
-                    except Exception:
+                    except Exception:  # nosec B110
                         # best-effort only
                         pass
             except Exception:
                 logger.exception("Telethon->Mongo bridge unavailable")
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     if enqueue_job is None:
@@ -514,7 +514,7 @@ async def _process_forward_hash(forward_hash: str):
     try:
         global LAST_FETCH_TS
         LAST_FETCH_TS = time.time()
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     tmp = _make_temp_path(
@@ -573,9 +573,9 @@ async def _process_forward_hash(forward_hash: str):
 
         try:
             delete_forward_metadata(forward_hash)
-        except Exception:
+        except Exception:  # nosec B110
             pass
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     return True
@@ -665,7 +665,7 @@ async def redis_listener():
                     logger.info(
                         "telethon_ingest: redis payload received: %s", payload
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
                 # Accept either `forward_hash` (preferred) or legacy `fid`/`forward_id`.
@@ -680,7 +680,7 @@ async def redis_listener():
                             "telethon_ingest: fetch payload missing forward id; payload=%s",
                             payload,
                         )
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
                 else:
                     try:
@@ -713,21 +713,21 @@ async def redis_listener():
             if pub is not None:
                 try:
                     await pub.unsubscribe(fetch_channel)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 try:
                     await pub.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             if r is not None:
                 try:
                     await r.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -741,7 +741,7 @@ def _make_temp_path(msg_id: str, ext: str = "") -> str:
     )
     try:
         os.makedirs(base_dir, exist_ok=True)
-    except Exception:
+    except Exception:  # nosec B110
         pass
     return os.path.join(base_dir, f"{msg_id}{ext}")
 
@@ -860,7 +860,7 @@ async def main():
             )  # nosec B108 - /tmp is last fallback, prefers env vars  # noqa: S108
             try:
                 os.makedirs(session_dir, exist_ok=True)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             # Use a path under the session_dir to avoid write-permissions issues on remote
             session_path = os.path.join(session_dir, session_name)
@@ -919,7 +919,7 @@ async def main():
                     ]
                     try:
                         cand_dirs.append(str(Path.home()))
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
                     import glob
                     import shutil
@@ -962,7 +962,7 @@ async def main():
                 logger.exception(
                     "telethon_ingest: error during TELETHON_CLEAN_SESSION cleanup"
                 )
-    except Exception:
+    except Exception:  # nosec B110
         pass
     # Determine whether we should listen for incoming messages (legacy behavior)
     LISTEN_INCOMING = os.environ.get(
@@ -1101,7 +1101,7 @@ async def main():
                 logger.exception(
                     "telethon_ingest: upload_telethon_log failed during startup"
                 )
-        except Exception:
+        except Exception:  # nosec B110
             pass
     except Exception:
         logger.exception(
@@ -1130,7 +1130,7 @@ async def main():
             finally:
                 try:
                     await client.disconnect()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         else:
             # Fetch-only mode: wait on redis listener task, or sleep forever
@@ -1150,18 +1150,18 @@ async def main():
                     await redis_task
                 except asyncio.CancelledError:
                     pass
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-        except Exception:
+        except Exception:  # nosec B110
             pass
         # Stop aiohttp debug server if running
         try:
             if http_runner is not None:
                 try:
                     await http_runner.cleanup()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -1175,7 +1175,7 @@ if __name__ == "__main__":
             # Best-effort: attempt to upload log before exiting
             try:
                 asyncio.run(upload_telethon_log("telethon_ingest_crash.log"))
-            except Exception:
+            except Exception:  # nosec B110
                 pass
-        except Exception:
+        except Exception:  # nosec B110
             pass

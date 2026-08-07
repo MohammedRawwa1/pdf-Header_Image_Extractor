@@ -33,7 +33,7 @@ ERROR_RETRY_SLEEP = 10
 # Minimum required env vars for the pipeline worker to function.
 _REQUIRED_ENV_VARS = {
     "REDIS_URL": "Redis connection string for job queue",
-    "BOT_TOKEN": "Telegram bot token for sending results",
+    "BOT_TOKEN": "Required for the bot to deliver results",  # nosec B105 - env-var name, not a literal secret
     "S3_BUCKET": "S3 bucket where BigFilePipeline stores ingested files",
 }
 
@@ -137,7 +137,7 @@ async def consume_loop():
 
     try:
         await close_redis()
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 

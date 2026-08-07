@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # ── Globals ───────────────────────────────────────────────────
 
 _sync_client = None
+_sync_raw_client = None
 _async_client = None
 _async_wrapper = None
 
@@ -65,15 +66,50 @@ def get_sync_redis(decode_responses: bool = True) -> redis.Redis | None:  # noqa
         return None
 
 
+def get_sync_redis_raw() -> redis.Redis | None:  # noqa: F821
+    """Return a cached sync Redis client with ``decode_responses=False``.
+
+    RQ stores job payloads pickled as raw bytes, so any RQ operation
+    (``Queue.enqueue``, ``Job.fetch``, ``Job.cancel``) MUST use a non-
+    decoding client.  The normal ``get_sync_redis()`` singleton caches the
+    first client created and ignores the ``decode_responses`` parameter on
+    later calls, so it can never back RQ code — use this helper instead.
+
+    Returns a cached client, or None if the connection fails.
+    """
+    global _sync_raw_client
+    if _sync_raw_client is not None:
+        return _sync_raw_client
+
+    url = get_redis_url()
+
+    try:
+        import redis
+
+        _sync_raw_client = redis.from_url(url, decode_responses=False)
+        logger.info("redis_client: sync raw Redis connected")
+        return _sync_raw_client
+    except Exception as e:
+        logger.warning("redis_client: sync raw Redis connection failed: %s", e)
+        _sync_raw_client = None
+        return None
+
+
 def close_sync_redis():
-    """Close the sync Redis connection and clear the cached singleton."""
-    global _sync_client
+    """Close the sync Redis connection and clear the cached singletons."""
+    global _sync_client, _sync_raw_client
     if _sync_client is not None:
         try:
             _sync_client.close()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     _sync_client = None
+    if _sync_raw_client is not None:
+        try:
+            _sync_raw_client.close()
+        except Exception:  # nosec B110
+            pass
+    _sync_raw_client = None
 
 
 # ── Async client (no-op close wrapper) ────────────────────────
@@ -165,7 +201,7 @@ async def close_async_redis():
                 await aclose()
             else:
                 await _async_client.close()
-        except Exception:
+        except Exception:  # nosec B110
             pass
     _async_client = None
     _async_wrapper = None

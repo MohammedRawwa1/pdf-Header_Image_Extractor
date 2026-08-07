@@ -67,7 +67,7 @@ class WebhookMonitor:
                         self.consecutive_failures = 0
                         self._current_interval = self.check_interval
                         return True
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             async with aiohttp.ClientSession() as session:
@@ -104,7 +104,7 @@ class WebhookMonitor:
                     old = self._current_interval
                     self._current_interval = min(
                         old * 2, self._max_backoff
-                    ) + random.uniform(0, 5)
+                    ) + random.uniform(0, 5)  # nosec B311
                     logger.warning(
                         "Webhook rate-limited (429). Backing off to %.1fs",
                         self._current_interval,
@@ -124,7 +124,7 @@ class WebhookMonitor:
             old = self._current_interval
             self._current_interval = min(
                 old * 2, self._max_backoff
-            ) + random.uniform(0, 5)
+            ) + random.uniform(0, 5)  # nosec B311
             return False
 
     async def start_monitoring(self):

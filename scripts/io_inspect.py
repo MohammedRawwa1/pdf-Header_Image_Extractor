@@ -103,7 +103,7 @@ def main() -> int:
         ttl_in = r.ttl(key_in)
         ttl_out = r.ttl(key_out)
         print(f"\nTTLs (seconds): {key_in}={ttl_in}, {key_out}={ttl_out}")
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     return 0

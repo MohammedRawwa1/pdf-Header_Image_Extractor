@@ -274,7 +274,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                     )
                     raise
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-                await asyncio.sleep(backoff + random.random())
+                await asyncio.sleep(backoff + random.random())  # nosec B311
 
     async def upload_file_streaming(self, src_path: str, dest_key: str) -> str:
         src_path = os.path.abspath(src_path)
@@ -363,7 +363,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                     )
                     raise
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-                await asyncio.sleep(backoff + random.random())
+                await asyncio.sleep(backoff + random.random())  # nosec B311
 
     async def download_file(self, key: str, dest_path: str) -> bool:
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
@@ -406,7 +406,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                     )
                     raise
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-                await asyncio.sleep(backoff + random.random())
+                await asyncio.sleep(backoff + random.random())  # nosec B311
 
     async def generate_presigned_post(
         self, key: str, expires: int | None = None
@@ -525,7 +525,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                     )
                     return False
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-                await asyncio.sleep(backoff + random.random())
+                await asyncio.sleep(backoff + random.random())  # nosec B311
 
     async def exists(self, key: str) -> bool:
         if not key:
@@ -565,7 +565,7 @@ class S3AsyncBackend(AsyncStorageBackend):
                 if attempt == retries:
                     return False
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-                await asyncio.sleep(backoff + random.random())
+                await asyncio.sleep(backoff + random.random())  # nosec B311
 
 
 _STORAGE_SINGLETON: AsyncStorageBackend | None = None

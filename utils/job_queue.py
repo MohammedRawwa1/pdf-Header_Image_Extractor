@@ -36,7 +36,7 @@ async def enqueue_job(job: dict) -> None:
     try:
         if not job.get("request_id"):
             job["request_id"] = str(uuid.uuid4())
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     try:
@@ -60,9 +60,9 @@ async def enqueue_job(job: dict) -> None:
                 if JOB_METADATA_TTL and JOB_METADATA_TTL > 0:
                     try:
                         await r.expire(f"pdf:job:{job_id}", JOB_METADATA_TTL)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             try:
@@ -75,9 +75,9 @@ async def enqueue_job(job: dict) -> None:
                     src,
                     out,
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     try:
@@ -88,9 +88,9 @@ async def enqueue_job(job: dict) -> None:
                 "Failed to push job onto Redis list for job %s",
                 job.get("job_id"),
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
@@ -106,13 +106,13 @@ async def pop_job(timeout: int = 5) -> dict | None:
                     raw = item.decode() if isinstance(item, bytes) else item
                     try:
                         await r.zrem(DELAYED_SET, raw)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
                     try:
                         await r.lpush(JOB_LIST, raw)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
-        except Exception:
+        except Exception:  # nosec B110
             pass
         item = await r.brpop(JOB_LIST, timeout=timeout)
         if not item:

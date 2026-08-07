@@ -55,7 +55,12 @@ def run_worker():
 
 
 def enqueue_test_job(
-    bot_token: str, chat_id: int, file_id: str, filename: str, mime: str = ""
+    bot_token: str,
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    mime: str = "",
+    user_id: int | None = None,
 ) -> None:
     """Enqueue `process_document_job` into Redis for testing from CLI."""
     redis_conn = Redis.from_url(redis_url)
@@ -65,12 +70,21 @@ def enqueue_test_job(
 
         func = getattr(tasks, "process_document_job")
         # Do NOT pass bot_token into the job; tasks will use config.BOT_TOKEN internally.
-        q.enqueue(func, chat_id, file_id, filename, mime)
+        # user_id is optional (defaults to global/admin session when None).
+        q.enqueue(
+            func,
+            chat_id=chat_id,
+            file_id=file_id,
+            filename=filename,
+            mime=mime,
+            user_id=user_id,
+        )
         logging.info(
-            "Enqueued process_document_job: chat_id=%s file_id=%s filename=%s",
+            "Enqueued process_document_job: chat_id=%s file_id=%s filename=%s user_id=%s",
             chat_id,
             file_id,
             filename,
+            user_id,
         )
     except Exception:
         logging.exception("Failed to enqueue test job")
@@ -98,6 +112,12 @@ def main():
         help="Filename to attach to uploaded document",
     )
     enq.add_argument("--mime", default="", help="Optional mime type")
+    enq.add_argument(
+        "--user-id",
+        type=int,
+        default=None,
+        help="Telegram user id to resolve the per-user session (default: global/admin session)",
+    )
 
     args = parser.parse_args()
     # Respect LOG_LEVEL env var so we can increase verbosity without changing code
@@ -131,6 +151,7 @@ def main():
             args.file_id,
             args.filename,
             args.mime,
+            args.user_id,
         )
     else:
         run_worker()

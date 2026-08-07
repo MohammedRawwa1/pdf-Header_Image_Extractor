@@ -388,7 +388,7 @@ async def _download_from_raw_channel(
             if os.path.exists(_dl_path):
                 try:
                     shutil.move(_dl_path, _abs_dest)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
             # Validate PDF files to catch corrupted/incomplete downloads
@@ -401,7 +401,7 @@ async def _download_from_raw_channel(
                 )
                 try:
                     os.remove(_abs_dest)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 await asyncio.sleep(2**attempt)
                 continue
@@ -458,6 +458,7 @@ async def _download_file_by_file_id(
     file_id: str,
     dest_path: str,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Download a file directly by Bot API file_id using Telethon's resolve_bot_file_id.
 
@@ -484,12 +485,14 @@ async def _download_file_by_file_id(
 
     from utils.telethon_session import (
         build_telethon_client,
+        get_telethon_session_string_for_user,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_telethon_client(api_id, api_hash)
+    _session_str = await get_telethon_session_string_for_user(user_id=user_id)
+    client = build_telethon_client(api_id, api_hash, session_str=_session_str)
     try:
         await client.start()
     except Exception as e:
@@ -540,7 +543,7 @@ async def _download_file_by_file_id(
                 )
                 try:
                     os.remove(dest_path)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 return False
             logger.info(
@@ -560,7 +563,7 @@ async def _download_file_by_file_id(
     finally:
         try:
             await client.disconnect()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -658,6 +661,7 @@ async def _download_with_telethon(
     file_unique_id: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     file_id: str | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Download using Telethon client.
 
@@ -678,12 +682,14 @@ async def _download_with_telethon(
 
     from utils.telethon_session import (
         build_telethon_client,
+        get_telethon_session_string_for_user,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_telethon_client(api_id, api_hash)
+    _session_str = await get_telethon_session_string_for_user(user_id=user_id)
+    client = build_telethon_client(api_id, api_hash, session_str=_session_str)
     try:
         logger.info("userbot: starting Telethon client for download")
         await client.start()
@@ -701,7 +707,7 @@ async def _download_with_telethon(
     if _dest_dir:
         try:
             os.makedirs(_dest_dir, exist_ok=True)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
     try:
@@ -820,7 +826,7 @@ async def _download_with_telethon(
                                 )
                                 try:
                                     os.remove(dest_path)
-                                except Exception:
+                                except Exception:  # nosec B110
                                     pass
                                 await asyncio.sleep(2**attempt)
                                 continue
@@ -832,7 +838,7 @@ async def _download_with_telethon(
                         )
                         try:
                             os.remove(dest_path)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         await asyncio.sleep(2**attempt)
                     except Exception as e:
@@ -882,7 +888,7 @@ async def _download_with_telethon(
                                     )
                                     try:
                                         os.remove(dest_path)
-                                    except Exception:
+                                    except Exception:  # nosec B110
                                         pass
                                     await asyncio.sleep(2**attempt)
                                     continue
@@ -890,7 +896,7 @@ async def _download_with_telethon(
                             await asyncio.sleep(2**attempt)
                         except Exception:
                             await asyncio.sleep(2**attempt)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         logger.warning(
@@ -903,7 +909,7 @@ async def _download_with_telethon(
     finally:
         try:
             await client.disconnect()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -911,6 +917,7 @@ async def _download_bytes_with_pyrogram(
     chat_id: int | str,
     message_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bytes | None:
     """Download a message's media into memory (bytes) using Pyrogram.
 
@@ -928,12 +935,14 @@ async def _download_bytes_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
+        get_pyrogram_session_string,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_pyrogram_client(api_id, api_hash)
+    _pyro_session = get_pyrogram_session_string(user_id=user_id)
+    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
     if client is None:
         logger.info(
             "userbot: Pyrogram session string not configured; cannot do in-memory download"
@@ -1054,7 +1063,7 @@ async def _download_bytes_with_pyrogram(
     finally:
         try:
             await client.stop()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -1063,6 +1072,7 @@ async def _download_with_pyrogram(
     message_id: int,
     dest_path: str,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -1078,12 +1088,14 @@ async def _download_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
+        get_pyrogram_session_string,
         get_userbot_credentials,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    client = build_pyrogram_client(api_id, api_hash)
+    _pyro_session = get_pyrogram_session_string(user_id=user_id)
+    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured")
         return False
@@ -1177,7 +1189,7 @@ async def _download_with_pyrogram(
                                         )
                                         try:
                                             os.remove(_abs_dest)
-                                        except Exception:
+                                        except Exception:  # nosec B110
                                             pass
                                         await asyncio.sleep(2**attempt)
                                         continue
@@ -1185,7 +1197,7 @@ async def _download_with_pyrogram(
                             if os.path.exists(dest_path):
                                 try:
                                     os.remove(dest_path)
-                                except Exception:
+                                except Exception:  # nosec B110
                                     pass
                         else:
                             break
@@ -1236,13 +1248,14 @@ async def _download_with_pyrogram(
     finally:
         try:
             await client.stop()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
 async def download_bytes_by_file_id_via_userbot(
     file_id: str,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bytes | None:
     """Download a file directly by bot-API file_id using userbot.
 
@@ -1263,17 +1276,23 @@ async def download_bytes_by_file_id_via_userbot(
 
             from utils.telethon_session import (
                 build_telethon_client,
+                get_telethon_session_string_for_user,
                 get_userbot_credentials,
                 has_usable_telethon_session,
             )
 
-            if not has_usable_telethon_session():
+            if not has_usable_telethon_session(user_id=user_id):
                 logger.info(
                     "userbot: Telethon session not configured; cannot download by file_id"
                 )
             else:
                 api_id, api_hash = get_userbot_credentials()
-                client = build_telethon_client(api_id, api_hash)
+                _session_str = await get_telethon_session_string_for_user(
+                    user_id=user_id
+                )
+                client = build_telethon_client(
+                    api_id, api_hash, session_str=_session_str
+                )
                 if client is not None:
                     try:
                         await client.start()
@@ -1310,7 +1329,7 @@ async def download_bytes_by_file_id_via_userbot(
                     finally:
                         try:
                             await client.disconnect()
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
         except Exception as e:
             logger.warning("userbot: Telethon file_id setup error: %s", e)
@@ -1340,6 +1359,7 @@ async def download_forward_via_userbot(
     file_unique_id: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     file_id: str | None = None,
+    user_id: int | None = None,
 ) -> bool:
     """Download a message media using a user account.
 
@@ -1387,7 +1407,7 @@ async def download_forward_via_userbot(
         return False
 
     # ── 1) Telethon (preferred: faster, better large-file support) ──
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
             result = await _download_with_telethon(
                 chat_id,
@@ -1397,6 +1417,7 @@ async def download_forward_via_userbot(
                 file_unique_id,
                 progress_callback=progress_callback,
                 file_id=file_id,
+                user_id=user_id,
             )
             if result:
                 return True
@@ -1414,7 +1435,7 @@ async def download_forward_via_userbot(
         )
 
     # ── 2) Pyrogram fallback (if configured) ──
-    pyrogram_session_configured = bool(get_pyrogram_session_string())
+    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
             result = await _download_with_pyrogram(
@@ -1422,6 +1443,7 @@ async def download_forward_via_userbot(
                 message_id,
                 dest_path,
                 progress_callback=progress_callback,
+                user_id=user_id,
             )
             if result:
                 return True
@@ -1438,6 +1460,7 @@ async def download_bytes_via_userbot(
     chat_id: int | str,
     message_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
 ) -> bytes | None:
     """Download a message media into memory (bytes) using userbot.
 
@@ -1459,15 +1482,21 @@ async def download_bytes_via_userbot(
     )
 
     # ── 1) Telethon (preferred: faster, better large-file support) ──
-    if TelegramClient is not None and has_usable_telethon_session():
+    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
         try:
-            from utils.telethon_session import build_telethon_client
+            from utils.telethon_session import (
+                build_telethon_client,
+                get_telethon_session_string_for_user,
+            )
             from utils.telethon_session import (
                 get_userbot_credentials as _get_creds,
             )
 
             _api_id, _api_hash = _get_creds()
-            _client = build_telethon_client(_api_id, _api_hash)
+            _session_str = await get_telethon_session_string_for_user(user_id=user_id)
+            _client = build_telethon_client(
+                _api_id, _api_hash, session_str=_session_str
+            )
             if _client is not None:
                 try:
                     await _client.start()
@@ -1524,7 +1553,7 @@ async def download_bytes_via_userbot(
                                         _file_dc,
                                     )
                                     await _client._set_connection_dc(_file_dc)
-                            except Exception:
+                            except Exception:  # nosec B110
                                 pass
 
                             for attempt in range(3):
@@ -1560,7 +1589,7 @@ async def download_bytes_via_userbot(
                 finally:
                     try:
                         await _client.disconnect()
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
         except Exception as e:
             logger.warning(
@@ -1569,11 +1598,14 @@ async def download_bytes_via_userbot(
             )
 
     # ── 2) Pyrogram fallback ──
-    pyrogram_session_configured = bool(get_pyrogram_session_string())
+    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
     if PyrogramClient is not None and pyrogram_session_configured:
         try:
             data = await _download_bytes_with_pyrogram(
-                chat_id, message_id, progress_callback=progress_callback
+                chat_id,
+                message_id,
+                progress_callback=progress_callback,
+                user_id=user_id,
             )
             if data is not None:
                 return data

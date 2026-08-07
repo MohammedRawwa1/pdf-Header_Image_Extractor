@@ -251,6 +251,17 @@ class RedisSlidingWindowRateLimiter:
             return True, self.max_requests, 0.0  # Fail open on any Redis error
 
 
+# ── Shared Telegram API limiter singleton ───────────────────
+# One instance is created here and reused by bot.py, the progress tracker
+# (send_progress_update), and anything else that sends outbound Telegram
+# API messages in the web process.  Sharing a single instance keeps the
+# global 30/s + per-user 1/s budgets accurate across all senders.
+#
+# NOTE: this is an in-memory limiter — it is NOT shared with the RQ worker
+# subprocess (which protects itself via retry-on-429 in tasks.py helpers).
+telegram_api_limiter = TelegramAPIRateLimiter()
+
+
 class ConversionRateLimiter:
     """Per-user hourly rate limiter for processing operations."""
 

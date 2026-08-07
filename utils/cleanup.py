@@ -130,7 +130,7 @@ class CleanupManager:
                         if not os.listdir(item_path):
                             os.rmdir(item_path)
                             removed += 1
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
 
             return removed
@@ -176,7 +176,7 @@ class CleanupManager:
                             removed += 1
                         elif ttl == -2:  # Already gone
                             pass
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
 
             return removed
@@ -216,7 +216,7 @@ class CleanupManager:
                             if os.path.isfile(fp):
                                 size_bytes += os.path.getsize(fp)
                                 file_count += 1
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             stats[name] = {
                 "size_mb": round(size_bytes / (1024 * 1024), 2),

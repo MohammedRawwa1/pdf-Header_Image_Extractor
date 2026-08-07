@@ -171,6 +171,6 @@ class RedisLock:
             except Exception:
                 try:
                     await self._client.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             self._client = None

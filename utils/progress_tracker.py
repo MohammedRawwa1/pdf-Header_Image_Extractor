@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 PREFIX_PROGRESS = "progress:"
 
 
+from utils.rate_limiter import telegram_api_limiter  # noqa: E402
 from utils.redis_client import get_sync_redis  # noqa: E402
 
 
@@ -76,6 +77,11 @@ class TaskProgress:
         self.status = "failed"
         self.error_message = error_message
 
+    def cancel(self):
+        """Mark the task as cancelled (used by /canceljob)."""
+        self.end_time = time.time()
+        self.status = "cancelled"
+
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
@@ -109,7 +115,7 @@ class ProgressTracker:
             # Active tasks get 1h TTL, completed/failed get 5min
             ttl = 3600 if task.status not in ("completed", "failed") else 300
             r.setex(key, ttl, data)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
     def create_task(
@@ -151,7 +157,7 @@ class ProgressTracker:
                     )
                     self.tasks[task_id] = task
                     return task
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return None
 
@@ -207,20 +213,62 @@ class ProgressTracker:
                     "error_message": task.error_message,
                 },
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
     def remove_task(self, task_id: str):
         if task_id in self.tasks:
             del self.tasks[task_id]
-            # Clean up Redis
-            try:
-                r = get_sync_redis()
-                if r:
-                    r.delete(f"{PREFIX_PROGRESS}{task_id}")
-            except Exception:
-                pass
-            logger.info("Removed task: %s", task_id)
+        # Always clean up the Redis key, even when the task only exists in
+        # Redis (e.g. after a process restart) so no stale keys accumulate.
+        try:
+            r = get_sync_redis()
+            if r:
+                r.delete(f"{PREFIX_PROGRESS}{task_id}")
+        except Exception:  # nosec B110
+            pass
+        logger.info("Removed task: %s", task_id)
+
+    async def cancel_task(self, task_id: str) -> bool:
+        """Cancel a task completely: mark cancelled, persist, then wipe from
+        Redis + memory so no stale keys remain.
+
+        Returns True if a task was found and cancelled.
+        """
+        task = self.tasks.get(task_id)
+        if task is None:
+            task = self.get_task(task_id)
+        if task is None:
+            return False
+        task.cancel()
+        # No need to persist the cancelled state to Redis: remove_task below
+        # wipes the key entirely (cancelled status only matters for the Mongo
+        # backup + callbacks).
+        await self._save_to_mongodb(task)
+        await self._notify_callbacks(task_id, task)
+        # Wipe from Redis and memory now that the task is cancelled
+        self.remove_task(task_id)
+        logger.info("Cancelled task: %s", task_id)
+        return True
+
+    def find_task_id_by_prefix(self, prefix: str) -> str | None:
+        """Find an active task id by prefix (users see truncated ids like `abc12345`)."""
+        # in-memory first
+        for tid in self.tasks:
+            if tid.startswith(prefix):
+                return tid
+        # Redis fallback (active tasks are persisted under `progress:<id>`)
+        try:
+            r = get_sync_redis()
+            if r:
+                for key in r.scan_iter(f"{PREFIX_PROGRESS}*", count=100):
+                    k = key.decode() if isinstance(key, bytes) else key
+                    tid = k[len(PREFIX_PROGRESS):]
+                    if tid.startswith(prefix):
+                        return tid
+        except Exception:  # nosec B110
+            pass
+        return None
 
     def register_callback(self, task_id: str, callback: Callable):
         self.callbacks[task_id] = callback
@@ -314,7 +362,18 @@ async def send_progress_update(
     Uses Unicode block characters for maximum cross-client compatibility.
     Bar uses 3 shades: █ (filled), ▓ (partial), ░ (remaining)
     20 segments = 5% each for smooth granularity.
+
+    Throttled by the shared ``telegram_api_limiter`` (global 30/s +
+    per-user 1/s) — this is the hottest outbound path (2-3 sends per
+    file under multi-user load), so it must respect Telegram flood limits.
     """
+    # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
+    try:
+        await telegram_api_limiter.wait_if_needed(
+            str(getattr(task, "user_id", 0) or 0)
+        )
+    except Exception:  # nosec B110 - throttling is best-effort
+        pass
     try:
         total_progress = task.progress_percentage
         bar = _build_progress_bar(total_progress)

@@ -1,13 +1,14 @@
 import asyncio
-import glob
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import time
 import uuid
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import aiofiles
@@ -67,6 +68,7 @@ from config import OWNER_ID  # noqa: E402
 from tools import (  # noqa: E402
     create_thumbnail_from_image,
     create_thumbnail_from_pdf,
+    extract_pdf_metadata,
     is_supported_format,
     is_valid_pdf,
 )
@@ -82,7 +84,7 @@ from utils.progress_tracker import (  # noqa: E402
 )
 from utils.rate_limiter import (  # noqa: E402
     RedisSlidingWindowRateLimiter,
-    TelegramAPIRateLimiter,
+    telegram_api_limiter,  # shared singleton (bot.py + progress tracker)
 )
 from utils.redis_client import get_sync_redis  # noqa: E402
 from utils.session_healthcheck import (  # noqa: E402
@@ -110,9 +112,11 @@ logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(
 logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Global error handler and rate limiter instances
+# Global error handler instance
+# NOTE: `telegram_api_limiter` is the shared singleton from utils.rate_limiter,
+# reused by send_progress_update so the global 30/s + per-user 1/s budgets
+# stay accurate across all outbound sends in this process.
 bot_error_handler = get_error_handler()
-telegram_api_limiter = TelegramAPIRateLimiter()
 
 # Global BigFilePipeline instance for large file ingestion
 _bigfile_pipeline = None
@@ -124,16 +128,25 @@ except Exception as e:
 
 
 # ── Userbot availability cache (checked once per handler call) ──
-def _check_userbot_available() -> bool:
-    """Return True if a Telethon or Pyrogram userbot session is configured."""
+def _check_userbot_available(user_id: int | None = None) -> bool:
+    """Return True if a Telethon or Pyrogram userbot session is configured.
+
+    When ``user_id`` is provided, checks that user's own sessions first
+    (per-user login), falling back to the global/admin session.
+
+    Honors ``ENABLE_USERBOT``: when explicitly set to false/0/no, the
+    userbot fallback is disabled entirely (mirrors the reference's gate).
+    """
     try:
+        if not config.ENABLE_USERBOT:
+            return False
         from utils.telethon_session import (
             get_pyrogram_session_string,
             has_usable_telethon_session,
         )
 
-        return has_usable_telethon_session() or bool(
-            get_pyrogram_session_string()
+        return has_usable_telethon_session(user_id=user_id) or bool(
+            get_pyrogram_session_string(user_id=user_id)
         )
     except Exception:
         return False
@@ -153,7 +166,7 @@ def _make_progress_cb(task_id: str, loop: asyncio.AbstractEventLoop):
                 progress_tracker.update_task_progress(task_id, current),
                 loop,
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
     return _cb
@@ -204,6 +217,7 @@ async def _send_with_upload_progress(
             caption=caption,
             thumb_path=thumb_path,
             progress_callback=_cb,
+            user_id=user_id,
         )
         if success:
             await progress_tracker.complete_task(task.task_id)
@@ -212,7 +226,7 @@ async def _send_with_upload_progress(
                     await send_progress_update(
                         chat_id, bot, task, progress_msg_id
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             logger.info(
                 "Upload complete: %s (%s)", filename, _format_size(file_size)
@@ -227,7 +241,7 @@ async def _send_with_upload_progress(
                     await send_progress_update(
                         chat_id, bot, task, progress_msg_id
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             raise RuntimeError(f"Userbot upload failed for {filename}")
     except Exception as e:
@@ -235,7 +249,7 @@ async def _send_with_upload_progress(
         if progress_msg_id:
             try:
                 await send_progress_update(chat_id, bot, task, progress_msg_id)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
         raise
 
@@ -268,7 +282,7 @@ async def _notify_download_failed(msg, file_size=None):
             "3. S3 pipeline (if configured)\n\n"
             "Options:\n" + "\n".join(options)
         )
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
@@ -346,6 +360,7 @@ async def _userbot_download_fallback(
                     dest_path=file_path,
                     progress_callback=_cb,
                     file_id=file_id,
+                    user_id=user_id,
                 )
                 if dl_ok and filename.lower().endswith(".pdf"):
                     if not is_valid_pdf(file_path):
@@ -355,7 +370,7 @@ async def _userbot_download_fallback(
                         dl_ok = False
                         try:
                             os.remove(file_path)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
             except Exception as fwd_err:
                 logger.warning("forward source download failed: %s", fwd_err)
@@ -389,6 +404,7 @@ async def _userbot_download_fallback(
                             dest_path=file_path,
                             progress_callback=_cb,
                             file_id=file_id,
+                            user_id=user_id,
                         )
                         if dl_ok and filename.lower().endswith(".pdf"):
                             if not is_valid_pdf(file_path):
@@ -398,7 +414,7 @@ async def _userbot_download_fallback(
                                 dl_ok = False
                                 try:
                                     os.remove(file_path)
-                                except Exception:
+                                except Exception:  # nosec B110
                                     pass
                     else:
                         raise Exception(
@@ -443,6 +459,7 @@ async def _userbot_download_fallback(
                                 dest_path=file_path,
                                 progress_callback=_cb,
                                 file_id=file_id,
+                                user_id=user_id,
                             )
                             if dl_ok and filename.lower().endswith(".pdf"):
                                 if not is_valid_pdf(file_path):
@@ -452,7 +469,7 @@ async def _userbot_download_fallback(
                                     dl_ok = False
                                     try:
                                         os.remove(file_path)
-                                    except Exception:
+                                    except Exception:  # nosec B110
                                         pass
                         else:
                             raise Exception(
@@ -478,6 +495,7 @@ async def _userbot_download_fallback(
             dest_path=file_path,
             progress_callback=_cb,
             file_id=file_id,
+            user_id=user_id,
         )
         if dl_ok and filename.lower().endswith(".pdf"):
             if not is_valid_pdf(file_path):
@@ -487,7 +505,7 @@ async def _userbot_download_fallback(
                 dl_ok = False
                 try:
                     os.remove(file_path)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
     # 4) BigFilePipeline (S3 pipeline)
@@ -539,25 +557,9 @@ async def _userbot_download_fallback(
                     await send_progress_update(
                         msg.chat.id, msg.get_bot(), task, progress_msg_id
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         return False
-
-
-# ── Login flow state ───────────────────────────────────────────
-# Tracks which users are currently in the /login flow
-LOGIN_PENDING_USERS: set = set()
-
-
-class AwaitingLoginFilter(filters.MessageFilter):
-    """Filter text messages only for users in the Telethon login flow."""
-
-    def filter(self, message):
-        try:
-            user = getattr(message, "from_user", None)
-            return bool(user and user.id in LOGIN_PENDING_USERS)
-        except Exception:
-            return False
 
 
 # ── User session tracking (Redis + MongoDB) ──────────────────
@@ -572,13 +574,13 @@ def _init_session_imports():
         from utils.cache import get_cache as _gc
 
         _cache_get_cache = _gc
-    except Exception:
+    except Exception:  # nosec B110
         pass
     try:
         from utils.db import save_user_session as _ss
 
         _db_save_user_session = _ss
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
@@ -610,37 +612,47 @@ async def _track_user_session(update: Update, action: str = "message"):
             try:
                 cache = await _cache_get_cache()
                 await cache.cache_user_session(str(uid), session_data)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
         # MongoDB (durable history)
         if _db_save_user_session is not None:
             try:
                 await _db_save_user_session(uid, session_data)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
 # Optional RQ enqueue helper (import only when needed)
 def enqueue_job(func_name: str, *args, **kwargs):
+    """Enqueue a job on the RQ 'default' queue.
+
+    Returns the RQ job id (so /canceljob can cancel it) or None on failure.
+
+    Uses a NON-decoding Redis connection (same as ``_cancel_rq_job`` and the
+    RQ worker): RQ stores job payloads pickled as raw bytes, so the
+    decode_responses=True singleton must never back an RQ Queue — reads
+    through it would UnicodeDecodeError.
+    """
     try:
         from rq import Queue
 
         import tasks
+        from utils.redis_client import get_sync_redis_raw
 
-        redis_conn = get_sync_redis()
+        redis_conn = get_sync_redis_raw()
         if not redis_conn:
             logger.error("Redis not available for enqueue_job")
-            return False
+            return None
         q = Queue("default", connection=redis_conn)
         # lookup function from tasks
         func = getattr(tasks, func_name)
-        q.enqueue(func, *args, **kwargs)
-        return True
+        job = q.enqueue(func, *args, **kwargs)
+        return getattr(job, "id", None)
     except Exception:
         logger.exception("Failed to enqueue job for %s", func_name)
-        return False
+        return None
 
 
 BOT_TOKEN = config.BOT_TOKEN
@@ -657,7 +669,6 @@ USE_POLLING = config.USE_POLLING
 # If not configured via WEBHOOK_SECRET env var, generate a random one on startup.
 WEBHOOK_SECRET = config.WEBHOOK_SECRET
 if not WEBHOOK_SECRET:
-    import secrets
 
     WEBHOOK_SECRET = secrets.token_urlsafe(32)
     logger.warning(
@@ -671,29 +682,9 @@ if not WEBHOOK_SECRET:
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # ── Session healthcheck background task ─────────────────────
-# Start the periodic session health verification loop.
-# The checker will persist healthy session strings to JSON + MongoDB.
+# Started inside the FastAPI lifespan startup (on_startup), where a
+# running event loop exists — see the lifespan handler above.
 _shc_task = None
-try:
-    _admin_id = (
-        OWNER_ID
-        if OWNER_ID
-        else (list(config.ADMIN_USERS)[0] if config.ADMIN_USERS else None)
-    )
-    if _admin_id:
-        _shc_task = start_session_healthcheck(
-            admin_user_id=_admin_id,
-            bot_app=application,
-            db_model=None,  # uses utils.db fallback for MongoDB persistence
-            check_interval=int(
-                os.getenv("SESSION_HEALTHCHECK_INTERVAL", "3600")
-            ),
-        )
-        logger.info("Session healthcheck started for admin %s", _admin_id)
-    else:
-        logger.info("No admin configured; session healthcheck disabled")
-except Exception as e:
-    logger.warning("Session healthcheck init failed (non-fatal): %s", e)
 
 # Batch-forward collection helpers (Redis-backed with local fallback)
 local_forward_batches = {}
@@ -791,6 +782,19 @@ async def handle_document(
         return
 
     doc = msg.document
+    # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await msg.reply_text("Access denied. This bot is private.")
+        return
+
+    # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
+    try:
+        await telegram_api_limiter.wait_if_needed(
+            str(getattr(update.effective_user, "id", 0))
+        )
+    except Exception:  # nosec B110 - throttling is best-effort
+        pass
+
     # If REDIS_URL provided, enqueue background job and return immediately
     chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
     filename = _sanitize_filename(doc.file_name, f"file_{doc.file_id}")
@@ -814,25 +818,7 @@ async def handle_document(
         )
         return
 
-    # If this was forwarded and a forward-batch is active for this sender, store metadata and return
-    is_forwarded = bool(
-        getattr(msg, "forward_from", None)
-        or getattr(msg, "forward_from_chat", None)
-        or getattr(msg, "forward_date", None)
-    )
-    user_id = getattr(update.effective_user, "id", None)
-    if is_forwarded and is_batch_active(chat_id, user_id):
-        item = {
-            "file_id": doc.file_id,
-            "file_unique_id": getattr(doc, "file_unique_id", None),
-            "filename": filename,
-            "mime": mime,
-        }
-        append_forward_item(chat_id, user_id, item)
-        await msg.reply_text(f"Added forwarded file to batch: {filename}")
-        return
-
-    # ── Capture forward metadata (for userbot fallback) ──────────────
+    # ── Capture forward metadata (for userbot fallback + batch items) ──
     forward_info = None
     try:
         fch = getattr(msg, "forward_from_chat", None)
@@ -846,21 +832,40 @@ async def handle_document(
                 forward_info["message_id"] = f_msg_id
             if f_user:
                 forward_info["user_id"] = f_user.id
-    except Exception:
+    except Exception:  # nosec B110
         pass
+
+    # If this was forwarded and a forward-batch is active for this sender, store metadata and return
+    is_forwarded = bool(
+        getattr(msg, "forward_from", None)
+        or getattr(msg, "forward_from_chat", None)
+        or getattr(msg, "forward_date", None)
+    )
+    user_id = getattr(update.effective_user, "id", None)
+    if is_forwarded and await asyncio.to_thread(
+        is_batch_active, chat_id, user_id
+    ):
+        item = {
+            "file_id": doc.file_id,
+            "file_unique_id": getattr(doc, "file_unique_id", None),
+            "filename": filename,
+            "mime": mime,
+            "message_id": msg.message_id,
+            "forward_info": forward_info,
+            "file_size": getattr(doc, "file_size", None),
+        }
+        await asyncio.to_thread(append_forward_item, chat_id, user_id, item)
+        await msg.reply_text(f"Added forwarded file to batch: {filename}")
+        return
 
     # If Telegram reports a file_size on the Document, check it against the configured
     # upload limit before attempting to enqueue or download. Telegram's Bot API will
     # reject downloads for files larger than the bot's allowed size (returns 400 "file is too big").
     file_size = getattr(doc, "file_size", None)
-    upload_limit = (
-        config.MAX_FILE_SIZE
-        if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-        else 50 * 1024 * 1024
-    )
+    upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
     use_userbot_download = False
     if file_size and upload_limit and file_size > upload_limit:
-        _userbot_ok = _check_userbot_available()
+        _userbot_ok = _check_userbot_available(user_id)
         if _userbot_ok:
             use_userbot_download = True
             logger.info(
@@ -891,7 +896,8 @@ async def handle_document(
         # (getFile) which cannot handle files >50MB and will fail with "file is too big".
         if not use_userbot_download:
             # Pass message_id + forward_info + file_size so the worker has context for userbot fallback
-            ok = enqueue_job(
+            ok = await asyncio.to_thread(
+                enqueue_job,
                 "process_document_job",
                 chat_id,
                 doc.file_id,
@@ -901,10 +907,12 @@ async def handle_document(
                 msg.message_id,
                 forward_info,
                 file_size,
+                user_id,
             )
             if ok:
                 await msg.reply_text(
-                    "Queued your file for background processing; I'll send the result when ready."
+                    "Queued your file for background processing; I'll send the result when ready.\n"
+                    f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
                 )
                 return
             # fall through to inline processing on enqueue failure
@@ -980,7 +988,7 @@ async def handle_document(
             _dl_success = False
             try:
                 os.remove(file_path)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             raise RuntimeError(
                 "Bot API download produced invalid PDF, falling back to userbot"
@@ -988,7 +996,6 @@ async def handle_document(
 
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         lower = filename.lower()
-        mime = mime
 
         # Return original file unchanged but attach generated thumbnail as header
         if lower.endswith(".pdf") or mime == "application/pdf":
@@ -1002,17 +1009,27 @@ async def handle_document(
 
         chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
         _dl_size = os.path.getsize(file_path)
-        _ul_limit = (
-            config.MAX_FILE_SIZE
-            if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-            else 50 * 1024 * 1024
-        )
-        if _dl_size > _ul_limit and _check_userbot_available():
+        _ul_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+        # ── Full PDF metadata retrieval (surfaced in the caption) ──
+        caption = "Here is your file with an auto-generated cover preview."
+        if lower.endswith(".pdf") or mime == "application/pdf":
+            meta = extract_pdf_metadata(file_path)
+            if meta.get("extracted"):
+                meta_bits = []
+                if meta.get("title"):
+                    meta_bits.append(f"📄 {meta['title']}")
+                if meta.get("author"):
+                    meta_bits.append(f"✍️ {meta['author']}")
+                meta_bits.append(f"📑 {meta['pages']} pages")
+                if meta.get("file_size"):
+                    meta_bits.append(_format_size(meta["file_size"]))
+                caption += "\n\n" + " · ".join(meta_bits)
+        if _dl_size > _ul_limit and _check_userbot_available(user_id):
             await _send_with_upload_progress(
                 bot=context.bot,
                 chat_id=chat_id,
                 file_path=file_path,
-                caption="Here is your file with an auto-generated cover preview.",
+                caption=caption,
                 thumb_path=thumb_path,
                 user_id=user_id,
                 filename=filename,
@@ -1030,7 +1047,7 @@ async def handle_document(
                     chat_id=chat_id,
                     document=input_doc,
                     thumbnail=f_thumb,
-                    caption="Here is your file with an auto-generated cover preview.",
+                    caption=caption,
                 )
         if task:
             await progress_tracker.complete_task(task.task_id)
@@ -1040,7 +1057,7 @@ async def handle_document(
                 )
     except Exception as e:
         # Try userbot fallback if Bot API download failed
-        if not _dl_success and _check_userbot_available():
+        if not _dl_success and _check_userbot_available(user_id):
             logger.info(
                 "Bot API download failed, falling back to userbot download for %s",
                 filename,
@@ -1079,13 +1096,8 @@ async def handle_document(
                         else msg.chat.id
                     )
                     _fb_size = os.path.getsize(file_path)
-                    _fb_limit = (
-                        config.MAX_FILE_SIZE
-                        if getattr(config, "MAX_FILE_SIZE", 0)
-                        and config.MAX_FILE_SIZE > 0
-                        else 50 * 1024 * 1024
-                    )
-                    if _fb_size > _fb_limit and _check_userbot_available():
+                    _fb_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+                    if _fb_size > _fb_limit and _check_userbot_available(user_id):
                         await _send_with_upload_progress(
                             bot=context.bot,
                             chat_id=chat_id,
@@ -1127,11 +1139,11 @@ async def handle_document(
                     await send_progress_update(
                         msg.chat.id, context.bot, task, progress_msg_id
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         try:
             await msg.reply_text(error_info["user_message"])
-        except Exception:
+        except Exception:  # nosec B110
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1145,31 +1157,26 @@ async def handle_photo(
     if not msg or not msg.photo:
         return
 
+    # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await msg.reply_text("Access denied. This bot is private.")
+        return
+
+    # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
+    try:
+        await telegram_api_limiter.wait_if_needed(
+            str(getattr(update.effective_user, "id", 0))
+        )
+    except Exception:  # nosec B110 - throttling is best-effort
+        pass
+
     photo = msg.photo[-1]
     photo_size = getattr(photo, "file_size", None) or 0
 
     # If REDIS_URL configured, enqueue background job and return immediately
     chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
     filename = _sanitize_filename(f"photo_{photo.file_id}.jpg", "photo.jpg")
-    # If this photo was forwarded and batch collection is active, append to batch
-    is_forwarded = bool(
-        getattr(msg, "forward_from", None)
-        or getattr(msg, "forward_from_chat", None)
-        or getattr(msg, "forward_date", None)
-    )
-    user_id = getattr(update.effective_user, "id", None)
-    if is_forwarded and is_batch_active(chat_id, user_id):
-        item = {
-            "file_id": photo.file_id,
-            "file_unique_id": getattr(photo, "file_unique_id", None),
-            "filename": filename,
-            "mime": "image/jpeg",
-        }
-        append_forward_item(chat_id, user_id, item)
-        await msg.reply_text(f"Added forwarded photo to batch: {filename}")
-        return
-
-    # ── Capture forward metadata (for userbot fallback) ──────────────
+    # ── Capture forward metadata (for userbot fallback + batch items) ──
     photo_forward_info = None
     try:
         fch = getattr(msg, "forward_from_chat", None)
@@ -1183,13 +1190,37 @@ async def handle_photo(
                 photo_forward_info["message_id"] = f_msg_id
             if f_user:
                 photo_forward_info["user_id"] = f_user.id
-    except Exception:
+    except Exception:  # nosec B110
         pass
+
+    # If this photo was forwarded and batch collection is active, append to batch
+    is_forwarded = bool(
+        getattr(msg, "forward_from", None)
+        or getattr(msg, "forward_from_chat", None)
+        or getattr(msg, "forward_date", None)
+    )
+    user_id = getattr(update.effective_user, "id", None)
+    if is_forwarded and await asyncio.to_thread(
+        is_batch_active, chat_id, user_id
+    ):
+        item = {
+            "file_id": photo.file_id,
+            "file_unique_id": getattr(photo, "file_unique_id", None),
+            "filename": filename,
+            "mime": "image/jpeg",
+            "message_id": msg.message_id,
+            "forward_info": photo_forward_info,
+            "file_size": photo_size,
+        }
+        await asyncio.to_thread(append_forward_item, chat_id, user_id, item)
+        await msg.reply_text(f"Added forwarded photo to batch: {filename}")
+        return
 
     # Thumbnail caching disabled
 
     if config.REDIS_URL:
-        ok = enqueue_job(
+        ok = await asyncio.to_thread(
+            enqueue_job,
             "process_document_job",
             chat_id,
             photo.file_id,
@@ -1199,10 +1230,12 @@ async def handle_photo(
             msg.message_id,
             photo_forward_info,
             photo_size,
+            user_id,
         )
         if ok:
             await msg.reply_text(
-                "Queued your photo for background processing; I'll send the result when ready."
+                "Queued your photo for background processing; I'll send the result when ready.\n"
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
             )
             return
 
@@ -1218,13 +1251,9 @@ async def handle_photo(
     try:
         file_path = os.path.join(tmpdir, filename)
 
-        upload_limit = (
-            config.MAX_FILE_SIZE
-            if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-            else 50 * 1024 * 1024
-        )
+        upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
 
-        if photo_size > upload_limit and _check_userbot_available():
+        if photo_size > upload_limit and _check_userbot_available(user_id):
             # ── Userbot download path for large photos ──
             _dl_result = await _userbot_download_fallback(
                 msg,
@@ -1276,12 +1305,8 @@ async def handle_photo(
         )  # send original image back as document to preserve original bytes, attach thumbnail
         chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
         _ph_size = os.path.getsize(file_path)
-        _ph_limit = (
-            config.MAX_FILE_SIZE
-            if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-            else 50 * 1024 * 1024
-        )
-        if _ph_size > _ph_limit and _check_userbot_available():
+        _ph_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+        if _ph_size > _ph_limit and _check_userbot_available(user_id):
             await _send_with_upload_progress(
                 bot=context.bot,
                 chat_id=chat_id,
@@ -1316,7 +1341,7 @@ async def handle_photo(
                 )
     except Exception as e:
         # If Bot API download failed but userbot is available, try fallback
-        if not _dl_success and _check_userbot_available():
+        if not _dl_success and _check_userbot_available(user_id):
             logger.info(
                 "Bot API download failed for photo, falling back to userbot"
             )
@@ -1338,15 +1363,10 @@ async def handle_photo(
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
                     create_thumbnail_from_image(file_path, thumb_path)
                     _ph_fb_size = os.path.getsize(file_path)
-                    _ph_fb_limit = (
-                        config.MAX_FILE_SIZE
-                        if getattr(config, "MAX_FILE_SIZE", 0)
-                        and config.MAX_FILE_SIZE > 0
-                        else 50 * 1024 * 1024
-                    )
+                    _ph_fb_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
                     if (
                         _ph_fb_size > _ph_fb_limit
-                        and _check_userbot_available()
+                        and _check_userbot_available(user_id)
                     ):
                         await _send_with_upload_progress(
                             bot=context.bot,
@@ -1391,11 +1411,11 @@ async def handle_photo(
                     await send_progress_update(
                         msg.chat.id, context.bot, task, progress_msg_id
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         try:
             await msg.reply_text(error_info["user_message"])
-        except Exception:
+        except Exception:  # nosec B110
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1409,37 +1429,76 @@ async def cmd_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await _track_user_session(update, "/start")
+    user_id = getattr(update.effective_user, "id", None)
+    if not config.is_user_allowed(user_id):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
+    user_name = getattr(update.effective_user, "first_name", None) or "there"
     await update.effective_message.reply_text(
-        "Hello! Send me a PDF or image and I'll return a thumbnail (PDF first page as cover)."
+        f"🎉 Welcome, {user_name}!\n\n"
+        "📄 Send me a **PDF** or **image** and I'll return a thumbnail "
+        "(PDF first page used as cover).\n\n"
+        "⚡ **Quick commands:**\n"
+        "• /help — all commands\n"
+        "• /login — connect **your** Telethon account (large files)\n"
+        "• /loginpyro — connect **your** Pyrogram account (large files)\n"
+        "• /loginstatus — check **your** session health\n"
+        "• /canceljob <id> — cancel a queued/in-flight job\n"
+        "• /startbatch + /endbatch — process multiple files at once\n\n"
+        "_Sessions are per-user: nobody else can use your account._",
+        parse_mode="Markdown",
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _track_user_session(update, "/help")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
     text = (
-        "/start - start\n"
-        "/help - this help\n"
-        "/status - get bot status\n"
-        "/login - (owner) login Telethon userbot\n"
-        "/loginpyro - (owner) login Pyrogram userbot\n"
-        "/loginstatus - (owner) show login status\n"
-        "/logout - (owner) logout and clear session\n"
-        "/clearflood - (owner) clear flood wait / resend code\n"
-        "/setwebhook <url> - (admin) set webhook to URL\n"
-        "/delwebhook - (admin) delete webhook\n"
-        "/setcommands - (admin) set bot command list\n"
-        "/sessionstatus - (owner) check userbot session health\n"
-        "/startbatch - start collecting forwarded files\n"
-        "/endbatch - process collected batch\n"
-        "/cancelbatch - cancel batch collection\n"
+        "📚 **Help — all commands**\n\n"
+        "**📄 Core**\n"
+        "• /start — welcome & quick start\n"
+        "• /help — this help\n"
+        "• /status — bot status\n\n"
+        "**🔐 Your sessions (per-user)**\n"
+        "• /login [phone] — connect **your** Telethon account\n"
+        "• /loginpyro [phone] — connect **your** Pyrogram account\n"
+        "• /loginstatus — check **your** session health\n"
+        "• /logout — disconnect **your** Telethon session\n"
+        "• /logoutpyro — disconnect **your** Pyrogram session\n"
+        "• /clearflood — reset a stuck login flow\n"
+        "• /cancel — cancel an active login flow\n\n"
+        "**📦 Jobs**\n"
+        "• /canceljob <id> — cancel a queued/in-flight job\n\n"
+        "**🗂 Batch**\n"
+        "• /startbatch — start collecting forwarded files\n"
+        "• /endbatch — process the collected batch\n"
+        "• /cancelbatch — discard the collected batch\n\n"
+        "**⚙️ Admin / owner**\n"
+        "• /admin add|remove|list <user_id> — manage allowed users\n"
+        "• /sessionstatus — userbot session health (owner)\n"
+        "• /setwebhook <url> — set webhook (owner)\n"
+        "• /delwebhook — delete webhook (owner)\n"
+        "• /setcommands — push this list to Telegram (owner)\n\n"
+        "_Send a PDF or image any time to get its thumbnail._"
     )
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_status(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await _track_user_session(update, "/status")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
     # Minimal, non-sensitive status reply
     await update.effective_message.reply_text("active")
 
@@ -1495,7 +1554,7 @@ async def cmd_setwebhook(
                     return
             except ValueError:
                 pass  # Hostname, not an IP - allow through
-        except Exception:
+        except Exception:  # nosec B110
             pass  # Best-effort validation
     except Exception:
         await update.effective_message.reply_text("\u274c Invalid URL format")
@@ -1557,17 +1616,22 @@ async def cmd_setcommands(
         BotCommand("start", "Start interaction with the bot"),
         BotCommand("help", "Show help and available commands"),
         BotCommand("status", "Get bot status"),
-        BotCommand("login", "(owner) Login Telethon userbot"),
-        BotCommand("loginpyro", "(owner) Login Pyrogram userbot"),
-        BotCommand("loginstatus", "(owner) Show login status"),
-        BotCommand("logout", "(owner) Logout and clear session"),
-        BotCommand("clearflood", "(owner) Clear flood wait / resend code"),
+        BotCommand("login", "Login your Telethon userbot"),
+        BotCommand("loginpyro", "Login your Pyrogram userbot"),
+        BotCommand("loginstatus", "Check your live session health"),
+        BotCommand("logout", "Logout your Telethon session"),
+        BotCommand("logoutpyro", "Logout your Pyrogram session"),
+        BotCommand("clearflood", "Clear an active login flow"),
+        BotCommand("admin", "Manage allowed users"),
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
+        BotCommand("canceljob", "Cancel a queued/in-flight job"),
+        BotCommand("cancel", "Cancel an active login flow"),
+        BotCommand("setcommands", "(owner) Update the command list"),
         BotCommand("sessionstatus", "(owner) Check userbot session health"),
-        BotCommand("setwebhook", "(admin) Set webhook URL"),
-        BotCommand("delwebhook", "(admin) Delete webhook"),
+        BotCommand("setwebhook", "(owner) Set webhook URL"),
+        BotCommand("delwebhook", "(owner) Delete webhook"),
     ]
     try:
         await context.bot.set_my_commands(commands)
@@ -1591,6 +1655,11 @@ async def cmd_startbatch(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await _track_user_session(update, "/startbatch")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -1599,7 +1668,7 @@ async def cmd_startbatch(
             "Unable to start batch here."
         )
         return
-    start_forward_batch(chat_id, user_id)
+    await asyncio.to_thread(start_forward_batch, chat_id, user_id)
     await update.effective_message.reply_text(
         "Started forward-collection batch. Forward messages now; when finished run /endbatch to process them."
     )
@@ -1609,6 +1678,11 @@ async def cmd_endbatch(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await _track_user_session(update, "/endbatch")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -1617,7 +1691,9 @@ async def cmd_endbatch(
             "Unable to finish batch here."
         )
         return
-    items = get_forward_items(chat_id, user_id)
+    items = await asyncio.to_thread(
+        get_forward_items, chat_id, user_id
+    )
     if not items:
         await update.effective_message.reply_text(
             "No forwarded items were collected in the batch."
@@ -1626,11 +1702,14 @@ async def cmd_endbatch(
 
     # enqueue a single batch job which processes items in order
     if config.REDIS_URL:
-        ok = enqueue_job("process_document_batch_job", chat_id, items)
+        ok = await asyncio.to_thread(
+            enqueue_job, "process_document_batch_job", chat_id, items, user_id
+        )
         if ok:
-            clear_forward_batch(chat_id, user_id)
+            await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
             await update.effective_message.reply_text(
-                f"Queued batch with {len(items)} items for processing."
+                f"Queued batch with {len(items)} items for processing.\n"
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
             )
             return
         # fall through to inline execution on failure
@@ -1642,9 +1721,9 @@ async def cmd_endbatch(
         # run in executor to avoid blocking
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, tasks.process_document_batch_job, chat_id, items
+            None, tasks.process_document_batch_job, chat_id, items, user_id
         )
-        clear_forward_batch(chat_id, user_id)
+        await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
         await update.effective_message.reply_text(
             f"Processed batch with {len(items)} items."
         )
@@ -1659,6 +1738,11 @@ async def cmd_cancelbatch(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     await _track_user_session(update, "/cancelbatch")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
     user = update.effective_user
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = getattr(user, "id", None)
@@ -1667,7 +1751,7 @@ async def cmd_cancelbatch(
             "Unable to cancel batch here."
         )
         return
-    clear_forward_batch(chat_id, user_id)
+    await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
     await update.effective_message.reply_text(
         "Cancelled and cleared forwarded batch."
     )
@@ -1705,1298 +1789,678 @@ async def cmd_sessionstatus(
 
 application.add_handler(CommandHandler("sessionstatus", cmd_sessionstatus))
 
-# ── Telethon / Userbot Login Commands ────────────────────────
+# ── Telethon / Userbot Login Commands (per-user) ──────────────
+# Login flows live in utils/login_handler.py and use the background-task +
+# asyncio.Future pattern. Each user logs in with their OWN Telethon or
+# Pyrogram session; sessions are persisted per-user (JSON files + MongoDB)
+# and every download/upload resolves that user's session.
 
-
-def _clear_login_flow(user_id, context):
-    """Clean up all login flow state for a user."""
-    try:
-        LOGIN_PENDING_USERS.discard(user_id)
-    except Exception:
-        pass
-    if context is not None and getattr(context, "user_data", None) is not None:
-        try:
-            login_task = context.user_data.get("login_start_task")
-            if login_task is not None and not login_task.done():
-                login_task.cancel()
-        except Exception:
-            pass
-        try:
-            fut = context.user_data.get("login_pending_future")
-            if fut is not None and not fut.done():
-                fut.cancel()
-        except Exception:
-            pass
-        try:
-            client = context.user_data.get("login_client")
-            if client is not None:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.create_task(client.disconnect())
-                except RuntimeError:
-                    pass
-        except Exception:
-            pass
-        # Safety net: also stop any lingering Pyrogram client
-        try:
-            pyro_client = context.user_data.get("pyro_client")
-            if pyro_client is not None:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.create_task(pyro_client.stop())
-                except RuntimeError:
-                    pass
-        except Exception:
-            pass
-        for key in (
-            "awaiting_login_phone",
-            "awaiting_login_code",
-            "awaiting_login_password",
-            "login_phone",
-            "login_client",
-            "login_session_path",
-            "login_code_sent_at",
-            "login_code_sent_repr",
-            "login_code_hash",
-            "login_code_type",
-            "login_flood_wait_until",
-            "login_resend_count",
-            "login_password_retry_count",
-            "login_pending_future",
-            "login_pending_type",
-            "login_start_task",
-            "login_flow_started",
-            # Pyrogram login flow keys
-            "awaiting_pyro_phone",
-            "awaiting_pyro_code",
-            "awaiting_pyro_password",
-            "pyro_client",
-            "pyro_phone",
-            "pyro_phone_code_hash",
-            "pyro_sent_code_type",
-            "pyro_flood_wait_until",
-            "pyro_password_retry_count",
-            "pyro_login_type",
-        ):
-            context.user_data.pop(key, None)
-
-
-async def cmd_login(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Start Telethon userbot login flow."""
-    user = update.effective_user
-    uid = getattr(user, "id", None)
-    if not config.is_owner(uid):
-        await update.effective_message.reply_text(
-            "\u26d4 Only the bot owner can run this command."
-        )
-        return
-
-    try:
-        from telethon import TelegramClient  # noqa: F401
-    except ImportError:
-        await update.effective_message.reply_text(
-            "Telethon is not installed. Install telethon to use /login:\n"
-            "pip install telethon"
-        )
-        return
-
-    api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
-    api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
-    if not api_id or not api_hash:
-        await update.effective_message.reply_text(
-            "Missing Telethon credentials. Set API_ID and API_HASH in the environment."
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "Please send the phone number for the userbot session in international format, e.g. +1234567890."
-    )
-    context.user_data["awaiting_login_phone"] = True
-    LOGIN_PENDING_USERS.add(uid)
-
-
-async def cmd_loginpyro(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Start Pyrogram userbot login flow.
-
-    After successful login, the session string is automatically persisted to:
-    - JSON file (session_name.session.json)
-    - MongoDB (via utils.db.save_user_session)
-    """
-    user = update.effective_user
-    uid = getattr(user, "id", None)
-    if not config.is_owner(uid):
-        await update.effective_message.reply_text(
-            "\u26d4 Only the bot owner can run this command."
-        )
-        return
-
-    try:
-        from pyrogram import Client as PyrogramClient  # noqa: F401
-    except ImportError:
-        await update.effective_message.reply_text(
-            "Pyrogram is not installed. Install pyrogram to use /loginpyro:\n"
-            "pip install pyrogram"
-        )
-        return
-
-    api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
-    api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
-    if not api_id or not api_hash:
-        await update.effective_message.reply_text(
-            "Missing credentials. Set API_ID and API_HASH in the environment."
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "Please send the phone number for the Pyrogram session in "
-        "international format, e.g. +1234567890."
-    )
-    context.user_data["awaiting_pyro_phone"] = True
-    context.user_data["pyro_login_type"] = True
-    LOGIN_PENDING_USERS.add(uid)
-
-
-async def cmd_loginstatus(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Show a clean Telethon/Pyrogram login status overview (owner only)."""
-    user = update.effective_user
-    uid = getattr(user, "id", None)
-    if not config.is_owner(uid):
-        await update.effective_message.reply_text(
-            "\u26d4 Only the bot owner can run this command."
-        )
-        return
-
-    # ── Userbot enabled (Telethon or Pyrogram) ──
-    userbot_ok = _check_userbot_available()
-
-    # ── API credentials ──
-    api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
-    api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
-    creds_ok = bool(api_id and api_hash)
-
-    # ── Telethon session status & source ──
-    telethon_ready = False
-    telethon_source = ""
-    try:
-        from utils.telethon_session import (
-            _get_configured_session_string,
-            _load_session_string_from_file,
-            get_telethon_session_path,
-            has_usable_telethon_session,
-        )
-
-        telethon_ready = has_usable_telethon_session()
-        if _get_configured_session_string():
-            telethon_source = "env"
-        elif _load_session_string_from_file(client_type="telethon"):
-            telethon_source = "json"
-        else:
-            tpath = get_telethon_session_path()
-            if os.path.exists(tpath) or os.path.exists(tpath + ".session"):
-                telethon_source = "file"
-    except Exception:
-        pass
-
-    # ── Pyrogram session status & source ──
-    pyrogram_ready = False
-    pyrogram_source = ""
-    try:
-        from utils.telethon_session import (
-            _load_session_string_from_file,
-            get_pyrogram_session_string,
-        )
-
-        pg_env = os.getenv("PYROGRAM_SESSION") or os.getenv(
-            "USERBOT_PYROGRAM_SESSION"
-        )
-        if pg_env:
-            pyrogram_ready = True
-            pyrogram_source = "env"
-        elif _load_session_string_from_file(client_type="pyrogram"):
-            pyrogram_ready = True
-            pyrogram_source = "json"
-        elif get_pyrogram_session_string():
-            pyrogram_ready = True
-            pyrogram_source = "env"
-    except Exception:
-        pass
-
-    # ── Persisted JSON file status ──
-    json_exists = False
-    json_has_telethon = False
-    json_has_pyrogram = False
-    try:
-        from utils.telethon_session import _get_persisted_session_path
-
-        json_path = _get_persisted_session_path()
-        json_exists = os.path.exists(json_path)
-        if json_exists:
-            import json as _json
-
-            with open(json_path) as _f:
-                _data = _json.load(_f)
-            json_has_telethon = bool(_data.get("telethon_session"))
-            json_has_pyrogram = bool(_data.get("pyrogram_session"))
-    except Exception:
-        pass
-
-    # ── Build output ──
-    yes = "\u2705"
-    no = "\u274c"
-
-    def src_label(src: str) -> str:
-        return {"env": "(env)", "json": "(json)", "file": "(file)"}.get(
-            src, ""
-        )
-
-    tel_line = (
-        f"{yes} Available {src_label(telethon_source)}"
-        if telethon_ready
-        else f"{no} Not available"
-    )
-    pyr_line = (
-        f"{yes} Available {src_label(pyrogram_source)}"
-        if pyrogram_ready
-        else f"{no} Not available"
-    )
-
-    json_line = f"{yes} Exists" if json_exists else f"{no} Not found"
-
-    lines = [
-        "\U0001f510 **Login Status**",
-        "",
-        f"Userbot enabled: {yes} Yes"
-        if userbot_ok
-        else f"Userbot enabled: {no}",
-        f"API credentials: {yes} Set"
-        if creds_ok
-        else f"API credentials: {no}",
-        "",
-        f"Telethon session: {tel_line}",
-        f"Pyrogram session: {pyr_line}",
-        "",
-        f"Persisted JSON file: {json_line}",
-        f"  Telethon in JSON: {yes if json_has_telethon else no}",
-        f"  Pyrogram in JSON: {yes if json_has_pyrogram else no}",
-    ]
-
-    await update.effective_message.reply_text(
-        "\n".join(lines), parse_mode="Markdown"
-    )
+from utils.login_handler import (  # noqa: E402
+    cleanup_login_flow,
+    register_login_handlers,
+)
 
 
 async def cmd_logout(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Remove all Telethon/Pyrogram session traces.
-
-    Cleans up:
-    - Telethon .session files and journals
-    - JSON persistence file (session_name.session.json)
-    - Pyrogram session string from JSON
-    - MongoDB stored sessions
-    - Redis-cached session data
-    - In-memory session cache
-    """
-    user = update.effective_user
-    uid = getattr(user, "id", None)
-    if not config.is_owner(uid):
+    """Log out the calling user's Telethon session (per-user)."""
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "\u26d4 Only the bot owner can run this command."
+            "Access denied. This bot is private."
         )
         return
+    user_id = update.effective_user.id
 
-    removed = []
+    # Clean up any active login flow before logging out
+    futures_map = context.application.bot_data.get("login_futures", {})
+    if (
+        user_id in futures_map
+        and futures_map[user_id].get("task") is not None
+        and not futures_map[user_id]["task"].done()
+    ):
+        await cleanup_login_flow(context, user_id)
+
     try:
         from utils.telethon_session import (
             _get_persisted_session_path,
             _invalidate_session_cache,
             get_telethon_session_path,
         )
-    except ImportError:
-        from utils.telethon_session import get_telethon_session_path
 
-        _get_persisted_session_path = None
-        _invalidate_session_cache = None
+        session_path = get_telethon_session_path()
+        removed = []
 
-    session_path = get_telethon_session_path()
-
-    # ── 1) Remove Telethon .session files ──
-    try:
+        # 1. Remove global session files (backward-compatible)
         if os.path.exists(session_path):
-            os.remove(session_path)
-            removed.append(session_path)
-    except Exception:
-        pass
-    for suffix in (".session", ".session-journal", ".session.lock"):
-        path_with_suffix = session_path + suffix
-        if os.path.exists(path_with_suffix):
             try:
-                os.remove(path_with_suffix)
-                removed.append(path_with_suffix)
-            except Exception:
+                os.remove(session_path)
+                removed.append(session_path)
+            except Exception:  # nosec B110
                 pass
+        for suffix in (
+            ".session",
+            ".session-journal",
+            ".session.lock",
+            ".session.json",
+        ):
+            path_with_suffix = session_path + suffix
+            if os.path.exists(path_with_suffix):
+                try:
+                    os.remove(path_with_suffix)
+                    removed.append(path_with_suffix)
+                except Exception:  # nosec B110
+                    pass
 
-    # ── 2) Remove Telethon session string from JSON, keep Pyrogram ──
-    if _get_persisted_session_path:
-        try:
-            json_path = _get_persisted_session_path()
-            if os.path.exists(json_path):
-                with open(json_path) as _f:
-                    _data = json.load(_f)
-                had_tel = _data.pop("telethon_session", None)
-                if had_tel:
-                    with open(json_path, "w") as _f:
-                        json.dump(_data, _f, indent=2)
-                    removed.append(
-                        json_path + " (Telethon session removed from JSON)"
-                    )
-        except Exception:
-            pass
-
-    # ── 3) Clear in-memory session cache ──
-    if _invalidate_session_cache:
-        try:
-            _invalidate_session_cache()
-        except Exception:
-            pass
-
-    # ── 4) Clean up temp session files ──
-    try:
-        for f in glob.glob(
-            os.path.join(
-                config.TEMP_PATH or tempfile.gettempdir(), "userbot_session*"
-            )
-        ):  # nosec - B108: config-defined fallback path
+        # 2. Remove per-user JSON session file
+        per_user_json = _get_persisted_session_path(user_id=user_id)
+        if os.path.exists(per_user_json):
             try:
-                os.remove(f)
-                removed.append(f)
-            except Exception:
-                pass
-    except Exception:
-        pass
+                os.remove(per_user_json)
+                removed.append(
+                    f"Per-user JSON ({os.path.basename(per_user_json)})"
+                )
+            except Exception as exc:
+                logger.debug(
+                    "logout: failed to remove per-user JSON %s: %s",
+                    per_user_json,
+                    exc,
+                )
 
-    # ── 5) Clear Redis-cached session ──
-    try:
-        from utils.cache import get_cache
+        # 3. Remove per-user Telethon .session file on disk
+        per_user_session = f"{session_path}.{user_id}.session"
+        if os.path.exists(per_user_session):
+            try:
+                os.remove(per_user_session)
+                removed.append(
+                    f"Per-user .session ({os.path.basename(per_user_session)})"
+                )
+            except Exception as exc:
+                logger.debug(
+                    "logout: failed to remove per-user session %s: %s",
+                    per_user_session,
+                    exc,
+                )
 
-        cache = await get_cache()
-        await cache.delete("telethon:session_string")
-        if uid:
-            await cache.delete(f"cache:user:{uid}")
-    except Exception:
-        pass
-
-    # ── 6) Clear Telethon session from MongoDB, keep Pyrogram ──
-    mongo_cleared = False
-    if uid:
+        # 4. Clear Telethon session from MongoDB (keep Pyrogram)
         try:
-            from utils.db import save_user_session
+            db_model = context.application.bot_data.get("db_model")
+            if db_model is not None and hasattr(db_model, "delete_session"):
+                await db_model.delete_session(user_id)
+                removed.append("MongoDB session")
+            else:
+                from utils.db import save_user_session
 
-            await save_user_session(
-                uid,
-                {
-                    "telethon_session": "",
-                    "string_session": "",
-                    "logged_out": True,
-                    "logged_out_at": time.time(),
-                },
-            )
-            mongo_cleared = True
-        except Exception:
+                await save_user_session(
+                    user_id,
+                    {
+                        "telethon_session": "",
+                        "string_session": "",
+                        "logged_out": True,
+                        "logged_out_at": time.time(),
+                    },
+                )
+        except Exception:  # nosec B110
             pass
 
-    # ── 7) Clear login flow state ──
-    _clear_login_flow(uid, context)
+        # 5. Clear in-memory session cache for this user
+        try:
+            _invalidate_session_cache(user_id=user_id)
+        except Exception:  # nosec B110
+            pass
 
-    # ── Build response ──
-    lines = []
-    if removed:
-        lines.append("\u2705 Logged out and removed session files:")
-        lines.extend(f"  \u2022 {f}" for f in removed)
-    else:
-        lines.append("\u2705 Logged out (no session files found)")
+        if removed:
+            await update.message.reply_text(
+                "✅ Logged out and removed Telethon session files:\n"
+                + "\n".join(removed)
+            )
+        else:
+            await update.message.reply_text(
+                "No local Telethon session file was found to remove."
+            )
+    except Exception as exc:
+        logger.exception("/logout failed: %s", exc)
+        await update.message.reply_text(
+            "Failed to remove the Telethon session. Check server logs for details."
+        )
 
-    if mongo_cleared:
-        lines.append("  \u2022 MongoDB session cleared")
-    else:
-        lines.append("  \u2022 MongoDB not available or already clean")
 
-    await update.effective_message.reply_text("\n".join(lines))
+async def cmd_logoutpyro(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Log out the calling user's Pyrogram session (per-user)."""
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
+    user_id = update.effective_user.id
 
+    # Clean up any active login flow before logging out
+    futures_map = context.application.bot_data.get("login_futures", {})
+    if (
+        user_id in futures_map
+        and futures_map[user_id].get("task") is not None
+        and not futures_map[user_id]["task"].done()
+    ):
+        await cleanup_login_flow(context, user_id)
 
-async def _finalize_pyro_login(pyro_client, update, context, user_id):
-    """Export Pyrogram session string and persist to JSON + MongoDB."""
     try:
-        session_str = await pyro_client.export_session_string()
+        removed = []
 
-        # Save to JSON persistence file
-        saved_file = False
+        # 1. Clear Pyrogram session from JSON file (per-user, then global)
         try:
             from utils.telethon_session import (
                 save_session_string_to_file_async,
             )
 
-            saved_file = await save_session_string_to_file_async(
-                session_str, client_type="pyrogram"
-            )
+            if await save_session_string_to_file_async(
+                "", client_type="pyrogram", user_id=user_id
+            ):
+                removed.append("JSON file (pyrogram_session cleared)")
         except Exception as exc:
-            logger.debug("Failed to save Pyrogram session to JSON: %s", exc)
-
-        # Save to MongoDB
-        saved_mongo = False
+            logger.debug("logoutpyro: JSON per-user clear failed: %s", exc)
         try:
-            from utils.db import save_user_session
-
-            await save_user_session(
-                user_id,
-                {
-                    "pyrogram_session": session_str,
-                    "string_session": session_str,
-                },
-            )
-            saved_mongo = True
+            if await save_session_string_to_file_async("", client_type="pyrogram"):
+                removed.append("Global JSON file (pyrogram_session cleared)")
         except Exception as exc:
-            logger.debug("Failed to save Pyrogram session to MongoDB: %s", exc)
+            logger.debug("logoutpyro: JSON global clear failed: %s", exc)
 
-        # Show the full login status so the user immediately sees
-        # whether Telethon/Pyrogram/JSON/MongoDB are all set.
+        # 2. Clear Pyrogram session from MongoDB
         try:
-            await cmd_loginstatus(update, context)
-        except Exception as _sts_err:
-            logger.warning(
-                "Failed to show loginstatus after Pyrogram login: %s", _sts_err
-            )
-            lines = ["\u2705 Pyrogram userbot login successful!"]
-            if saved_file:
-                lines.append("  \u2022 Session saved to JSON persistence file")
-            if saved_mongo:
-                lines.append("  \u2022 Session saved to MongoDB")
-            lines.append(
-                f"  \u2022 Session string length: {len(session_str)} chars"
-            )
-            lines.append("")
-            if saved_file or saved_mongo:
-                lines.append(
-                    "The session is now fully persisted and available for userbot operations."
-                )
+            db_model = context.application.bot_data.get("db_model")
+            if db_model is not None and hasattr(db_model, "save_session"):
+                await db_model.save_session(user_id, {"pyrogram_session": ""})
+                removed.append("MongoDB (pyrogram_session cleared)")
             else:
-                lines.append(
-                    "Note: session string was not persisted (set PYROGRAM_SESSION env var to preserve across restarts)."
-                )
-            await update.message.reply_text("\n".join(lines))
-        logger.info(
-            "Pyrogram login successful for user %s (json_persisted=%s, mongo_persisted=%s)",
-            user_id,
-            saved_file,
-            saved_mongo,
-        )
+                from utils.db import save_user_session
 
+                await save_user_session(user_id, {"pyrogram_session": ""})
+                removed.append("MongoDB (pyrogram_session cleared)")
+        except Exception as exc:
+            logger.debug("logoutpyro: MongoDB clear failed: %s", exc)
+
+        if removed:
+            await update.message.reply_text(
+                "✅ Logged out of Pyrogram and cleared session:\n"
+                + "\n".join(removed)
+            )
+        else:
+            await update.message.reply_text(
+                "No Pyrogram session was found to clear."
+            )
     except Exception as exc:
-        logger.exception("Pyrogram session export failed: %s", exc)
+        logger.exception("/logoutpyro failed: %s", exc)
         await update.message.reply_text(
-            "Login completed but session export failed. Check server logs."
+            "Failed to clear the Pyrogram session. Check server logs for details."
         )
-    finally:
-        try:
-            await pyro_client.stop()
-        except Exception:
-            pass
-        _clear_login_flow(user_id, context)
 
 
-async def _process_pyro_login_text(
+async def cmd_loginstatus(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle text messages during the Pyrogram login flow (phone, code, password)."""
-    user_id = getattr(update.effective_user, "id", None)
-    if not user_id:
+    """Live session health check for the calling user (per-user)."""
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
         return
+    await update.message.reply_text(
+        "🩺 Testing sessions live — connecting to Telegram..."
+    )
 
-    # Respect FloodWait
+    calling_user_id = update.effective_user.id
     try:
-        flood_until = context.user_data.get("pyro_flood_wait_until")
-        if flood_until:
-            now = time.time()
-            if now < flood_until:
-                remaining = int(flood_until - now)
-                await update.message.reply_text(
-                    f"Too many login attempts. Please wait {remaining} seconds before retrying."
-                )
-                return
-            else:
-                context.user_data.pop("pyro_flood_wait_until", None)
+        checker = get_session_healthchecker()
+        health = await checker.run_once(user_id=calling_user_id)
+    except Exception as exc:
+        logger.exception("loginstatus: health check failed: %s", exc)
+        health = {}
+
+    pyro = health.get("pyrogram", {})
+    tele = health.get("telethon", {})
+
+    # Persisted JSON file info (per-user only)
+    per_user_json_session = None
+    per_user_json_exists = False
+    try:
+        from utils.telethon_session import (
+            _get_persisted_session_path,
+            _load_all_sessions_from_file_async,
+        )
+
+        _per_user_path = _get_persisted_session_path(user_id=calling_user_id)
+        per_user_json_exists = os.path.exists(_per_user_path)
+        per_user_json_session = await _load_all_sessions_from_file_async(
+            user_id=calling_user_id
+        )
     except Exception:
-        pass
+        logger.debug("bot: Per-user JSON file check failed")
 
-    # ── Phone number step ──
-    if context.user_data.get("awaiting_pyro_phone"):
-        context.user_data["awaiting_pyro_phone"] = False
-        phone = update.message.text.strip()
-        await update.message.reply_text(
-            "Got phone number. Sending code via Pyrogram..."
-        )
+    tele_per_user = bool(
+        per_user_json_session and per_user_json_session.get("telethon_session")
+    )
+    pyro_per_user = bool(
+        per_user_json_session and per_user_json_session.get("pyrogram_session")
+    )
 
-        api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
-        api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
-        try:
-            api_id = int(api_id)
-        except Exception:
-            await update.message.reply_text("Configured API_ID is invalid.")
-            _clear_login_flow(user_id, context)
-            return
+    has_api_id = bool(
+        os.getenv("API_ID")
+        or os.getenv("USERBOT_API_ID")
+        or os.getenv("api_id")
+        or os.getenv("userbot_api_id")
+    )
+    has_api_hash = bool(
+        os.getenv("API_HASH")
+        or os.getenv("USERBOT_API_HASH")
+        or os.getenv("api_hash")
+        or os.getenv("userbot_api_hash")
+    )
 
-        try:
-            from pyrogram import Client as PyrogramClient
-        except ImportError:
-            await update.message.reply_text("Pyrogram is not installed.")
-            _clear_login_flow(user_id, context)
-            return
-
-        # Create in-memory Pyrogram client
-        pyro_client = PyrogramClient(
-            "pyro_login_session",
-            api_id=api_id,
-            api_hash=api_hash,
-            in_memory=True,
-        )
-
-        try:
-            await pyro_client.connect()
-            sent_code = await pyro_client.send_code(phone)
-
-            context.user_data["pyro_client"] = pyro_client
-            context.user_data["pyro_phone"] = phone
-            context.user_data["pyro_phone_code_hash"] = (
-                sent_code.phone_code_hash
+    def _session_line(name: str, result: dict) -> str:
+        if not result:
+            return f"❌ **{name}** — Check failed (no result)"
+        alive = result.get("alive", False)
+        if alive:
+            phone = result.get("phone") or "?"
+            dc = result.get("dc_id") or "?"
+            latency = result.get("latency_ms") or "?"
+            return (
+                f"✅ **{name}** — Working\n"
+                f"   Phone: `{phone}`\n"
+                f"   DC: `{dc}` | Latency: `{latency}ms`"
             )
-            context.user_data["awaiting_pyro_code"] = True
+        else:
+            err = (result.get("error") or "Not configured").replace("`", "")
+            return f"❌ **{name}** — `{err}`"
 
-            # Log the code delivery type for diagnostics
-            code_type = getattr(sent_code, "type", None)
-            if code_type:
-                context.user_data["pyro_sent_code_type"] = str(code_type)
-                logger.info("Pyrogram: code sent via %s", code_type)
+    # Get healthcheck interval + admin alert state from the checker
+    check_interval = getattr(checker, "check_interval", 3600)
+    admin_alerts = (
+        "Enabled" if getattr(checker, "admin_user_id", None) else "Disabled"
+    )
+    userbot_enabled = config.ENABLE_USERBOT
 
-            await update.message.reply_text(
-                "A login code has been sent to your Telegram app. "
-                "Please send me the code (just the digits)."
-            )
-
-        except Exception as exc:
-            logger.exception("Pyrogram send_code failed: %s", exc)
-            await update.message.reply_text(
-                "Failed to send code. Check API_ID/API_HASH and the phone number."
-            )
-            try:
-                await pyro_client.stop()
-            except Exception:
-                pass
-            _clear_login_flow(user_id, context)
-
-        return
-
-    # ── Code entry step ──
-    if context.user_data.get("awaiting_pyro_code"):
-        code = update.message.text.strip()
-        # Normalize Arabic/ Persian digits and strip non-digit chars
-        try:
-            trans = str.maketrans(
-                {
-                    "\u0660": "0",
-                    "\u0661": "1",
-                    "\u0662": "2",
-                    "\u0663": "3",
-                    "\u0664": "4",
-                    "\u0665": "5",
-                    "\u0666": "6",
-                    "\u0667": "7",
-                    "\u0668": "8",
-                    "\u0669": "9",
-                    "\u06f0": "0",
-                    "\u06f1": "1",
-                    "\u06f2": "2",
-                    "\u06f3": "3",
-                    "\u06f4": "4",
-                    "\u06f5": "5",
-                    "\u06f6": "6",
-                    "\u06f7": "7",
-                    "\u06f8": "8",
-                    "\u06f9": "9",
-                }
-            )
-            code = code.translate(trans)
-            code = "".join(c for c in code if c.isdigit())
-        except Exception:
-            pass
-
-        pyro_client = context.user_data.get("pyro_client")
-        phone = context.user_data.get("pyro_phone")
-        phone_code_hash = context.user_data.get("pyro_phone_code_hash")
-
-        if not pyro_client or not phone:
-            await update.message.reply_text(
-                "Session state lost. Please run /loginpyro again."
-            )
-            _clear_login_flow(user_id, context)
-            return
-
-        try:
-            from pyrogram.errors import SessionPasswordNeeded
-
-            await pyro_client.sign_in(
-                phone, code, phone_code_hash=phone_code_hash
-            )
-            # No 2FA needed
-            context.user_data["awaiting_pyro_code"] = False
-            await _finalize_pyro_login(pyro_client, update, context, user_id)
-
-        except SessionPasswordNeeded:
-            context.user_data["awaiting_pyro_code"] = False
-            context.user_data["awaiting_pyro_password"] = True
-            await update.message.reply_text(
-                "Two-step verification is enabled. Please enter your account password:"
-            )
-        except Exception as exc:
-            logger.exception("Pyrogram sign_in failed: %s", exc)
-            await update.message.reply_text(
-                "Login failed. Please run /loginpyro again."
-            )
-            _clear_login_flow(user_id, context)
-
-        return
-
-    # ── Password entry step (2FA) ──
-    if context.user_data.get("awaiting_pyro_password"):
-        password = update.message.text.strip()
-        pyro_client = context.user_data.get("pyro_client")
-
-        if not pyro_client:
-            await update.message.reply_text(
-                "Session state lost. Please run /loginpyro again."
-            )
-            _clear_login_flow(user_id, context)
-            return
-
-        try:
-            await pyro_client.sign_in(password=password)
-            context.user_data["awaiting_pyro_password"] = False
-            await _finalize_pyro_login(pyro_client, update, context, user_id)
-        except Exception as exc:
-            logger.exception("Pyrogram password sign_in failed: %s", exc)
-            retry = context.user_data.get("pyro_password_retry_count", 0) + 1
-            context.user_data["pyro_password_retry_count"] = retry
-            if retry >= 3:
-                await update.message.reply_text(
-                    "Too many incorrect password attempts. Please run /loginpyro again."
-                )
-                _clear_login_flow(user_id, context)
-            else:
-                await update.message.reply_text(
-                    f"Incorrect password. Try again ({retry}/3):"
-                )
-        return
+    lines = [
+        "\U0001f510 **Live Session Status**",
+        "",
+        "**Userbot enabled:** " + ("✅ Yes" if userbot_enabled else "❌ No"),
+        "**API credentials:** "
+        + ("✅ Set" if has_api_id and has_api_hash else "⚠️ Missing API_ID/API_HASH"),
+        "",
+        _session_line("Telethon", tele),
+        "",
+        _session_line("Pyrogram", pyro),
+        "",
+        f"**Persisted JSON files (per-user {calling_user_id}):** "
+        + ("✅ Exists" if per_user_json_exists else "❌ Not found"),
+        f"  Telethon: {'✅' if tele_per_user else '❌'}",
+        f"  Pyrogram: {'✅' if pyro_per_user else '❌'}",
+        "",
+        f"🔔 Admin alerts: `{admin_alerts}`",
+        f"🔄 Background check: every `{check_interval}s`",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def _process_login_text(
+async def cmd_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle text messages during login flows (Telethon or Pyrogram).
-
-    Dispatches to the Pyrogram handler when ``pyro_login_type`` is set.
-    """
-    # Dispatch to Pyrogram handler if this is a Pyrogram login flow
-    if context.user_data.get("pyro_login_type"):
-        await _process_pyro_login_text(update, context)
+    """Manage allowed users (admin only): /admin add|remove|list <user_id>."""
+    await _track_user_session(update, "/admin")
+    user_id = update.effective_user.id
+    is_admin = config.is_admin_user(user_id)
+    if not is_admin:
+        await update.message.reply_text("Unauthorized: admin only")
         return
 
-    user_id = getattr(update.effective_user, "id", None)
-    if not user_id:
-        return
-    user_id = getattr(update.effective_user, "id", None)
-    if not user_id:
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
         return
 
-    # Respect FloodWait
+    cmd = args[0].lower()
+    if cmd == "list":
+        users = sorted(list(config.ALLOWED_USER_IDS))
+        await update.message.reply_text(f"Allowed users: {users}")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("Specify a user id")
+        return
+
     try:
-        flood_until = context.user_data.get("login_flood_wait_until")
-        if flood_until:
-            now = time.time()
-            if now < flood_until:
-                remaining = int(flood_until - now)
-                await update.message.reply_text(
-                    f"Too many login attempts. Please wait {remaining} seconds before retrying."
-                )
-                return
-            else:
-                context.user_data.pop("login_flood_wait_until", None)
+        target = int(args[1])
     except Exception:
-        pass
+        await update.message.reply_text("Invalid user id")
+        return
 
-    if context.user_data.get("awaiting_login_phone"):
-        context.user_data["awaiting_login_phone"] = False
-        phone = update.message.text.strip()
-        await update.message.reply_text(
-            "Got phone number. Please wait while I generate the Telethon session..."
-        )
+    if cmd == "add":
+        config.ALLOWED_USER_IDS.add(target)
+        config.persist_allowed_users()
+        await update.message.reply_text(f"Added {target} to allowed users")
+        return
+    if cmd == "remove":
+        config.ALLOWED_USER_IDS.discard(target)
+        config.persist_allowed_users()
+        await update.message.reply_text(f"Removed {target} from allowed users")
+        return
 
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-        except ImportError:
-            await update.message.reply_text(
-                "Telethon is not installed. Install telethon to use /login."
-            )
-            _clear_login_flow(user_id, context)
-            return
-
-        api_id = os.getenv("API_ID") or os.getenv("USERBOT_API_ID")
-        api_hash = os.getenv("API_HASH") or os.getenv("USERBOT_API_HASH")
-        try:
-            api_id = int(api_id)
-        except Exception:
-            await update.message.reply_text(
-                "Configured API_ID is invalid. It must be an integer."
-            )
-            _clear_login_flow(user_id, context)
-            return
-
-        # Use the same session path that utils.telethon_session expects,
-        # so build_telethon_client() and has_usable_telethon_session()
-        # can detect and reuse the session after login completes.
-        from utils.telethon_session import get_telethon_session_path
-
-        session_path = get_telethon_session_path()
-        os.makedirs(os.path.dirname(session_path) or ".", exist_ok=True)
-
-        # Use file-based session so Telethon manages the .session file natively.
-        # This way has_usable_telethon_session() and build_telethon_client()
-        # can detect and reuse it across bot restarts.
-        client = TelegramClient(session_path, api_id, api_hash)
-        try:
-            await client.connect()
-
-            if await client.is_user_authorized():
-                # Session exists on disk. Also persist the session string to
-                # the JSON file and MongoDB so it survives across restarts
-                # without the .session file (mirrors the same logic in _do_start()).
-                _tel_session_str = None
-                _tel_saved_file = False
-                _tel_saved_mongo = False
-                try:
-                    _tel_session_str = StringSession.save(client.session)
-                    if _tel_session_str:
-                        _tel_session_str = str(_tel_session_str)
-                        from utils.telethon_session import (
-                            save_session_string_to_file_async,
-                        )
-
-                        _tel_saved_file = (
-                            await save_session_string_to_file_async(
-                                _tel_session_str,
-                                client_type="telethon",
-                            )
-                        )
-                except Exception as _tel_save_err:
-                    logger.debug(
-                        "Failed to persist Telethon session to JSON: %s",
-                        _tel_save_err,
-                    )
-
-                # Persist to MongoDB for cross-deployment survival
-                if _tel_session_str:
-                    try:
-                        from utils.db import save_user_session
-
-                        await save_user_session(
-                            user_id,
-                            {
-                                "telethon_session": _tel_session_str,
-                                "string_session": _tel_session_str,
-                            },
-                        )
-                        _tel_saved_mongo = True
-                    except Exception as _tel_mongo_err:
-                        logger.debug(
-                            "Failed to persist Telethon session to MongoDB: %s",
-                            _tel_mongo_err,
-                        )
-
-                _persist_msgs = []
-                if _tel_saved_file:
-                    _persist_msgs.append(
-                        "  \u2022 Session saved to JSON persistence file"
-                    )
-                if _tel_saved_mongo:
-                    _persist_msgs.append(
-                        "  \u2022 Session saved to MongoDB"
-                    )
-
-                await update.message.reply_text(
-                    "Telethon session is already authorized and saved."
-                    + ("\n" + "\n".join(_persist_msgs) if _persist_msgs else "")
-                )
-                await client.disconnect()
-                _clear_login_flow(user_id, context)
-                logger.info(
-                    "Telethon session already authorized for %s "
-                    "(json_persisted=%s, mongo_persisted=%s)",
-                    phone,
-                    _tel_saved_file,
-                    _tel_saved_mongo,
-                )
-                return
-
-            async def _do_start():
-                from telethon.errors import (
-                    FloodWaitError,
-                    PhoneCodeExpiredError,
-                    SessionPasswordNeededError,
-                )
-
-                try:
-                    loop = asyncio.get_running_loop()
-                    context.user_data["login_phone"] = phone
-                    context.user_data["login_client"] = client
-                    context.user_data["login_session_path"] = session_path
-                    context.user_data["awaiting_login_code"] = True
-
-                    async def _code_callback():
-                        _future = loop.create_future()
-                        context.user_data["login_pending_future"] = _future
-                        context.user_data["login_pending_type"] = "code"
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="Please enter the login code you received on your Telegram app:",
-                        )
-                        _code = await _future
-                        try:
-                            _trans = str.maketrans(
-                                {
-                                    "\u0660": "0",
-                                    "\u0661": "1",
-                                    "\u0662": "2",
-                                    "\u0663": "3",
-                                    "\u0664": "4",
-                                    "\u0665": "5",
-                                    "\u0666": "6",
-                                    "\u0667": "7",
-                                    "\u0668": "8",
-                                    "\u0669": "9",
-                                    "\u06f0": "0",
-                                    "\u06f1": "1",
-                                    "\u06f2": "2",
-                                    "\u06f3": "3",
-                                    "\u06f4": "4",
-                                    "\u06f5": "5",
-                                    "\u06f6": "6",
-                                    "\u06f7": "7",
-                                    "\u06f8": "8",
-                                    "\u06f9": "9",
-                                }
-                            )
-                            _code = (_code or "").translate(_trans)
-                            _code = "".join(c for c in _code if c.isdigit())
-                        except Exception:
-                            pass
-                        return _code
-
-                    async def _password_callback():
-                        _pw_future = loop.create_future()
-                        context.user_data["login_pending_future"] = _pw_future
-                        context.user_data["login_pending_type"] = "password"
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="Two-step verification is enabled. Please enter your account password:",
-                        )
-                        return await _pw_future
-
-                    for _attempt in range(2):
-                        try:
-                            logger.info(
-                                "Login via client.start() for %s (attempt %d/2)",
-                                phone,
-                                _attempt + 1,
-                            )
-                            await client.start(
-                                phone=phone,
-                                code_callback=_code_callback,
-                            )
-                            logger.info(
-                                "Login successful for %s via client.start()",
-                                phone,
-                            )
-                            break
-                        except PhoneCodeExpiredError:
-                            if _attempt == 1:
-                                raise
-                            logger.warning(
-                                "Code expired for %s; waiting 5s then retrying",
-                                phone,
-                            )
-                            await asyncio.sleep(5)
-                            continue
-                        except SessionPasswordNeededError:
-                            _password = await _password_callback()
-                            await client.sign_in(password=_password)
-                            break
-
-                    if await client.is_user_authorized():
-                        # Telethon already saved the session to its native .session file
-                        # at session_path. has_usable_telethon_session() and
-                        # build_telethon_client() will find it automatically.
-                        # Also persist the session string to the JSON file and MongoDB
-                        # so it survives across restarts without the .session file.
-                        _tel_session_str = None
-                        _tel_saved_file = False
-                        _tel_saved_mongo = False
-                        try:
-                            _tel_session_str = StringSession.save(client.session)
-                            if _tel_session_str:
-                                _tel_session_str = str(_tel_session_str)
-                                from utils.telethon_session import (
-                                    save_session_string_to_file_async,
-                                )
-
-                                _tel_saved_file = (
-                                    await save_session_string_to_file_async(
-                                        _tel_session_str,
-                                        client_type="telethon",
-                                    )
-                                )
-                        except Exception as _tel_save_err:
-                            logger.debug(
-                                "Failed to persist Telethon session to JSON: %s",
-                                _tel_save_err,
-                            )
-
-                        # Persist to MongoDB for cross-deployment survival
-                        if _tel_session_str:
-                            try:
-                                from utils.db import save_user_session
-
-                                await save_user_session(
-                                    user_id,
-                                    {
-                                        "telethon_session": _tel_session_str,
-                                        "string_session": _tel_session_str,
-                                    },
-                                )
-                                _tel_saved_mongo = True
-                            except Exception as _tel_mongo_err:
-                                logger.debug(
-                                    "Failed to persist Telethon session to MongoDB: %s",
-                                    _tel_mongo_err,
-                                )
-
-                        # Show the full login status so the user immediately sees
-                        # whether Telethon/Pyrogram/JSON/MongoDB are all set.
-                        try:
-                            await cmd_loginstatus(update, context)
-                        except Exception as _sts_err:
-                            logger.warning(
-                                "Failed to show loginstatus after login: %s",
-                                _sts_err,
-                            )
-                            _tel_lines = [
-                                "\u2705 Telethon userbot login successful."
-                            ]
-                            if _tel_saved_file:
-                                _tel_lines.append(
-                                    "  \u2022 Session saved to JSON persistence file"
-                                )
-                            if _tel_saved_mongo:
-                                _tel_lines.append(
-                                    "  \u2022 Session saved to MongoDB"
-                                )
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text="\n".join(_tel_lines),
-                            )
-                        logger.info(
-                            "Telethon login successful for %s "
-                            "(json_persisted=%s, mongo_persisted=%s)",
-                            phone,
-                            _tel_saved_file,
-                            _tel_saved_mongo,
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="Login completed but session is not authorized. Please run /login again.",
-                        )
-
-                except Exception as start_exc:
-                    logger.exception("_do_start() failed: %s", start_exc)
-                    try:
-                        if isinstance(start_exc, FloodWaitError):
-                            wait = (
-                                getattr(start_exc, "seconds", None)
-                                or getattr(start_exc, "timeout", None)
-                                or 60
-                            )
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"Too many attempts. Please wait {int(wait)} seconds before retrying.",
-                            )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text="Login failed.\nPlease run /login again.",
-                            )
-                    except Exception:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="Login failed unexpectedly. Please run /login again.",
-                        )
-                finally:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    try:
-                        fut = context.user_data.get("login_pending_future")
-                        if fut and not fut.done():
-                            fut.cancel()
-                    except Exception:
-                        pass
-                    _clear_login_flow(user_id, context)
-
-            context.user_data["login_phone"] = phone
-            context.user_data["login_client"] = client
-            context.user_data["login_session_path"] = session_path
-            # Set guard flag to prevent fall-through cleanup from firing
-            # while _do_start() is setting up the pending future
-            context.user_data["login_flow_started"] = True
-            login_task = asyncio.create_task(_do_start())
-            context.user_data["login_start_task"] = login_task
-            logger.info("Login background task started for %s", phone)
-            return
-
-        except Exception as exc:
-            logger.exception("/login phone step failed: %s", exc)
-            await update.message.reply_text(
-                "Failed to start Telethon login. Check API_ID/API_HASH and the phone number."
-            )
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            _clear_login_flow(user_id, context)
-            return
-
-    # Check if there's a pending future to resolve (code or password from client.start())
-    pending_future = context.user_data.get("login_pending_future")
-    pending_type = context.user_data.get("login_pending_type")
-    if pending_future is not None and not pending_future.done():
-        client = context.user_data.get("login_client")
-        phone = context.user_data.get("login_phone")
-        if client is None or not phone:
-            await update.message.reply_text(
-                "Session state lost. Please run /login again to start a fresh login."
-            )
-            _clear_login_flow(user_id, context)
-            return
-
-        try:
-            _input = update.message.text.strip()
-            if pending_type == "code":
-                trans_digits = str.maketrans(
-                    {
-                        "\u0660": "0",
-                        "\u0661": "1",
-                        "\u0662": "2",
-                        "\u0663": "3",
-                        "\u0664": "4",
-                        "\u0665": "5",
-                        "\u0666": "6",
-                        "\u0667": "7",
-                        "\u0668": "8",
-                        "\u0669": "9",
-                        "\u06f0": "0",
-                        "\u06f1": "1",
-                        "\u06f2": "2",
-                        "\u06f3": "3",
-                        "\u06f4": "4",
-                        "\u06f5": "5",
-                        "\u06f6": "6",
-                        "\u06f7": "7",
-                        "\u06f8": "8",
-                        "\u06f9": "9",
-                    }
-                )
-                norm_code = (_input or "").translate(trans_digits)
-                norm_code = "".join([c for c in norm_code if c.isdigit()])
-                resolved_value = norm_code
-            else:
-                resolved_value = _input
-            pending_future.set_result(resolved_value)
-            logger.info(
-                "Telethon login %s resolved for user=%s",
-                pending_type or "input",
-                user_id,
-            )
-            return
-        except Exception as exc:
-            logger.exception(
-                "Failed to resolve pending future for user=%s: %s",
-                user_id,
-                exc,
-            )
-            try:
-                if not pending_future.done():
-                    pending_future.set_exception(exc)
-            except Exception:
-                pass
-            await update.message.reply_text(
-                "Failed to send your input to the login process. Please run /login again."
-            )
-            return
-
-    # Only clear if no active login flow was started
-    if not context.user_data.get("login_flow_started"):
-        _clear_login_flow(user_id, context)
-
-
-application.add_handler(CommandHandler("login", cmd_login))
-application.add_handler(CommandHandler("loginpyro", cmd_loginpyro))
-application.add_handler(CommandHandler("loginstatus", cmd_loginstatus))
-application.add_handler(CommandHandler("logout", cmd_logout))
+    await update.message.reply_text("Unknown admin command")
 
 
 async def cmd_clearflood(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Clear FloodWait block for current login flow and optionally resend code.
-
-    Usage: /clearflood [resend]
-    - Without args: clears flood wait for your current login attempt.
-    - With 'resend': attempts a best-effort resend of the login code.
-    """
-    user = update.effective_user
-    uid = getattr(user, "id", None)
-    if not config.is_owner(uid):
+    """Clear the calling user's active login flow (FloodWait cleanup)."""
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "\u26d4 Only the bot owner can run this command."
+            "Access denied. This bot is private."
         )
         return
+    user_id = update.effective_user.id
+    futures_map = context.application.bot_data.get("login_futures", {})
+    if (
+        user_id in futures_map
+        and futures_map[user_id].get("task") is not None
+    ):
+        await cleanup_login_flow(context, user_id)
+        await update.message.reply_text(
+            "✅ Cleared active login flow. You can run /login or /loginpyro again."
+        )
+    else:
+        await update.message.reply_text("No active login flow found to clear.")
 
-    # Clear flood wait state
-    try:
-        cleared = False
-        if context.user_data.pop("login_flood_wait_until", None) is not None:
-            cleared = True
-    except Exception:
-        cleared = False
 
-    # Disconnect any lingering Telethon client
-    try:
-        client = context.user_data.get("login_client")
-        if client is not None:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(client.disconnect())
-            except RuntimeError:
-                pass
-    except Exception:
-        pass
-
-    args = context.args if hasattr(context, "args") else []
-    want_resend = len(args) > 0 and args[0].lower() in ("resend", "r")
-
-    if not want_resend:
+async def cmd_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel an active login flow (or report nothing to cancel)."""
+    await _track_user_session(update, "/cancel")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "\u2705 FloodWait state cleared."
-            if cleared
-            else "No FloodWait state found."
+            "Access denied. This bot is private."
         )
         return
-
-    # Attempt resend using stored Telethon client/phone
-    client = context.user_data.get("login_client")
-    phone = context.user_data.get("login_phone")
-    if client is None or not phone:
-        await update.effective_message.reply_text(
-            "No active login session found to resend for. Start /login first."
-        )
+    user_id = update.effective_user.id
+    futures_map = context.application.bot_data.get("login_futures", {})
+    if (
+        user_id in futures_map
+        and futures_map[user_id].get("task") is not None
+        and not futures_map[user_id]["task"].done()
+    ):
+        await cleanup_login_flow(context, user_id)
+        await update.message.reply_text("❌ Login cancelled.")
         return
-
-    try:
-        sent = await client.send_code_request(phone)
-    except Exception as e:
-        try:
-            from telethon.errors import FloodWaitError
-
-            if isinstance(e, FloodWaitError):
-                wait = (
-                    getattr(e, "seconds", None)
-                    or getattr(e, "timeout", None)
-                    or 60
-                )
-                context.user_data["login_flood_wait_until"] = (
-                    time.time() + int(wait)
-                )
-                await update.effective_message.reply_text(
-                    f"Too many requests; please wait {int(wait)} seconds before retrying."
-                )
-                logger.warning(
-                    "FloodWait during clearflood resend for %s: wait=%s",
-                    phone,
-                    wait,
-                )
-                return
-        except Exception:
-            pass
-        logger.exception("Resend via /clearflood failed")
-        await update.effective_message.reply_text(
-            "Failed to resend login code. See server logs for details."
-        )
-        return
-
-    # Store new code context
-    try:
-        context.user_data["login_code_sent_at"] = time.time()
-        context.user_data["login_code_sent_repr"] = repr(sent)
-        new_hash = getattr(sent, "phone_code_hash", None)
-        if new_hash:
-            context.user_data["login_code_hash"] = new_hash
-    except Exception:
-        pass
-
-    await update.effective_message.reply_text(
-        "Cleared FloodWait and resent login code (best-effort). Check your Telegram app for the code."
+    await update.message.reply_text(
+        "❌ Operation cancelled.\n\nSend /help to see available commands."
     )
 
 
+# ── Job cancellation (progress task / RQ job / pipeline job) ───
+
+
+def _wipe_job_redis_keys(job_id: str) -> None:
+    """Delete all Redis keys associated with a job id (progress, io, cancel flag)."""
+    try:
+        r = get_sync_redis()
+        if not r:
+            return
+        for key in (
+            f"progress:{job_id}",
+            f"io:in:{job_id}",
+            f"io:out:{job_id}",
+            f"cancel:{job_id}",
+        ):
+            try:
+                r.delete(key)
+            except Exception:  # nosec B110
+                pass
+    except Exception:  # nosec B110
+        pass
+
+
+def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
+    """Best-effort cancel of an RQ job by id, but only when the job originated
+    from the caller's chat (ownership check for shared group chats).
+
+    Robust against a known RQ 2.x race: ``job.cancel()`` can raise
+    ``ValueError: Execution {id} not found in Redis`` when the job is in the
+    started registry but its execution record is missing (or was already
+    cleaned up). The ``cancel:<job_id>`` flag is set FIRST — that is the
+    signal the RQ worker honours at its checkpoints (tasks.py) to abort the
+    job even mid-flight — so cancellation is guaranteed even if RQ's own
+    bookkeeping fails. ``job.cancel()`` is still attempted for clean
+    bookkeeping; on failure the job is dropped from the queue/started
+    registries manually and marked canceled so it can never run.
+    """
+    try:
+        from rq.job import Job, JobStatus
+
+        from utils.redis_client import get_sync_redis_raw
+
+        # RQ stores job payloads pickled as raw bytes, so RQ operations must
+        # use a NON-decoding connection (the decode_responses=True singleton
+        # would UnicodeDecodeError on Job.fetch and silently fail to cancel).
+        r = get_sync_redis_raw()
+        if not r:
+            return False
+        job = Job.fetch(job_id, connection=r)
+        # All enqueued jobs pass chat_id as the first positional argument.
+        args = list(getattr(job, "args", None) or [])
+        if chat_id is not None and (not args or args[0] != chat_id):
+            return False
+
+        # Belt: the worker aborts jobs on this flag, so set it BEFORE RQ
+        # bookkeeping — a failed job.cancel() must never lose the cancel.
+        # Use the SAME raw connection that just succeeded at Job.fetch (a
+        # second connection may be in a transient error state and would
+        # silently lose the flag inside the best-effort guard below).
+        try:
+            r.setex(f"cancel:{job_id}", 3600, "1")
+        except Exception:  # nosec B110 - flag is best-effort
+            pass
+
+        def _drop_from_registries() -> None:
+            """Fallback: remove the job from queue/started registries and mark
+            it canceled, plus (re)set the cancel flag."""
+            origin = getattr(job, "origin", None) or "default"
+            # Wrong-type errors are impossible (queue is a list, wip is a
+            # zset); each key op is independently guarded.
+            try:
+                r.lrem(f"rq:queue:{origin}", 0, job_id)
+            except Exception:  # nosec B110
+                pass
+            try:
+                r.zrem(f"rq:wip:{origin}", job_id)
+            except Exception:  # nosec B110
+                pass
+            try:
+                job.set_status(JobStatus.CANCELED)
+            except Exception:  # nosec B110
+                pass
+            # Re-set the abort flag in case the belt attempt above failed.
+            try:
+                r.setex(f"cancel:{job_id}", 3600, "1")
+            except Exception:  # nosec B110
+                pass
+
+        try:
+            job.cancel()
+            return True
+        except Exception:  # nosec B110 - RQ 2.x execution-registry race etc.
+            _drop_from_registries()
+            return True
+    except Exception:
+        return False
+
+
+def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
+    """Best-effort cancel of a BigFilePipeline job: set the cancel flag and
+    remove any queued entry from the ``pdf:jobs`` Redis list — but only for
+    jobs owned by ``user_id`` (multi-user isolation)."""
+    removed = False
+    try:
+        from utils.job_queue import JOB_LIST
+
+        r = get_sync_redis()
+        if not r:
+            return False
+        raw_items = r.lrange(JOB_LIST, 0, -1)
+        for item in raw_items:
+            raw = item.decode() if isinstance(item, bytes) else item
+            try:
+                d = json.loads(raw)
+            except Exception:  # nosec B112 - skip non-JSON entries in the queue
+                continue
+            if d.get("job_id") == job_id and (
+                user_id is None or d.get("user_id") == user_id
+            ):
+                try:
+                    r.hset(f"pdf:job:{job_id}", mapping={"cancel": "1"})
+                except Exception:  # nosec B110
+                    pass
+                try:
+                    r.lrem(JOB_LIST, 0, item)
+                    removed = True
+                except Exception:  # nosec B110
+                    pass
+        return removed
+    except Exception:
+        return False
+
+
+async def cmd_canceljob(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel a queued or in-flight job by id (progress task, RQ job, or pipeline job)."""
+    await _track_user_session(update, "/canceljob")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.effective_message.reply_text(
+            "Usage: /canceljob <job_id>\n\n"
+            "You can find the job id in the 'Queued...' reply or the progress "
+            "message (ID: xxxxxxxx)."
+        )
+        return
+    job_id = args[0].strip()
+    uid = getattr(update.effective_user, "id", None)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    actions = []
+    owned = False
+
+    # 1) Inline progress task — only the owning user may cancel it
+    task_id = progress_tracker.find_task_id_by_prefix(job_id)
+    if task_id:
+        task = progress_tracker.get_task(task_id)
+        if task is not None and task.user_id == uid:
+            owned = True
+            if await progress_tracker.cancel_task(task_id):
+                actions.append(f"progress task `{task_id[:8]}`")
+
+    # 2) RQ job (queued/started Bot API pipeline) — caller's chat only
+    if await asyncio.to_thread(_cancel_rq_job, job_id, chat_id):
+        owned = True
+        actions.append(f"RQ job `{job_id}`")
+
+    # 3) BigFilePipeline job — caller's own only
+    if _cancel_pipeline_job(job_id, uid):
+        owned = True
+        actions.append(f"pipeline job `{job_id}`")
+
+    if owned:
+        # Ownership verified: wipe Redis keys + set the in-flight abort flag
+        _wipe_job_redis_keys(job_id)
+        try:
+            r = get_sync_redis()
+            if r:
+                r.setex(f"cancel:{job_id}", 3600, "1")
+        except Exception:  # nosec B110
+            pass
+        await update.effective_message.reply_text(
+            "✅ Cancelled: " + ", ".join(actions)
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"No active job found for you with id `{job_id}`. "
+            "It may have already finished."
+        )
+
+
+# ── Register per-user login + auth commands ────────────────────
+register_login_handlers(application)
+application.add_handler(CommandHandler("logout", cmd_logout))
+application.add_handler(CommandHandler("logoutpyro", cmd_logoutpyro))
+application.add_handler(CommandHandler("loginstatus", cmd_loginstatus))
+application.add_handler(CommandHandler("admin", cmd_admin))
 application.add_handler(CommandHandler("clearflood", cmd_clearflood))
+application.add_handler(CommandHandler("cancel", cmd_cancel))
+application.add_handler(CommandHandler("canceljob", cmd_canceljob))
 
-# Login text handler - captures phone/code/password during login flow
-_login_text_filter = filters.TEXT & ~filters.COMMAND & AwaitingLoginFilter()
-application.add_handler(
-    MessageHandler(_login_text_filter, _process_login_text)
-)
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """FastAPI lifespan: run startup logic and graceful shutdown teardown.
+
+    Replaces the deprecated ``@app.on_event`` startup/shutdown handlers.
+    ``on_startup`` / ``_on_shutdown`` / ``on_shutdown`` are module-level
+    coroutines defined below and resolved at runtime (when the server starts),
+    so forward references are safe.
+    """
+    await on_startup()
+    try:
+        yield
+    finally:
+        # Deliberate order: stop the session healthcheck BEFORE the worker/
+        # DB/application shutdown so the checker never sends admin messages
+        # during teardown.
+        await _on_shutdown()
+        await on_shutdown()
+
+
+app = FastAPI(lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    """Add baseline hardening headers to every HTTP response.
+
+    Flagged by the pre-deployment VulnClaw security audit (missing
+    X-Content-Type-Options / X-Frame-Options / Referrer-Policy / HSTS).
+    HSTS is only emitted when the request arrived over HTTPS (direct or via
+    a trusted proxy) so local/plain-HTTP testing is unaffected.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    )
+    # Proxies may send a comma-separated list (e.g. "https, http"); the first
+    # entry is the scheme the client used.
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0]
+    if request.url.scheme == "https" or forwarded_proto.strip().lower() == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
 
 
 # ── Application shutdown handler ────────────────────────────
-@app.on_event("shutdown")
 async def _on_shutdown():
     """Graceful shutdown: stop session healthcheck and cleanup."""
     logger.info("Shutting down bot application...")
     try:
         stop_session_healthcheck()
         logger.info("Session healthcheck stopped")
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
 
@@ -3009,14 +2473,14 @@ _longpoll_task = None
 _shutdown_event = asyncio.Event()
 
 
-@app.on_event("startup")
 async def on_startup() -> None:
     global \
         _keep_alive_task, \
         _worker_task, \
         _worker_proc, \
         _cleanup_task, \
-        _longpoll_task
+        _longpoll_task, \
+        _shc_task
     # Ensure storage directories exist
     for d in (
         config.STORAGE_PATH,
@@ -3027,10 +2491,32 @@ async def on_startup() -> None:
     ):
         try:
             os.makedirs(d, exist_ok=True)
-        except Exception:
+        except Exception:  # nosec B110
             pass
     # Initialize application so handlers, bot, and context are ready
     await application.initialize()
+
+    # ── Start the session healthcheck loop (needs a running loop) ──
+    try:
+        _admin_id = (
+            OWNER_ID
+            if OWNER_ID
+            else (list(config.ADMIN_USERS)[0] if config.ADMIN_USERS else None)
+        )
+        if _admin_id:
+            _shc_task = start_session_healthcheck(
+                admin_user_id=_admin_id,
+                bot_app=application,
+                db_model=None,  # uses utils.db fallback for MongoDB persistence
+                check_interval=int(
+                    os.getenv("SESSION_HEALTHCHECK_INTERVAL", "3600")
+                ),
+            )
+            logger.info("Session healthcheck started for admin %s", _admin_id)
+        else:
+            logger.info("No admin configured; session healthcheck disabled")
+    except Exception as e:
+        logger.warning("Session healthcheck init failed (non-fatal): %s", e)
 
     # ── Log cached user sessions on startup ──
     try:
@@ -3047,6 +2533,84 @@ async def on_startup() -> None:
                 )
     except Exception:
         logger.debug("Could not enumerate cached user sessions on startup")
+
+    # ── Eagerly persist env-var session strings to per-user JSON + MongoDB ──
+    # Mirrors the reference (media_conversion_bot/main.py): after a redeploy
+    # the persisted per-user JSON files are empty, so /loginstatus shows the
+    # owner's env session as missing and per-user resolution falls back to env
+    # every time. Persisting here populates the owner's per-user file right away.
+    try:
+        from utils.telethon_session import (
+            _load_all_sessions_from_file_async,
+            save_session_string_to_file_async,
+        )
+
+        _admin_persist_id = (
+            config.ADMIN_USER_ID
+            or config.OWNER_ID
+            or (sorted(config.ADMIN_USERS)[0] if config.ADMIN_USERS else None)
+        )
+        _existing_json = await _load_all_sessions_from_file_async()
+
+        # Pyrogram session from env var
+        _pyro_env = os.getenv("PYROGRAM_SESSION") or os.getenv(
+            "USERBOT_PYROGRAM_SESSION"
+        )
+        if _pyro_env and _existing_json.get("pyrogram_session") != _pyro_env:
+            await save_session_string_to_file_async(
+                _pyro_env, client_type="pyrogram"
+            )
+        if _pyro_env and _admin_persist_id:
+            await save_session_string_to_file_async(
+                _pyro_env, client_type="pyrogram", user_id=_admin_persist_id
+            )
+            try:
+                from utils.db import save_user_session
+
+                await save_user_session(
+                    _admin_persist_id, {"pyrogram_session": _pyro_env}
+                )
+            except Exception:  # nosec B110
+                pass
+
+        # Telethon session from env var
+        _telethon_env = None
+        for _k in (
+            "API_SESSION",
+            "SESSION",
+            "api_session",
+            "USERBOT_SESSION",
+            "userbot_session",
+            "TELETHON_SESSION",
+            "telethon_session",
+        ):
+            _v = os.getenv(_k)
+            if _v:
+                _telethon_env = _v
+                break
+        if _telethon_env and _existing_json.get("telethon_session") != _telethon_env:
+            await save_session_string_to_file_async(
+                _telethon_env, client_type="telethon"
+            )
+        if _telethon_env and _admin_persist_id:
+            await save_session_string_to_file_async(
+                _telethon_env, client_type="telethon", user_id=_admin_persist_id
+            )
+            try:
+                from utils.db import save_user_session
+
+                await save_user_session(
+                    _admin_persist_id, {"telethon_session": _telethon_env}
+                )
+            except Exception:  # nosec B110
+                pass
+
+        logger.info(
+            "Startup: persisted env-var sessions to per-user JSON (admin=%s)",
+            _admin_persist_id,
+        )
+    except Exception as exc:
+        logger.debug("Startup env->per-user JSON persistence skipped: %s", exc)
 
     # ── Background worker subprocess (with auto-restart supervision) ──
     _worker_proc = None
@@ -3210,7 +2774,7 @@ async def on_startup() -> None:
                     parsed_ka = urlparse(WEBHOOK_URL)
                     if parsed_ka.netloc:
                         _ka_url = f"{parsed_ka.scheme}://{parsed_ka.netloc}"
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
             if _ka_url:
@@ -3272,7 +2836,6 @@ async def on_startup() -> None:
         logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
 
 
-@app.on_event("shutdown")
 async def on_shutdown() -> None:
     _shutdown_event.set()
     try:
@@ -3301,7 +2864,7 @@ async def on_shutdown() -> None:
                     _worker_proc.kill()
                     _worker_proc.wait(timeout=3)
                 logger.info("Shutdown: worker subprocess terminated")
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
         # Stop cleanup manager
@@ -3309,7 +2872,7 @@ async def on_shutdown() -> None:
             from utils.cleanup import cleanup_manager as _cm
 
             _cm.stop()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         # Close MongoDB connections
@@ -3317,7 +2880,7 @@ async def on_shutdown() -> None:
             from utils.db import close_db
 
             await close_db()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         # CRITICAL: Do NOT delete the webhook on shutdown.
@@ -3347,14 +2910,16 @@ async def telegram_webhook(
       (set when registering the webhook via /setwebhook or /set_webhook)
       This is Telegram's official CSRF protection mechanism.
     """
-    # Layer 1: URL path token validation
-    if token != BOT_TOKEN:
+    # Layer 1: URL path token validation (constant-time comparison)
+    if not secrets.compare_digest(token, BOT_TOKEN):
         logger.warning("Received webhook with invalid token")
         return {"ok": False}
 
     # Layer 2: Secret token header validation (CSRF protection)
     # Telegram sends this header when secret_token is configured in setWebhook
-    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+    if not x_telegram_bot_api_secret_token or not secrets.compare_digest(
+        x_telegram_bot_api_secret_token, WEBHOOK_SECRET
+    ):
         logger.warning(
             "Received webhook with invalid X-Telegram-Bot-Api-Secret-Token "
             "(expected=%s..., got=%s...)",
@@ -3367,8 +2932,16 @@ async def telegram_webhook(
 
     data = await request.json()
     update = Update.de_json(data, application.bot)
+
+    async def _run_update() -> None:
+        # Guard against unobserved task exceptions from malformed updates.
+        try:
+            await application.process_update(update)
+        except Exception:
+            logger.exception("Failed to process webhook update")
+
     # Schedule processing in the running event loop to avoid threadpool issues
-    asyncio.create_task(application.process_update(update))
+    asyncio.create_task(_run_update())
     return {"ok": True}
 
 
@@ -3397,10 +2970,15 @@ async def handle_text_with_url(
     msg = update.effective_message
     if not msg or not msg.text:
         return
+    # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await msg.reply_text("Access denied. This bot is private.")
+        return
     urls = URL_RE.findall(msg.text)
     if not urls:
         return
 
+    user_id = getattr(update.effective_user, "id", None)
     _loop = asyncio.get_running_loop()
 
     for url in urls:
@@ -3416,7 +2994,16 @@ async def handle_text_with_url(
             if not base.lower().endswith(".pdf"):
                 base = base + ".pdf"
             if config.REDIS_URL:
-                ok = enqueue_job("process_url_job", chat_id, url, base)
+                # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
+                try:
+                    await telegram_api_limiter.wait_if_needed(
+                        str(getattr(update.effective_user, "id", 0))
+                    )
+                except Exception:  # nosec B110 - throttling is best-effort
+                    pass
+                ok = await asyncio.to_thread(
+                    enqueue_job, "process_url_job", chat_id, url, base
+                )
                 if ok:
                     await msg.reply_text(
                         "Queued your PDF URL for background processing; I'll send the result when ready."
@@ -3435,13 +3022,8 @@ async def handle_text_with_url(
                 thumb_path = os.path.join(tmpdir, "thumb.jpg")
                 create_thumbnail_from_pdf(file_path, thumb_path)
                 _url_file_size = os.path.getsize(file_path)
-                _url_limit = (
-                    config.MAX_FILE_SIZE
-                    if getattr(config, "MAX_FILE_SIZE", 0)
-                    and config.MAX_FILE_SIZE > 0
-                    else 50 * 1024 * 1024
-                )
-                if _url_file_size > _url_limit and _check_userbot_available():
+                _url_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+                if _url_file_size > _url_limit and _check_userbot_available(user_id):
                     await _send_with_upload_progress(
                         bot=context.bot,
                         chat_id=msg.chat.id
@@ -3479,7 +3061,7 @@ async def handle_text_with_url(
                 )
                 try:
                     await msg.reply_text(error_info["user_message"])
-                except Exception:
+                except Exception:  # nosec B110
                     pass
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3538,12 +3120,12 @@ async def handle_text_with_url(
                                     await msg.reply_text(
                                         error_info["user_message"]
                                     )
-                                except Exception:
+                                except Exception:  # nosec B110
                                     pass
                             finally:
                                 shutil.rmtree(tmpdir, ignore_errors=True)
                             return
-            except Exception:
+            except Exception:  # nosec B112
                 continue
 
 
@@ -3553,30 +3135,15 @@ application.add_handler(
 
 
 def _verify_admin_header(admin_token: str) -> bool:
-    if not config.ADMIN_SECRET:
+    if not config.ADMIN_SECRET or not admin_token:
         return False
-    return admin_token == config.ADMIN_SECRET
+    return secrets.compare_digest(admin_token, config.ADMIN_SECRET)
 
 
 @app.get("/status")
 async def status() -> str:
     # Return a minimal, non-sensitive status string
     return "active"
-
-
-@app.get("/commands")
-async def get_commands(admin_token: str | None = Header(default=None)) -> dict:
-    if not admin_token or not _verify_admin_header(admin_token):
-        raise HTTPException(status_code=403, detail="Admin token required")
-    try:
-        cmds = await application.bot.get_my_commands()
-        return {"ok": True, "commands": [c.to_dict() for c in cmds]}
-    except Exception:
-        logger.exception("Failed to fetch commands")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to fetch commands. Check server logs for details.",
-        )
 
 
 # ── Rate limiter for admin HTTP endpoints ─────────────────────
@@ -3617,6 +3184,24 @@ async def _rate_limit_admin_api(request: Request) -> None:
         )
 
 
+@app.get("/commands")
+async def get_commands(
+    admin_token: str | None = Header(default=None),
+    _: None = Depends(_rate_limit_admin_api),
+) -> dict:
+    if not admin_token or not _verify_admin_header(admin_token):
+        raise HTTPException(status_code=403, detail="Admin token required")
+    try:
+        cmds = await application.bot.get_my_commands()
+        return {"ok": True, "commands": [c.to_dict() for c in cmds]}
+    except Exception:
+        logger.exception("Failed to fetch commands")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch commands. Check server logs for details.",
+        )
+
+
 @app.post("/set_webhook")
 async def set_webhook(
     request: Request,
@@ -3625,7 +3210,7 @@ async def set_webhook(
     _: None = Depends(_rate_limit_admin_api),
 ) -> dict:
     # OWNER_ID header check: only the bot owner can call this endpoint
-    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+    if OWNER_ID and (not owner_id or str(owner_id) != str(OWNER_ID)):
         raise HTTPException(
             status_code=403, detail="Only the bot owner can set the webhook"
         )
@@ -3660,7 +3245,7 @@ async def delete_webhook(
     owner_id: str | None = Header(default=None),
     _: None = Depends(_rate_limit_admin_api),
 ) -> dict:
-    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+    if OWNER_ID and (not owner_id or str(owner_id) != str(OWNER_ID)):
         raise HTTPException(
             status_code=403, detail="Only the bot owner can delete the webhook"
         )
@@ -3685,7 +3270,7 @@ async def admin_purge_s3(
     _: None = Depends(_rate_limit_admin_api),
 ) -> dict:
     # OWNER_ID header check: only the bot owner can purge S3
-    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+    if OWNER_ID and (not owner_id or str(owner_id) != str(OWNER_ID)):
         raise HTTPException(
             status_code=403, detail="Only the bot owner can purge S3"
         )
@@ -3732,7 +3317,7 @@ async def set_commands(
     _: None = Depends(_rate_limit_admin_api),
 ) -> dict:
     # OWNER_ID header check: only the bot owner can call this endpoint
-    if OWNER_ID and (not owner_id or int(owner_id) != OWNER_ID):
+    if OWNER_ID and (not owner_id or str(owner_id) != str(OWNER_ID)):
         raise HTTPException(
             status_code=403, detail="Only the bot owner can set commands"
         )

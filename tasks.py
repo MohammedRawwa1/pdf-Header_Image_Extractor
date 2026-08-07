@@ -11,6 +11,42 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+def _job_cancelled(job_id: str | None) -> bool:
+    """Return True if a cancel flag exists in Redis for this job id.
+
+    Set by /canceljob (``cancel:<job_id>`` key with a 1h TTL). The RQ worker
+    and pipeline worker check this flag so in-flight jobs abort cleanly.
+    """
+    if not job_id:
+        return False
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return False
+        return bool(r.exists(f"cancel:{job_id}"))
+    except Exception:
+        return False
+
+
+def _pipeline_cancel_flag(job_id: str | None) -> bool:
+    """Return True if the pipeline job hash has its cancel flag set."""
+    if not job_id:
+        return False
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return False
+        flag = r.hget(f"pdf:job:{job_id}", "cancel")
+        return flag in (b"1", "1")
+    except Exception:
+        return False
+
+
 # Use direct Telegram Bot HTTP API calls in background workers (synchronous)
 
 
@@ -62,7 +98,7 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
                         "timestamp": int(time.time()),
                     },
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             # For server errors or rate limits, retry a couple times
             if r.status_code >= 500 or r.status_code == 429:
@@ -90,7 +126,7 @@ def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
                         "timestamp": int(time.time()),
                     },
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             raise
 
@@ -175,9 +211,53 @@ def _tg_send_document(
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-    r = requests.post(url, data=data, files=files, timeout=120)
-    r.raise_for_status()
-    return r.json()
+    # Retry on transient 429/5xx (Telegram flood control) with backoff —
+    # the worker shares the bot token with the web process, so sends must
+    # tolerate global-rate-limit responses instead of failing the job.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            # Rewind file streams so a retry re-sends the FULL payload
+            # (requests consumes the file object; without seek(0) a retry
+            # would upload a truncated file).
+            try:
+                doc_fileobj.seek(0)
+                if thumb_fileobj is not None:
+                    thumb_fileobj.seek(0)
+            except Exception:  # nosec B110 - non-seekable streams
+                pass
+            r = requests.post(url, data=data, files=files, timeout=120)
+            if r.status_code in (429,) or r.status_code >= 500:
+                last_exc = requests.HTTPError(
+                    f"Telegram sendDocument failed: status={r.status_code}"
+                )
+                logger.warning(
+                    "_tg_send_document: HTTP %s on attempt %d for %s",
+                    r.status_code,
+                    attempt + 1,
+                    filename,
+                )
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
+                raise last_exc
+            r.raise_for_status()
+            return r.json()
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+        ) as e:
+            last_exc = e
+            logger.warning(
+                "_tg_send_document: transient error %s on attempt %d for %s",
+                type(e).__name__,
+                attempt + 1,
+                filename,
+            )
+            if attempt < 2:
+                time.sleep(2**attempt)
+                continue
+    raise last_exc or RuntimeError(f"Failed to send document {filename}")
 
 
 def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
@@ -190,9 +270,43 @@ def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
             bot_token = None
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {"chat_id": str(chat_id), "text": text}
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    # Retry on transient 429/5xx (Telegram flood control) with backoff —
+    # mirrors the sendDocument helper so background workers survive bursts.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.post(url, data=data, timeout=30)
+            if r.status_code in (429,) or r.status_code >= 500:
+                last_exc = requests.HTTPError(
+                    f"Telegram sendMessage failed: status={r.status_code}"
+                )
+                logger.warning(
+                    "_tg_send_message: HTTP %s on attempt %d (chat %s)",
+                    r.status_code,
+                    attempt + 1,
+                    chat_id,
+                )
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
+                raise last_exc
+            r.raise_for_status()
+            return r.json()
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+        ) as e:
+            last_exc = e
+            logger.warning(
+                "_tg_send_message: transient error %s on attempt %d (chat %s)",
+                type(e).__name__,
+                attempt + 1,
+                chat_id,
+            )
+            if attempt < 2:
+                time.sleep(2**attempt)
+                continue
+    raise last_exc or RuntimeError(f"Failed to send message to chat {chat_id}")
 
 
 def _tg_edit_message_text(
@@ -309,6 +423,7 @@ from tools import (  # noqa: E402
     create_thumbnail_from_image_bytes,
     create_thumbnail_from_pdf,
     create_thumbnail_from_pdf_bytes,
+    extract_pdf_metadata,
     is_supported_format,
 )
 from utils.progress_tracker import (  # noqa: E402
@@ -412,6 +527,16 @@ def process_input_key_job(job: dict) -> dict:
 
     unique_key = job_id
 
+    # Honour /canceljob: abort before downloading when the flag is set.
+    if _job_cancelled(job_id) or _pipeline_cancel_flag(job_id):
+        try:
+            _tg_send_message(
+                None, chat_id, "\u274c Job cancelled by user."
+            )
+        except Exception:  # nosec B110
+            pass
+        return {"status": "cancelled"}
+
     # write input metadata for observability
     try:
         input_meta = {
@@ -434,7 +559,7 @@ def process_input_key_job(job: dict) -> dict:
     }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     tmpdir = None
@@ -471,7 +596,7 @@ def process_input_key_job(job: dict) -> dict:
             )
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             return {"error": "s3_download_failed"}
         dl_elapsed = time.time() - dl_start
@@ -484,11 +609,11 @@ def process_input_key_job(job: dict) -> dict:
         _dl_size_post = os.path.getsize(dest_path)
         try:
             out_meta.setdefault("sizes", {})["orig_bytes"] = _dl_size_post
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         # Update progress: download complete
@@ -516,11 +641,17 @@ def process_input_key_job(job: dict) -> dict:
         else:
             create_thumbnail_from_image(dest_path, thumb_path)
 
-        upload_limit = (
-            config.MAX_FILE_SIZE
-            if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-            else 50 * 1024 * 1024
-        )
+        # ── Full PDF metadata retrieval (persisted into io:out) ──
+        if filename.lower().endswith(".pdf"):
+            pdf_meta = extract_pdf_metadata(dest_path)
+            if pdf_meta.get("extracted"):
+                out_meta["pdf_metadata"] = pdf_meta
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+
+        upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
         upload_path = dest_path
         try:
             orig_size = os.path.getsize(dest_path)
@@ -552,7 +683,7 @@ def process_input_key_job(job: dict) -> dict:
                 ] = int(time.time())
                 try:
                     _set_io_keys(unique_key, output_meta=out_meta)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 if ok1:
                     try:
@@ -564,7 +695,7 @@ def process_input_key_job(job: dict) -> dict:
                         out_meta.setdefault("sizes", {})[
                             "compressed_bytes"
                         ] = csize
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             if upload_path == dest_path:
@@ -590,7 +721,7 @@ def process_input_key_job(job: dict) -> dict:
                     ] = int(time.time())
                     try:
                         _set_io_keys(unique_key, output_meta=out_meta)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
                     if ok2:
                         try:
@@ -602,7 +733,7 @@ def process_input_key_job(job: dict) -> dict:
                             out_meta.setdefault("sizes", {})[
                                 "compressed_bytes"
                             ] = c2size
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
         # If still too large, try S3 fallback (should rarely be needed since input was uploaded already)
@@ -630,7 +761,7 @@ def process_input_key_job(job: dict) -> dict:
                                 chat_id,
                                 "\U0001f4ce File was too large for Telegram; uploaded to external storage.",
                             )
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         out_meta.setdefault("durations", {})[
                             "s3_upload_ms"
@@ -642,7 +773,7 @@ def process_input_key_job(job: dict) -> dict:
                         out_meta.setdefault("s3", {})["url"] = url
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         return {"s3_url": url}
                 except Exception:
@@ -655,7 +786,7 @@ def process_input_key_job(job: dict) -> dict:
                     chat_id,
                     "\U0001f4e6 File too large to upload via bot; compression couldn't reduce it enough. Try a smaller file or external storage.",
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             out_meta.setdefault("status", "too_large_after_compress")
             out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
@@ -664,7 +795,7 @@ def process_input_key_job(job: dict) -> dict:
             )
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             return {"error": "file too large after compression"}
 
@@ -700,15 +831,15 @@ def process_input_key_job(job: dict) -> dict:
             out_meta.setdefault("sizes", {})["out_bytes"] = os.path.getsize(
                 upload_path
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             out_meta["tg_response"] = res
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         _tg_send_progress(
@@ -726,7 +857,7 @@ def process_input_key_job(job: dict) -> dict:
                 if job_obj is not None:
                     job_obj.meta["tg_response"] = res
                     job_obj.save_meta()
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         return res
@@ -745,7 +876,7 @@ def process_input_key_job(job: dict) -> dict:
         out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             _tg_send_message(
@@ -753,7 +884,7 @@ def process_input_key_job(job: dict) -> dict:
                 chat_id,
                 "\u274c Error processing uploaded file. Check server logs for details.",
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return {"error": "processing_error"}
     finally:
@@ -761,7 +892,7 @@ def process_input_key_job(job: dict) -> dict:
             if tmpdir and os.path.exists(tmpdir):
                 if cleanup_input:
                     shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
@@ -816,7 +947,7 @@ def _set_io_keys(
                 sync_query(COL_JOBS, mongo_db).where(
                     "job_id", "=", f"io:{unique_id}"
                 ).upsert(mongo_meta)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     return redis_ok
@@ -831,6 +962,7 @@ def process_document_job(
     message_id: int | None = None,
     forward_info: dict | None = None,
     file_size: int | None = None,
+    user_id: int | None = None,
 ) -> dict | None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
 
@@ -839,9 +971,28 @@ def process_document_job(
       2. Chat-based userbot download ``download_bytes_via_userbot(chat_id, message_id)``
       3. BigFilePipeline (S3 pipeline + separate worker) — only if S3 is configured
 
+    ``user_id`` is threaded into the userbot fallback so the *requesting user's*
+    own Telethon/Pyrogram session is used (per-user sessions).
+
     NOTE: This function reads the bot token from `config.BOT_TOKEN` internally; do NOT pass the token as a job argument.
     """
     unique_key = file_unique_id or file_id
+
+    # Capture the RQ job id (when running under the RQ worker) so /canceljob can
+    # abort this job via the `cancel:<id>` Redis flag even while it is running.
+    _rq_job_id = None
+    try:
+        import rq
+
+        _cur_job = rq.get_current_job()
+        _rq_job_id = _cur_job.id if _cur_job else None
+    except Exception:  # nosec B110 - rq is optional outside the worker
+        pass
+    _cancel_check_id = _rq_job_id or unique_key
+
+    # Honour an early /canceljob request before doing any heavy work.
+    if _job_cancelled(_cancel_check_id):
+        return {"status": "cancelled"}
 
     # ── Early format validation: reject unsupported formats before any processing ──
     if not is_supported_format(filename, mime or ""):
@@ -859,7 +1010,7 @@ def process_document_job(
                 "This bot only processes **PDF documents** and **images** (JPEG, PNG, WEBP, GIF).\n"
                 "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported.",
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return {"error": "unsupported format", "filename": filename, "mime": mime}
 
@@ -890,18 +1041,14 @@ def process_document_job(
     }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     tmpdir = None
     # Flag for userbot fallback data (large files that Bot API can't handle)
     _userbot_dl_data = None
     # Calculate upload limit BEFORE getFile so the early size check can use it
-    upload_limit = (
-        config.MAX_FILE_SIZE
-        if getattr(config, "MAX_FILE_SIZE", 0) and config.MAX_FILE_SIZE > 0
-        else 50 * 1024 * 1024
-    )
+    upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
     # Track progress message ID so we can edit the same message
     _progress_msg_id = None
     try:
@@ -939,6 +1086,20 @@ def process_document_job(
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
+                # Honor the ENABLE_USERBOT gate (mirrors the reference's
+                # handlers-level gate): when explicitly disabled, skip the
+                # userbot fallback chain entirely.
+                try:
+                    import config as _config
+
+                    _userbot_gate = _config.ENABLE_USERBOT
+                except Exception:
+                    _userbot_gate = True
+                if not _userbot_gate:
+                    logger.info(
+                        "Bot API cannot handle large file; userbot fallback disabled by ENABLE_USERBOT"
+                    )
+                    raise
                 logger.info(
                     "Bot API cannot handle large file; trying userbot fallback chain"
                 )
@@ -963,7 +1124,9 @@ def process_document_job(
                         download_bytes_by_file_id_via_userbot as _dl_file_id,
                     )
 
-                    _ub_data = _asyncio.run(_dl_file_id(file_id))
+                    _ub_data = _asyncio.run(
+                        _dl_file_id(file_id, user_id=user_id)
+                    )
                     if _ub_data and len(_ub_data) > 0:
                         logger.info(
                             "Userbot file_id download succeeded: %d bytes",
@@ -998,7 +1161,9 @@ def process_document_job(
                             chat_id,
                             message_id,
                         )
-                        _ub_data = _asyncio.run(_dl_chat(chat_id, message_id))
+                        _ub_data = _asyncio.run(
+                            _dl_chat(chat_id, message_id, user_id=user_id)
+                        )
                         if _ub_data and len(_ub_data) > 0:
                             logger.info(
                                 "Userbot chat-based download succeeded: %d bytes",
@@ -1058,7 +1223,11 @@ def process_document_job(
                                 )
 
                                 _ub_data = _asyncio.run(
-                                    _dl_relay(relay_chat_id, fwd_msg_id)
+                                    _dl_relay(
+                                        relay_chat_id,
+                                        fwd_msg_id,
+                                        user_id=user_id,
+                                    )
                                 )
                                 if _ub_data and len(_ub_data) > 0:
                                     logger.info(
@@ -1115,6 +1284,7 @@ def process_document_job(
                                 file_size=file_size or 0,
                                 file_unique_id=file_unique_id,
                                 original_filename=filename,
+                                user_id=user_id,
                             )
                         )
                         if _result and _result.ok:
@@ -1176,7 +1346,7 @@ def process_document_job(
         out_meta.setdefault("timestamps", {})["getfile_end"] = int(time.time())
         try:
             _set_io_keys(unique_key, output_meta=out_meta)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
         # (upload_limit was calculated before the getFile block above)
@@ -1225,11 +1395,11 @@ def process_document_job(
             _dl_size_post = os.path.getsize(file_path)
             try:
                 out_meta.setdefault("sizes", {})["orig_bytes"] = _dl_size_post
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             # Update progress: download complete
@@ -1259,6 +1429,19 @@ def process_document_job(
                 create_thumbnail_from_pdf(file_path, thumb_path)
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
+
+            # ── Full PDF metadata retrieval (persisted into io:out) ──
+            if (
+                filename.lower().endswith(".pdf")
+                or "pdf" in (mime or "").lower()
+            ):
+                pdf_meta = extract_pdf_metadata(file_path)
+                if pdf_meta.get("extracted"):
+                    out_meta["pdf_metadata"] = pdf_meta
+                    try:
+                        _set_io_keys(unique_key, output_meta=out_meta)
+                    except Exception:  # nosec B110
+                        pass
 
             # compression flow
             upload_path = file_path
@@ -1292,7 +1475,7 @@ def process_document_job(
                     ] = int(time.time())
                     try:
                         _set_io_keys(unique_key, output_meta=out_meta)
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
                     if ok1:
                         try:
@@ -1304,7 +1487,7 @@ def process_document_job(
                             out_meta.setdefault("sizes", {})[
                                 "compressed_bytes"
                             ] = csize
-                except Exception:
+                except Exception:  # nosec B110
                     pass
 
                 if upload_path == file_path:
@@ -1331,7 +1514,7 @@ def process_document_job(
                         ] = int(time.time())
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         if ok2:
                             try:
@@ -1343,7 +1526,7 @@ def process_document_job(
                                 out_meta.setdefault("sizes", {})[
                                     "compressed_bytes"
                                 ] = c2size
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
 
             # if still too large, try S3 fallback
@@ -1371,7 +1554,7 @@ def process_document_job(
                                     chat_id,
                                     f"File was too large for Telegram; uploaded to external storage: {url}",
                                 )
-                            except Exception:
+                            except Exception:  # nosec B110
                                 pass
                             out_meta.setdefault("durations", {})[
                                 "s3_upload_ms"
@@ -1383,7 +1566,7 @@ def process_document_job(
                             out_meta.setdefault("s3", {})["url"] = url
                             try:
                                 _set_io_keys(unique_key, output_meta=out_meta)
-                            except Exception:
+                            except Exception:  # nosec B110
                                 pass
                             return {"s3_url": url}
                     except Exception:
@@ -1398,7 +1581,7 @@ def process_document_job(
                         chat_id,
                         "\U0001f4e6 File too large to upload via bot; compression didn't reduce it enough. Try a smaller file or external storage.",
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 out_meta.setdefault("status", "too_large_after_compress")
                 out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
@@ -1407,9 +1590,29 @@ def process_document_job(
                 )
                 try:
                     _set_io_keys(unique_key, output_meta=out_meta)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 return {"error": "file too large after compression"}
+
+            # ── Honour /canceljob while the job is in flight ──
+            if _job_cancelled(_cancel_check_id):
+                _tg_send_progress(
+                    chat_id,
+                    filename,
+                    "cancelled",
+                    detail="\u274c Job cancelled by user.",
+                    file_size=orig_size or 0,
+                    message_id=_progress_msg_id,
+                )
+                out_meta.setdefault("status", "cancelled")
+                out_meta.setdefault("timestamps", {})["finished"] = int(
+                    time.time()
+                )
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+                return {"status": "cancelled"}
 
             # send final document via Telegram
             _progress_msg_id = _tg_send_progress(
@@ -1445,15 +1648,15 @@ def process_document_job(
                 out_meta.setdefault("sizes", {})["out_bytes"] = (
                     os.path.getsize(upload_path)
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 out_meta["tg_response"] = res
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             # Update progress to done
@@ -1472,7 +1675,7 @@ def process_document_job(
                     if job is not None:
                         job.meta["tg_response"] = res
                         job.save_meta()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             return res
@@ -1499,11 +1702,11 @@ def process_document_job(
                 out_meta.setdefault("sizes", {})["orig_bytes"] = len(
                     file_bytes
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             if (
@@ -1537,7 +1740,7 @@ def process_document_job(
                         ] = int(time.time())
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         if ok1:
                             try:
@@ -1550,7 +1753,7 @@ def process_document_job(
                                 out_meta.setdefault("sizes", {})[
                                     "compressed_bytes"
                                 ] = csize
-                    except Exception:
+                    except Exception:  # nosec B110
                         pass
 
                     if len(file_bytes) > upload_limit:
@@ -1570,7 +1773,7 @@ def process_document_job(
                             ] = int(time.time())
                             try:
                                 _set_io_keys(unique_key, output_meta=out_meta)
-                            except Exception:
+                            except Exception:  # nosec B110
                                 pass
                             if ok2:
                                 try:
@@ -1583,7 +1786,7 @@ def process_document_job(
                                     out_meta.setdefault("sizes", {})[
                                         "compressed_bytes"
                                     ] = c2size
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
 
                     # if still too big, try S3
@@ -1614,7 +1817,7 @@ def process_document_job(
                                             chat_id,
                                             f"File was too large for Telegram; uploaded to external storage: {url}",
                                         )
-                                    except Exception:
+                                    except Exception:  # nosec B110
                                         pass
                                     out_meta.setdefault("durations", {})[
                                         "s3_upload_ms"
@@ -1630,7 +1833,7 @@ def process_document_job(
                                         _set_io_keys(
                                             unique_key, output_meta=out_meta
                                         )
-                                    except Exception:
+                                    except Exception:  # nosec B110
                                         pass
                                     return {"s3_url": url}
                             except Exception:
@@ -1644,7 +1847,7 @@ def process_document_job(
                                 chat_id,
                                 f"File too large to upload via bot after compression; size={len(file_bytes)} bytes",
                             )
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         out_meta.setdefault(
                             "status", "too_large_after_compress"
@@ -1654,7 +1857,7 @@ def process_document_job(
                         )
                         try:
                             _set_io_keys(unique_key, output_meta=out_meta)
-                        except Exception:
+                        except Exception:  # nosec B110
                             pass
                         return {"error": "file too large after compression"}
                 finally:
@@ -1684,11 +1887,11 @@ def process_document_job(
             out_meta.setdefault("status", "done")
             try:
                 out_meta["tg_response"] = res
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 _set_io_keys(unique_key, output_meta=out_meta)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 if get_current_job is not None:
@@ -1696,7 +1899,7 @@ def process_document_job(
                     if job is not None:
                         job.meta["tg_response"] = res
                         job.save_meta()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             return res
 
@@ -1709,7 +1912,7 @@ def process_document_job(
                 time.time()
             )
             _set_io_keys(unique_key, output_meta=out_meta)
-        except Exception:
+        except Exception:  # nosec B110
             pass
         # Update progress to failed if a progress message exists
         try:
@@ -1720,7 +1923,7 @@ def process_document_job(
                 detail="\u274c Processing failed. Check server logs for details.",
                 message_id=_progress_msg_id,
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         try:
             _tg_send_message(
@@ -1728,21 +1931,24 @@ def process_document_job(
                 chat_id,
                 "\u274c Error processing file in background. Check server logs for details.",
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return {"error": str(e)}
     finally:
         try:
             if tmpdir and os.path.exists(tmpdir):
                 shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
+        except Exception:  # nosec B110
             pass
 
 
-def process_document_batch_job(chat_id: int, items: list) -> None:
+def process_document_batch_job(
+    chat_id: int, items: list, user_id: int | None = None
+) -> None:
     """RQ job: process a batch of forwarded document items in order.
 
     Each item dict is expected to have: file_id, filename, mime.
+    ``user_id`` is threaded to each item so per-user sessions are used.
     """
     results = []
     for item in items:
@@ -1762,7 +1968,17 @@ def process_document_batch_job(chat_id: int, items: list) -> None:
             results.append({"skipped": "unsupported format", "filename": filename, "mime": mime})
             continue
         try:
-            res = process_document_job(chat_id, file_id, filename, mime)
+            res = process_document_job(
+                chat_id,
+                file_id,
+                filename,
+                mime,
+                file_unique_id=item.get("file_unique_id"),
+                message_id=item.get("message_id"),
+                forward_info=item.get("forward_info"),
+                file_size=item.get("file_size"),
+                user_id=user_id,
+            )
             results.append(res)
         except Exception:
             logger.exception("Failed processing batch item %s", filename)
@@ -1792,7 +2008,7 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
                 chat_id,
                 "\u274c Invalid or blocked URL. Only http/https URLs to public servers are allowed.",
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
         return
 
@@ -1835,7 +2051,7 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
                 chat_id,
                 "\u274c Error processing URL. Check server logs for details.",
             )
-        except Exception:
+        except Exception:  # nosec B110
             pass
     finally:
         if tmpdir:

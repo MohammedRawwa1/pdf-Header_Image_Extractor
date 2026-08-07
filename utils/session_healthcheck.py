@@ -127,11 +127,24 @@ class SessionHealthChecker:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    def start(self) -> asyncio.Task:
-        """Start the periodic healthcheck loop as a background task."""
+    def start(self) -> asyncio.Task | None:
+        """Start the periodic healthcheck loop as a background task.
+
+        Returns ``None`` when there is no running event loop (e.g. during
+        module import) instead of leaking an un-awaited coroutine; the
+        startup path that has a live loop should call this again.
+        """
         if self._task is not None and not self._task.done():
             logger.debug("SessionHealthChecker is already running")
             return self._task
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "SessionHealthChecker.start: no running event loop; deferring"
+            )
+            self.is_running = False
+            return None
         self.is_running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info(
@@ -148,14 +161,21 @@ class SessionHealthChecker:
             self._task.cancel()
         logger.info("SessionHealthChecker stop requested")
 
-    async def run_once(self) -> dict:
+    async def run_once(self, user_id: int | None = None) -> dict:
         """Run a single health check and return the result dict.
 
-        Useful for on-demand diagnostics (e.g. the ``/sessionstatus`` command).
+        When ``user_id`` is provided, checks that user's own sessions
+        (per-user login) instead of the global/admin session.
+
+        Useful for on-demand diagnostics (e.g. the ``/loginstatus`` command).
         """
-        results = await self._check_all()
-        self.last_health = {r["name"]: r for r in results}
-        return self.last_health
+        results = await self._check_all(user_id=user_id)
+        # Only the global/admin check updates the shared last_health used by
+        # the background loop and admin alerts; per-user checks must not
+        # clobber it.
+        if user_id is None:
+            self.last_health = {r["name"]: r for r in results}
+        return {r["name"]: r for r in results}
 
     # ── Internal loop ───────────────────────────────────────────────
 
@@ -289,16 +309,20 @@ class SessionHealthChecker:
 
     # ── Health checks ──────────────────────────────────────────────
 
-    async def _check_all(self) -> list:
-        """Run both Pyrogram and Telethon checks in parallel."""
+    async def _check_all(self, user_id: int | None = None) -> list:
+        """Run both Pyrogram and Telethon checks in parallel.
+
+        When ``user_id`` is provided, each check resolves that user's own
+        sessions (per-user login).
+        """
         results = []
         tasks = []
 
         if PyrogramClient is not None:
-            tasks.append(self._check_pyrogram())
+            tasks.append(self._check_pyrogram(user_id=user_id))
 
         if TelegramClient is not None:
-            tasks.append(self._check_telethon())
+            tasks.append(self._check_telethon(user_id=user_id))
 
         if not tasks:
             logger.debug("SessionHealthChecker: no client libraries available")
@@ -357,11 +381,11 @@ class SessionHealthChecker:
             finally:
                 try:
                     await asyncio.sleep(0.5)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 try:
                     await client.stop()
-                except Exception:
+                except Exception:  # nosec B110
                     pass
         except Exception as exc:
             logger.warning(
@@ -369,43 +393,62 @@ class SessionHealthChecker:
             )
             return False
 
-    async def _check_pyrogram(self) -> SessionHealth:
+    async def _check_pyrogram(self, user_id: int | None = None) -> SessionHealth:
         """Check if the Pyrogram session string is still valid.
 
-        On success, persists the current session string to MongoDB so that
-        long-lived sessions survive restarts (see ``_save_pyrogram_session``).
+        When ``user_id`` is provided, resolves that user's own session
+        (per-user login).  On success, persists the session string to
+        MongoDB + JSON so long-lived sessions survive restarts
+        (see ``_save_pyrogram_session``).
         """
         h = SessionHealth("pyrogram")
 
         try:
             from utils.telethon_session import (
-                _get_env_value,
-                _load_session_string_from_file_async,
                 build_pyrogram_client,
+                get_pyrogram_session_string,
                 get_userbot_credentials,
             )
         except ImportError as exc:
             h.error = f"import failed: {exc}"
             return h
 
-        # Check env vars first (fast, no I/O) \u2014 skip the file read if set
-        env_str = _get_env_value(
-            "PYROGRAM_SESSION",
-            "pyrogram_session",
-            "USERBOT_PYROGRAM_SESSION",
-            "userbot_pyrogram_session",
-        )
-        if env_str:
-            session_str = env_str
-        else:
-            # Read the persisted JSON file async to avoid blocking the event loop
+        # Resolve which user_id to use: caller-specified, then admin, then None
+        check_user_id = user_id or self.admin_user_id
+
+        # Resolve the session string: per-user session first when user_id is
+        # provided, env/global shared session as fallback.
+        try:
+            session_str = get_pyrogram_session_string(user_id=check_user_id)
+        except Exception as exc:
+            h.error = f"config check failed: {exc}"
+            return h
+
+        if not session_str:
+            # Fall back to the MongoDB-persisted session (mirrors the
+            # reference's build_pyrogram_client_async resolution, so
+            # /loginstatus matches what downloads actually resolve).
             try:
-                session_str = await _load_session_string_from_file_async(
-                    client_type="pyrogram"
+                from utils.telethon_session import (
+                    get_pyrogram_session_string_for_user,
                 )
-            except Exception as exc:
-                h.error = f"config check failed: {exc}"
-                return h
+
+                session_str = await get_pyrogram_session_string_for_user(
+                    user_id=check_user_id, db_model=self.db_model
+                )
+            except Exception:
+                session_str = None
+
+        if not session_str and user_id is None:
+            # Fall back to the most recent session stored for ANY user — but
+            # ONLY for the global periodic check, which doesn't know which user
+            # owns a /loginpyro session. Per-user /loginstatus checks must stay
+            # truthful (never report another user's session as this user's).
+            session_str = await self._load_any_session("pyrogram_session")
+            if session_str:
+                logger.info(
+                    "SessionHealthChecker: Pyrogram session found via latest-Mongo fallback"
+                )
 
         if not session_str:
             h.alive = False
@@ -442,10 +485,10 @@ class SessionHealthChecker:
                         if hasattr(client.storage, "dc_id")
                         else None
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-                # Persist session string to MongoDB for long-term survival
-                await self._save_pyrogram_session(client)
+                # Persist session string to MongoDB + JSON for long-term survival
+                await self._save_pyrogram_session(client, user_id=user_id)
             else:
                 h.error = "get_me() returned None (not authorized)"
         except Exception as exc:
@@ -455,50 +498,66 @@ class SessionHealthChecker:
         finally:
             try:
                 await asyncio.sleep(0.5)
-            except Exception:
+            except Exception:  # nosec B110
                 pass
             try:
                 await client.stop()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
         return h
 
-    async def _check_telethon(self) -> SessionHealth:
+    async def _check_telethon(self, user_id: int | None = None) -> SessionHealth:
         """Check if the Telethon session is still valid.
 
-        On success, persists the current session string to MongoDB so that
-        long-lived sessions survive restarts (see ``_save_telethon_session``).
+        When ``user_id`` is provided, resolves that user's own session
+        (per-user login).  On success, persists the session string to
+        MongoDB + JSON so long-lived sessions survive restarts
+        (see ``_save_telethon_session``).
         """
         h = SessionHealth("telethon")
 
         from utils.telethon_session import (
-            _get_env_value,
-            _load_session_string_from_file_async,
+            _get_configured_session_string,
             build_telethon_client,
             get_telethon_session_path,
             get_userbot_credentials,
         )
 
-        # Check env vars first (fast, no I/O)
-        session_str = _get_env_value(
-            "API_SESSION",
-            "SESSION",
-            "api_session",
-            "USERBOT_SESSION",
-            "userbot_session",
-            "TELETHON_SESSION",
-            "telethon_session",
-        )
+        # Resolve which user_id to use: caller-specified, then admin, then None
+        check_user_id = user_id or self.admin_user_id
+
+        # Resolve the session string: per-user session first when user_id is
+        # provided, env/global shared session as fallback.
+        try:
+            session_str = _get_configured_session_string(user_id=check_user_id)
+        except Exception as exc:
+            h.error = f"config check failed: {exc}"
+            return h
+
         if not session_str:
-            # Read the persisted JSON file async to avoid blocking the event loop
+            # Fall back to the MongoDB-persisted session (mirrors the
+            # reference's resolution, so /loginstatus matches downloads).
             try:
-                session_str = await _load_session_string_from_file_async(
-                    client_type="telethon"
+                from utils.telethon_session import (
+                    get_telethon_session_string_for_user,
                 )
-            except Exception as exc:
-                h.error = f"config check failed: {exc}"
-                return h
+
+                session_str = await get_telethon_session_string_for_user(
+                    user_id=check_user_id, db_model=self.db_model
+                )
+            except Exception:
+                session_str = None
+
+        if not session_str and user_id is None:
+            # Fall back to the most recent session stored for ANY user — but
+            # ONLY for the global periodic check. Per-user /loginstatus checks
+            # must stay truthful (never report another user's session).
+            session_str = await self._load_any_session("telethon_session")
+            if session_str:
+                logger.info(
+                    "SessionHealthChecker: Telethon session found via latest-Mongo fallback"
+                )
 
         if not session_str:
             # Fall back to checking for a file-based .session on disk
@@ -538,7 +597,7 @@ class SessionHealthChecker:
                     me = await client.get_me()
                     if me is not None:
                         h.phone = getattr(me, "phone", None)
-                except Exception:
+                except Exception:  # nosec B110
                     pass
                 try:
                     h.dc_id = (
@@ -546,10 +605,10 @@ class SessionHealthChecker:
                         if hasattr(client.session, "dc_id")
                         else None
                     )
-                except Exception:
+                except Exception:  # nosec B110
                     pass
-                # Persist session string to MongoDB for long-term survival
-                await self._save_telethon_session(client)
+                # Persist session string to MongoDB + JSON for long-term survival
+                await self._save_telethon_session(client, user_id=user_id)
             else:
                 h.error = "Session exists but user is not authorized"
         except Exception as exc:
@@ -559,15 +618,73 @@ class SessionHealthChecker:
         finally:
             try:
                 await client.disconnect()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
         return h
 
     # ── Session persistence helpers ────────────────────────────────
 
-    async def _save_telethon_session(self, client):
+    async def _load_any_session(self, key: str) -> str | None:
+        """Return the most recent session string of a given type for ANY user.
+
+        The periodic healthcheck does not know which user owns a session
+        created via /login or /loginpyro, so when per-user lookups miss we
+        scan MongoDB for the latest document containing the requested key
+        (e.g. "pyrogram_session" or "telethon_session").
+
+        Legacy documents that predate the typed-key split and only carry
+        ``string_session`` are used as a last resort.
+        """
+        try:
+            from utils.db import COL_SESSIONS, get_db, query
+
+            db = await get_db()
+            if not db:
+                return None
+            # Most recent doc that actually contains this typed session key
+            # (non-empty), ordered by last_active so the newest login wins.
+            doc = await (
+                query(COL_SESSIONS, db)
+                .where(key, "!=", "")
+                .order_by("last_active", "desc")
+                .first()
+            )
+            if doc and doc.get(key):
+                return str(doc[key])
+
+            # Legacy fallback: a doc carrying the old string_session key.
+            # Only use it when it does NOT also carry the OTHER typed key, so a
+            # legacy Pyrogram string is never served for a Telethon lookup (and
+            # vice versa) — mirrors the reference's typed-key guard.
+            other_key = "pyrogram_session" if key == "telethon_session" else "telethon_session"
+            legacy = await (
+                query(COL_SESSIONS, db)
+                .where("string_session", "!=", "")
+                .order_by("last_active", "desc")
+                .first()
+            )
+            if legacy and legacy.get("string_session"):
+                # Skip if the doc carries the other typed session key: the
+                # first query already covered typed-key docs, so this one is
+                # either a genuine pre-split legacy doc or ambiguous.
+                if legacy.get(other_key):
+                    return None
+                return str(legacy["string_session"])
+            return None
+        except Exception as exc:
+            logger.debug(
+                "SessionHealthChecker: latest-session Mongo fallback failed: %s",
+                exc,
+            )
+            return None
+
+    async def _save_telethon_session(self, client, user_id: int | None = None):
         """Extract and persist the current Telethon session string.
+
+        When ``user_id`` is provided the session is scoped to that user
+        (per-user JSON file + MongoDB keyed by user).  Otherwise the
+        admin user (or the legacy global JSON file) is used.
 
         Saves to both MongoDB (for the login flow) and a local JSON file
         (for the downloader/uploader fallback chain). Best-effort.
@@ -578,6 +695,8 @@ class SessionHealthChecker:
                 return
             session_str = str(session_str)
 
+            target_user_id = user_id if user_id is not None else self.admin_user_id
+
             # Save to local JSON file (bridges StringSession -> file fallback)
             saved_file = False
             try:
@@ -586,44 +705,38 @@ class SessionHealthChecker:
                 )
 
                 saved_file = await save_session_string_to_file_async(
-                    session_str, client_type="telethon"
+                    session_str, client_type="telethon", user_id=user_id
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             # Save to MongoDB (for login flow and diagnostics).
             saved_mongo = False
-            if self.db_model is not None and self.admin_user_id is not None:
+            if target_user_id is not None:
                 try:
-                    await self.db_model.save_session(
-                        self.admin_user_id,
-                        {
-                            "telethon_session": session_str,
-                            "string_session": session_str,  # backward compat
-                        },
-                    )
-                    saved_mongo = True
+                    if self.db_model is not None:
+                        await self.db_model.save_session(
+                            target_user_id,
+                            {
+                                "telethon_session": session_str,
+                                "string_session": session_str,  # backward compat
+                            },
+                        )
+                        saved_mongo = True
+                    else:
+                        from utils.db import save_user_session
+
+                        await save_user_session(
+                            target_user_id,
+                            {
+                                "telethon_session": session_str,
+                                "string_session": session_str,
+                            },
+                        )
+                        saved_mongo = True
                 except Exception as exc:
                     logger.debug(
                         "SessionHealthChecker: failed to persist Telethon session to MongoDB: %s",
-                        exc,
-                    )
-            elif self.admin_user_id is not None:
-                # Fallback: use utils.db if db_model is not provided
-                try:
-                    from utils.db import save_user_session
-
-                    await save_user_session(
-                        self.admin_user_id,
-                        {
-                            "telethon_session": session_str,
-                            "string_session": session_str,
-                        },
-                    )
-                    saved_mongo = True
-                except Exception as exc:
-                    logger.debug(
-                        "SessionHealthChecker: failed to persist Telethon session via utils.db: %s",
                         exc,
                     )
 
@@ -643,8 +756,12 @@ class SessionHealthChecker:
                 exc,
             )
 
-    async def _save_pyrogram_session(self, client):
+    async def _save_pyrogram_session(self, client, user_id: int | None = None):
         """Export and persist the current Pyrogram session string.
+
+        When ``user_id`` is provided the session is scoped to that user
+        (per-user JSON file + MongoDB keyed by user).  Otherwise the
+        admin user (or the legacy global JSON file) is used.
 
         Saves to both MongoDB (for the login flow) and a local JSON file
         (for the downloader/uploader fallback chain). Best-effort.
@@ -655,6 +772,8 @@ class SessionHealthChecker:
                 return
             session_str = str(session_str)
 
+            target_user_id = user_id if user_id is not None else self.admin_user_id
+
             # Save to local JSON file (bridges in-memory session -> file fallback)
             saved_file = False
             try:
@@ -663,44 +782,38 @@ class SessionHealthChecker:
                 )
 
                 saved_file = await save_session_string_to_file_async(
-                    session_str, client_type="pyrogram"
+                    session_str, client_type="pyrogram", user_id=user_id
                 )
-            except Exception:
+            except Exception:  # nosec B110
                 pass
 
             # Save to MongoDB (for login flow and diagnostics).
             saved_mongo = False
-            if self.db_model is not None and self.admin_user_id is not None:
+            if target_user_id is not None:
                 try:
-                    await self.db_model.save_session(
-                        self.admin_user_id,
-                        {
-                            "pyrogram_session": session_str,
-                            "string_session": session_str,  # backward compat
-                        },
-                    )
-                    saved_mongo = True
+                    if self.db_model is not None:
+                        await self.db_model.save_session(
+                            target_user_id,
+                            {
+                                "pyrogram_session": session_str,
+                                "string_session": session_str,  # backward compat
+                            },
+                        )
+                        saved_mongo = True
+                    else:
+                        from utils.db import save_user_session
+
+                        await save_user_session(
+                            target_user_id,
+                            {
+                                "pyrogram_session": session_str,
+                                "string_session": session_str,
+                            },
+                        )
+                        saved_mongo = True
                 except Exception as exc:
                     logger.debug(
                         "SessionHealthChecker: failed to persist Pyrogram session to MongoDB: %s",
-                        exc,
-                    )
-            elif self.admin_user_id is not None:
-                # Fallback: use utils.db if db_model is not provided
-                try:
-                    from utils.db import save_user_session
-
-                    await save_user_session(
-                        self.admin_user_id,
-                        {
-                            "pyrogram_session": session_str,
-                            "string_session": session_str,
-                        },
-                    )
-                    saved_mongo = True
-                except Exception as exc:
-                    logger.debug(
-                        "SessionHealthChecker: failed to persist Pyrogram session via utils.db: %s",
                         exc,
                     )
 
@@ -855,7 +968,7 @@ def start_session_healthcheck(
     bot_app=None,
     db_model=None,
     check_interval: int = 3600,
-) -> asyncio.Task:
+) -> asyncio.Task | None:
     """Start the session healthcheck background loop.
 
     When a session is confirmed healthy, its session string is automatically
@@ -874,7 +987,8 @@ def start_session_healthcheck(
     check_interval:
         Seconds between health checks (default 3600 = 1 hour).
 
-    Returns the background ``asyncio.Task``.
+    Returns the background ``asyncio.Task``, or ``None`` if there was no
+    running event loop (e.g. called during module import).
     """
     checker = get_session_healthchecker()
     if admin_user_id is not None:
