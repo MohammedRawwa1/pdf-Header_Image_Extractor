@@ -139,6 +139,128 @@ jobs:
           echo "═══════════════════════════════════════"
           echo ""
 
+  scripts-validation:
+    name: "🧹 Scripts validation (clear_jobs.py)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install validation deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install redis ruff
+
+      - name: Syntax check scripts/clear_jobs.py
+        run: python -m py_compile scripts/clear_jobs.py
+
+      - name: Ruff lint scripts/clear_jobs.py
+        run: python -m ruff check scripts/clear_jobs.py
+
+      - name: Functional smoke test (clear_jobs.py against fake Redis)
+        run: |
+          python - <<'EOF'
+          import json, sys
+          sys.path.insert(0, 'scripts')
+          import clear_jobs as cj
+
+          class FakeRedis:
+              def __init__(self):
+                  self.store = {}
+              def keys(self, pat):
+                  import fnmatch
+                  return [k for k in self.store if fnmatch.fnmatch(k, pat)]
+              def lrange(self, k, a, b):
+                  return self.store.get(k, [])[a:b if b >= 0 else None]
+              def zrange(self, k, a, b):
+                  return list(self.store.get(k, {}).keys())[a:b if b >= 0 else None]
+              def lrem(self, k, c, v):
+                  lst = self.store.get(k, [])
+                  n = lst.count(v)
+                  self.store[k] = [x for x in lst if x != v]
+                  return n
+              def zrem(self, k, v):
+                  d = self.store.get(k, {})
+                  return d.pop(v, None) is not None
+              def llen(self, k):
+                  return len(self.store.get(k, []))
+              def zcard(self, k):
+                  return len(self.store.get(k, {}))
+              def exists(self, k):
+                  return k in self.store
+              def delete(self, *ks):
+                  n = 0
+                  for k in ks:
+                      if k in self.store:
+                          del self.store[k]
+                          n += 1
+                  return n
+              def scan_iter(self, pat, count=100):
+                  return iter(self.keys(pat))
+
+          r = FakeRedis()
+          r.store['rq:queue:default'] = ['jobA', 'jobB']
+          r.store['rq:job:jobA'] = {'data': 'x'}
+          r.store['rq:wip:default'] = {'jobB': 1.0}
+          r.store['pdf:jobs'] = [
+              json.dumps({'job_id': 'jobA', 'original_filename': 'a.pdf'}),
+              json.dumps({'job_id': 'jobC'}),
+          ]
+          r.store['pdf:delayed'] = {json.dumps({'job_id': 'jobB'}): 2.0}
+          r.store['pdf:job:jobA'] = {'status': 'queued'}
+          r.store['pdf:progress:jobA'] = {'x': 1}
+          r.store['progress:jobA'] = {'x': 1}
+          r.store['io:out:jobA'] = {'x': 1}
+          r.store['cancel:jobA'] = '1'
+
+          n = cj.clear_job(r, 'jobA')
+          print('cleared count:', n)
+          assert 'jobA' not in r.store.get('rq:queue:default', [])
+          assert 'rq:job:jobA' not in r.store
+          assert all(json.loads(x)['job_id'] != 'jobA' for x in r.store['pdf:jobs'])
+          assert 'pdf:job:jobA' not in r.store
+          assert 'progress:jobA' not in r.store
+          assert 'cancel:jobA' not in r.store
+          assert r.store.get('rq:wip:default') == {'jobB': 1.0}  # untouched
+          print('SMOKE_OK')
+          EOF
+
+      - name: Functional smoke test (S3 input purge)
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, 'scripts')
+          import clear_jobs as cj
+
+          # Fake S3 client stub: list_objects_v2 + delete_object
+          class FakeS3:
+              def __init__(self, keys):
+                  self.keys = list(keys)
+                  self.deleted = []
+              def get_paginator(self, name):
+                  return self
+              def paginate(self, Bucket, Prefix):
+                  matching = [k for k in self.keys if k.startswith(Prefix)]
+                  return [{'Contents': [{'Key': k} for k in matching]}] if matching else [{}]
+              def delete_object(self, Bucket, Key):
+                  self.deleted.append(Key)
+
+          fake = FakeS3(['inputs/jobX/source', 'inputs/jobY/source', 'pdf-bot/other'])
+          cj._s3_client = lambda: (fake, 'test-bucket')
+
+          n = cj.purge_s3_inputs('inputs/')
+          print('S3 purged:', n)
+          assert n == 2, f'expected 2 deletes, got {n}'
+          assert set(fake.deleted) == {'inputs/jobX/source', 'inputs/jobY/source'}
+          print('S3_SMOKE_OK')
+          EOF
+
   secret-scan:
     name: "🔑 TruffleHog Secret Scan"
     runs-on: ubuntu-latest

@@ -2319,7 +2319,13 @@ async def cmd_cancel(
 
 
 def _wipe_job_redis_keys(job_id: str) -> None:
-    """Delete all Redis keys associated with a job id (progress, io, cancel flag)."""
+    """Delete all Redis keys associated with a job id (progress, io, cancel flag).
+
+    Covers BOTH background pipes for consistency:
+      - shared bookkeeping keys (progress/io/cancel)
+      - BigFile pipeline keys (pdf:job:<id> hash, pdf:progress:<id>)
+    (RQ job hashes/registries are handled by ``_cancel_rq_job`` itself.)
+    """
     try:
         r = get_sync_redis()
         if not r:
@@ -2329,6 +2335,8 @@ def _wipe_job_redis_keys(job_id: str) -> None:
             f"io:in:{job_id}",
             f"io:out:{job_id}",
             f"cancel:{job_id}",
+            f"pdf:job:{job_id}",
+            f"pdf:progress:{job_id}",
         ):
             try:
                 r.delete(key)

@@ -265,7 +265,12 @@ The bot shows real-time progress bars for download/upload operations:
 │   ├── forward_store.py       # Forward metadata storage
 │   └── telethon_mongo.py      # Telethon-MongoDB bridge
 ├── scripts/
-│   └── telethon_ingest.py     # Standalone Telethon ingestion
+│   ├── telethon_ingest.py     # Standalone Telethon ingestion
+│   ├── clear_jobs.py          # Clear stuck jobs from BOTH pipes (RQ + BigFile)
+│   │                          #   also purges S3 inputs/ blobs when S3 is configured
+│   ├── check_rq.py            # Inspect RQ queues/workers
+│   ├── dequeue_job.py         # Remove one job from the RQ queue
+│   └── remove_job_keys.py     # Delete Redis keys matching a job id
 └── media_conersion_bot/       # Reference implementation (not used)
 ```
 
