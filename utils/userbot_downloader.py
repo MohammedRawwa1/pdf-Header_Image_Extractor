@@ -662,6 +662,7 @@ async def _download_with_telethon(
     progress_callback: Callable[[int, int], None] | None = None,
     file_id: str | None = None,
     user_id: int | None = None,
+    session_str: str | None = None,
 ) -> bool:
     """Download using Telethon client.
 
@@ -682,14 +683,18 @@ async def _download_with_telethon(
 
     from utils.telethon_session import (
         build_telethon_client,
-        get_telethon_session_string_for_user,
         get_userbot_credentials,
+        resolve_session_string,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    _session_str = await get_telethon_session_string_for_user(user_id=user_id)
-    client = build_telethon_client(api_id, api_hash, session_str=_session_str)
+    # Use the caller's pre-resolved session string when provided; fall back to
+    # resolving it here (direct callers) so it is never resolved twice.
+    session_str = await resolve_session_string(
+        "telethon", session_str=session_str, user_id=user_id
+    )
+    client = build_telethon_client(api_id, api_hash, session_str=session_str)
     try:
         logger.info("userbot: starting Telethon client for download")
         await client.start()
@@ -918,6 +923,7 @@ async def _download_bytes_with_pyrogram(
     message_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
+    session_str: str | None = None,
 ) -> bytes | None:
     """Download a message's media into memory (bytes) using Pyrogram.
 
@@ -935,14 +941,18 @@ async def _download_bytes_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
-        get_pyrogram_session_string,
         get_userbot_credentials,
+        resolve_session_string,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    _pyro_session = get_pyrogram_session_string(user_id=user_id)
-    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
+    # Use the caller's pre-resolved session string when provided; fall back to
+    # resolving it here (direct callers) so it is never resolved twice.
+    session_str = await resolve_session_string(
+        "pyrogram", session_str=session_str, user_id=user_id
+    )
+    client = build_pyrogram_client(api_id, api_hash, session_str=session_str)
     if client is None:
         logger.info(
             "userbot: Pyrogram session string not configured; cannot do in-memory download"
@@ -1073,6 +1083,7 @@ async def _download_with_pyrogram(
     dest_path: str,
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
+    session_str: str | None = None,
 ) -> bool:
     """Download using Pyrogram client (session string fallback).
 
@@ -1088,14 +1099,18 @@ async def _download_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
-        get_pyrogram_session_string,
         get_userbot_credentials,
+        resolve_session_string,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    _pyro_session = get_pyrogram_session_string(user_id=user_id)
-    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
+    # Use the caller's pre-resolved session string when provided; fall back to
+    # resolving it here (direct callers) so it is never resolved twice.
+    session_str = await resolve_session_string(
+        "pyrogram", session_str=session_str, user_id=user_id
+    )
+    client = build_pyrogram_client(api_id, api_hash, session_str=session_str)
     if client is None:
         logger.info("userbot: Pyrogram session string not configured")
         return False
@@ -1278,18 +1293,17 @@ async def download_bytes_by_file_id_via_userbot(
                 build_telethon_client,
                 get_telethon_session_string_for_user,
                 get_userbot_credentials,
-                has_usable_telethon_session,
             )
 
-            if not has_usable_telethon_session(user_id=user_id):
+            _session_str = await get_telethon_session_string_for_user(
+                user_id=user_id
+            )
+            if not _session_str:
                 logger.info(
                     "userbot: Telethon session not configured; cannot download by file_id"
                 )
             else:
                 api_id, api_hash = get_userbot_credentials()
-                _session_str = await get_telethon_session_string_for_user(
-                    user_id=user_id
-                )
                 client = build_telethon_client(
                     api_id, api_hash, session_str=_session_str
                 )
@@ -1383,8 +1397,8 @@ async def download_forward_via_userbot(
         )
 
     from utils.telethon_session import (
-        get_pyrogram_session_string,
-        has_usable_telethon_session,
+        get_pyrogram_session_string_for_user,
+        get_telethon_session_string_for_user,
     )
 
     # Note: file_id-based download via _download_file_by_file_id() was removed
@@ -1407,7 +1421,8 @@ async def download_forward_via_userbot(
         return False
 
     # ── 1) Telethon (preferred: faster, better large-file support) ──
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    _tele_session = await get_telethon_session_string_for_user(user_id=user_id)
+    if TelegramClient is not None and _tele_session:
         try:
             result = await _download_with_telethon(
                 chat_id,
@@ -1418,6 +1433,7 @@ async def download_forward_via_userbot(
                 progress_callback=progress_callback,
                 file_id=file_id,
                 user_id=user_id,
+                session_str=_tele_session,
             )
             if result:
                 return True
@@ -1435,8 +1451,8 @@ async def download_forward_via_userbot(
         )
 
     # ── 2) Pyrogram fallback (if configured) ──
-    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
-    if PyrogramClient is not None and pyrogram_session_configured:
+    _pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id)
+    if PyrogramClient is not None and _pyro_session:
         try:
             result = await _download_with_pyrogram(
                 chat_id,
@@ -1444,6 +1460,7 @@ async def download_forward_via_userbot(
                 dest_path,
                 progress_callback=progress_callback,
                 user_id=user_id,
+                session_str=_pyro_session,
             )
             if result:
                 return True
@@ -1477,23 +1494,22 @@ async def download_bytes_via_userbot(
         )
 
     from utils.telethon_session import (
-        get_pyrogram_session_string,
-        has_usable_telethon_session,
+        get_pyrogram_session_string_for_user,
+        get_telethon_session_string_for_user,
     )
 
     # ── 1) Telethon (preferred: faster, better large-file support) ──
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    _tele_session = await get_telethon_session_string_for_user(user_id=user_id)
+    if TelegramClient is not None and _tele_session:
         try:
-            from utils.telethon_session import (
-                build_telethon_client,
-                get_telethon_session_string_for_user,
-            )
+            from utils.telethon_session import build_telethon_client
             from utils.telethon_session import (
                 get_userbot_credentials as _get_creds,
             )
 
             _api_id, _api_hash = _get_creds()
-            _session_str = await get_telethon_session_string_for_user(user_id=user_id)
+            # Reuse the session string already resolved by the gate.
+            _session_str = _tele_session
             _client = build_telethon_client(
                 _api_id, _api_hash, session_str=_session_str
             )
@@ -1598,14 +1614,15 @@ async def download_bytes_via_userbot(
             )
 
     # ── 2) Pyrogram fallback ──
-    pyrogram_session_configured = bool(get_pyrogram_session_string(user_id=user_id))
-    if PyrogramClient is not None and pyrogram_session_configured:
+    _pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id)
+    if PyrogramClient is not None and _pyro_session:
         try:
             data = await _download_bytes_with_pyrogram(
                 chat_id,
                 message_id,
                 progress_callback=progress_callback,
                 user_id=user_id,
+                session_str=_pyro_session,
             )
             if data is not None:
                 return data

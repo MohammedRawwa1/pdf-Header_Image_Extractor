@@ -42,6 +42,7 @@ async def _send_with_telethon(
     thumb_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
+    session_str: str | None = None,
 ) -> bool:
     """Send a file using Telethon.
 
@@ -54,20 +55,23 @@ async def _send_with_telethon(
 
     from utils.telethon_session import (
         build_telethon_client,
-        get_telethon_session_string_for_user,
         get_userbot_credentials,
-        has_usable_telethon_session,
+        resolve_session_string,
     )
 
-    if not has_usable_telethon_session(user_id=user_id):
+    # Use the caller's pre-resolved session string when provided; fall back to
+    # resolving it here (direct callers) so it is never resolved twice.
+    session_str = await resolve_session_string(
+        "telethon", session_str=session_str, user_id=user_id
+    )
+    if not session_str:
         logger.info(
             "userbot: Telethon session not configured; skipping Telethon upload"
         )
         return False
 
     api_id, api_hash = get_userbot_credentials()
-    _session_str = await get_telethon_session_string_for_user(user_id=user_id)
-    client = build_telethon_client(api_id, api_hash, session_str=_session_str)
+    client = build_telethon_client(api_id, api_hash, session_str=session_str)
     try:
 
         async def _no_phone():
@@ -100,6 +104,7 @@ async def _send_with_pyrogram(
     thumb_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
+    session_str: str | None = None,
 ) -> bool:
     """Send a file using Pyrogram (session string fallback).
 
@@ -112,14 +117,18 @@ async def _send_with_pyrogram(
 
     from utils.telethon_session import (
         build_pyrogram_client,
-        get_pyrogram_session_string,
         get_userbot_credentials,
+        resolve_session_string,
     )
 
     api_id, api_hash = get_userbot_credentials()
 
-    _pyro_session = get_pyrogram_session_string(user_id=user_id)
-    client = build_pyrogram_client(api_id, api_hash, session_str=_pyro_session)
+    # Use the caller's pre-resolved session string when provided; fall back to
+    # resolving it here (direct callers) so it is never resolved twice.
+    session_str = await resolve_session_string(
+        "pyrogram", session_str=session_str, user_id=user_id
+    )
+    client = build_pyrogram_client(api_id, api_hash, session_str=session_str)
     if client is None:
         return False
 
@@ -172,9 +181,13 @@ async def send_file_via_userbot(
             "Install at least one: pip install telethon or pip install pyrogram"
         )
 
-    from utils.telethon_session import has_usable_telethon_session
+    from utils.telethon_session import (
+        get_pyrogram_session_string_for_user,
+        get_telethon_session_string_for_user,
+    )
 
-    if TelegramClient is not None and has_usable_telethon_session(user_id=user_id):
+    _tele_session = await get_telethon_session_string_for_user(user_id=user_id)
+    if TelegramClient is not None and _tele_session:
         try:
             result = await _send_with_telethon(
                 chat_id,
@@ -183,6 +196,7 @@ async def send_file_via_userbot(
                 thumb_path,
                 progress_callback=progress_callback,
                 user_id=user_id,
+                session_str=_tele_session,
             )
             if result:
                 return True
@@ -199,7 +213,8 @@ async def send_file_via_userbot(
             "userbot: Telethon session not configured; skipping Telethon upload"
         )
 
-    if PyrogramClient is not None:
+    _pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id)
+    if PyrogramClient is not None and _pyro_session:
         result = await _send_with_pyrogram(
             chat_id,
             file_path,
@@ -207,6 +222,7 @@ async def send_file_via_userbot(
             thumb_path,
             progress_callback=progress_callback,
             user_id=user_id,
+            session_str=_pyro_session,
         )
         if result:
             return True

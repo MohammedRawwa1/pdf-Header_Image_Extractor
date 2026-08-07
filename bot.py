@@ -89,6 +89,7 @@ from utils.rate_limiter import (  # noqa: E402
 from utils.redis_client import get_sync_redis  # noqa: E402
 from utils.session_healthcheck import (  # noqa: E402
     get_session_healthchecker,
+    source_label,
     start_session_healthcheck,
     stop_session_healthcheck,
 )
@@ -128,11 +129,49 @@ except Exception as e:
 
 
 # ── Userbot availability cache (checked once per handler call) ──
+def _has_mongo_session_sync(user_id: int | None) -> bool:
+    """Return True if MongoDB (sync) holds any session string for *user_id*.
+
+    Covers per-user sessions that only exist in MongoDB — e.g. after a redeploy
+    wiped the ephemeral per-user JSON files.  Mirrors the async per-user
+    resolvers so ``_check_userbot_available`` agrees with what downloads
+    actually resolve.
+    """
+    if user_id is None:
+        return False
+    try:
+        from utils.db import (  # noqa: PLC0415
+            COL_SESSIONS,
+            get_sync_db,
+            sync_query,
+        )
+
+        db = get_sync_db()
+        if db is None:
+            return False
+        doc = (
+            sync_query(COL_SESSIONS, db)
+            .where("user_id", "=", int(user_id))
+            .first()
+        )
+        if not doc:
+            return False
+        return bool(
+            doc.get("telethon_session")
+            or doc.get("pyrogram_session")
+            or doc.get("string_session")
+        )
+    except Exception:
+        return False
+
+
 def _check_userbot_available(user_id: int | None = None) -> bool:
     """Return True if a Telethon or Pyrogram userbot session is configured.
 
     When ``user_id`` is provided, checks that user's own sessions first
-    (per-user login), falling back to the global/admin session.
+    (per-user login), falling back to the global/admin session, and finally
+    to MongoDB (sync) — so a per-user session that only survives in MongoDB
+    after a redeploy still enables the userbot fallback.
 
     Honors ``ENABLE_USERBOT``: when explicitly set to false/0/no, the
     userbot fallback is disabled entirely (mirrors the reference's gate).
@@ -140,14 +179,16 @@ def _check_userbot_available(user_id: int | None = None) -> bool:
     try:
         if not config.ENABLE_USERBOT:
             return False
-        from utils.telethon_session import (
+        from utils.telethon_session import (  # noqa: PLC0415
             get_pyrogram_session_string,
             has_usable_telethon_session,
         )
 
-        return has_usable_telethon_session(user_id=user_id) or bool(
+        if has_usable_telethon_session(user_id=user_id) or bool(
             get_pyrogram_session_string(user_id=user_id)
-        )
+        ):
+            return True
+        return _has_mongo_session_sync(user_id)
     except Exception:
         return False
 
@@ -1997,6 +2038,36 @@ async def cmd_logoutpyro(
         )
 
 
+def _fmt_ts(ts) -> str:
+    """Format a stored epoch timestamp (float) or datetime as a short human string."""
+    if not ts:
+        return "never"
+    if hasattr(ts, "timestamp"):  # datetime / BSON date
+        try:
+            ts = ts.timestamp()
+        except Exception:  # nosec B110
+            return "?"
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return "?"
+    age = time.time() - ts
+    if age < 1:
+        return "just now"
+    if age < 60:
+        return f"{int(age)}s ago"
+    if age < 3600:
+        return f"{int(age // 60)}m ago"
+    if age < 86400:
+        return f"{int(age // 3600)}h ago"
+    if age < 86400 * 30:
+        return f"{int(age // 86400)}d ago"
+    try:
+        return time.strftime("%b %d", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
 async def cmd_loginstatus(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2021,9 +2092,9 @@ async def cmd_loginstatus(
     pyro = health.get("pyrogram", {})
     tele = health.get("telethon", {})
 
-    # Persisted JSON file info (per-user only)
+    # ── Where the user's sessions are stored: per-user JSON file (ephemeral,
+    # wiped on redeploy) + MongoDB (durable) ──
     per_user_json_session = None
-    per_user_json_exists = False
     try:
         from utils.telethon_session import (
             _get_persisted_session_path,
@@ -2031,7 +2102,6 @@ async def cmd_loginstatus(
         )
 
         _per_user_path = _get_persisted_session_path(user_id=calling_user_id)
-        per_user_json_exists = os.path.exists(_per_user_path)
         per_user_json_session = await _load_all_sessions_from_file_async(
             user_id=calling_user_id
         )
@@ -2043,6 +2113,26 @@ async def cmd_loginstatus(
     )
     pyro_per_user = bool(
         per_user_json_session and per_user_json_session.get("pyrogram_session")
+    )
+
+    mongo_session = None
+    try:
+        from utils.db import get_user_session  # noqa: PLC0415
+
+        mongo_session = await get_user_session(calling_user_id)
+    except Exception:
+        logger.debug("bot: Mongo session state check failed")
+    tele_mongo = bool(
+        mongo_session and mongo_session.get("telethon_session")
+    )
+    pyro_mongo = bool(
+        mongo_session and mongo_session.get("pyrogram_session")
+    )
+    mongo_legacy_only = bool(
+        mongo_session
+        and mongo_session.get("string_session")
+        and not mongo_session.get("telethon_session")
+        and not mongo_session.get("pyrogram_session")
     )
 
     has_api_id = bool(
@@ -2062,6 +2152,7 @@ async def cmd_loginstatus(
         if not result:
             return f"❌ **{name}** — Check failed (no result)"
         alive = result.get("alive", False)
+        source = source_label(result.get("source"))
         if alive:
             phone = result.get("phone") or "?"
             dc = result.get("dc_id") or "?"
@@ -2069,11 +2160,12 @@ async def cmd_loginstatus(
             return (
                 f"✅ **{name}** — Working\n"
                 f"   Phone: `{phone}`\n"
-                f"   DC: `{dc}` | Latency: `{latency}ms`"
+                f"   DC: `{dc}` | Latency: `{latency}ms`\n"
+                f"   Source: {source}"
             )
         else:
             err = (result.get("error") or "Not configured").replace("`", "")
-            return f"❌ **{name}** — `{err}`"
+            return f"❌ **{name}** — `{err}`\n   Source: {source}"
 
     # Get healthcheck interval + admin alert state from the checker
     check_interval = getattr(checker, "check_interval", 3600)
@@ -2081,6 +2173,34 @@ async def cmd_loginstatus(
         "Enabled" if getattr(checker, "admin_user_id", None) else "Disabled"
     )
     userbot_enabled = config.ENABLE_USERBOT
+
+    _tele_mongo_mark = (
+        "⚠️ (legacy)" if mongo_legacy_only else ("✅" if tele_mongo else "❌")
+    )
+    storage_lines = [
+        f"**Stored for you (user {calling_user_id}):**",
+        f"  Telethon: JSON {'✅' if tele_per_user else '❌'} · MongoDB {_tele_mongo_mark}",
+        f"  Pyrogram: JSON {'✅' if pyro_per_user else '❌'} · MongoDB {'✅' if pyro_mongo else '❌'}",
+    ]
+    if mongo_legacy_only:
+        storage_lines.append(
+            "  ⚠️ only a legacy `string_session` is in MongoDB (client type unknown)"
+        )
+
+    # Doc-level activity timestamps (last_active is set on every save; last_seen
+    # on every bot interaction; created_at on first sighting).
+    if mongo_session is not None:
+        _ts_bits = []
+        for _label, _key in (
+            ("last active", "last_active"),
+            ("last seen", "last_seen"),
+            ("created", "created_at"),
+        ):
+            _v = mongo_session.get(_key)
+            if _v:
+                _ts_bits.append(f"{_label} {_fmt_ts(_v)}")
+        if _ts_bits:
+            storage_lines.append("  " + " · ".join(_ts_bits))
 
     lines = [
         "\U0001f510 **Live Session Status**",
@@ -2093,10 +2213,7 @@ async def cmd_loginstatus(
         "",
         _session_line("Pyrogram", pyro),
         "",
-        f"**Persisted JSON files (per-user {calling_user_id}):** "
-        + ("✅ Exists" if per_user_json_exists else "❌ Not found"),
-        f"  Telethon: {'✅' if tele_per_user else '❌'}",
-        f"  Pyrogram: {'✅' if pyro_per_user else '❌'}",
+        *storage_lines,
         "",
         f"🔔 Admin alerts: `{admin_alerts}`",
         f"🔄 Background check: every `{check_interval}s`",
@@ -2612,6 +2729,18 @@ async def on_startup() -> None:
         )
     except Exception as exc:
         logger.debug("Startup env->per-user JSON persistence skipped: %s", exc)
+
+    # ── Restore per-user JSON session files from MongoDB ──
+    # The per-user JSON session files live on an ephemeral filesystem and are
+    # wiped on every redeploy.  Re-materialize each user's JSON file from the
+    # durable MongoDB store so per-user sessions (created via /login or
+    # /loginpyro) keep working immediately after a deployment.
+    try:
+        from utils.telethon_session import restore_per_user_session_files
+
+        await restore_per_user_session_files()
+    except Exception as exc:
+        logger.debug("Startup: per-user session file restore skipped: %s", exc)
 
     # ── Background worker subprocess (with auto-restart supervision) ──
     _worker_proc = None

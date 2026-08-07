@@ -410,6 +410,12 @@ class MongoQueryBuilder:
         """Execute the query and return the first matching document.
 
         Like Laravel: ->first()
+
+        ``motor``'s ``to_list()`` returns a *list* of documents, so the
+        single result must be unwrapped — returning the list (as the old
+        ``await cursor.to_list(length=1) or None`` did) silently broke
+        every async read that expected a dict (e.g. ``get_user_session``,
+        which then fell through to the env fallback).
         """
         if not await self._resolve_db():
             return None
@@ -422,7 +428,8 @@ class MongoQueryBuilder:
             if self._sort_field:
                 cursor = cursor.sort(self._sort_field, self._sort_order)
             cursor = cursor.limit(1)
-            return await cursor.to_list(length=1) or None
+            docs = await cursor.to_list(length=1)
+            return docs[0] if docs else None
         except Exception as e:
             logger.debug("MongoQueryBuilder.first failed: %s", e)
             return None
@@ -1151,7 +1158,7 @@ async def save_job_metadata(job_id: str, meta: dict[str, Any]) -> bool:
     Only whitelisted fields are persisted.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         meta["job_id"] = str(job_id)
@@ -1171,7 +1178,7 @@ async def get_job_metadata(job_id: str) -> dict[str, Any] | None:
     Uses prepared statement parameter binding.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return None
     try:
         return (
@@ -1189,7 +1196,7 @@ async def update_job_metadata(job_id: str, fields: dict[str, Any]) -> bool:
     Only whitelisted fields are updated.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         return (
@@ -1211,7 +1218,7 @@ async def list_jobs(
     Prevents NoSQL injection by validating the status against the whitelist.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return []
     try:
         q = query(COL_JOBS, db).order_by("created_at", "desc").limit(limit)
@@ -1225,7 +1232,7 @@ async def list_jobs(
 async def count_jobs() -> int:
     """Count total jobs in MongoDB."""
     db = await get_db()
-    if not db:
+    if db is None:
         return 0
     try:
         return await query(COL_JOBS, db).count()
@@ -1247,10 +1254,14 @@ async def save_user_session(
     Only whitelisted session fields are persisted.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         session_data["user_id"] = user_id
+        # last_active drives the "newest login wins" ordering used when scanning
+        # for the latest session string.  (Stored as a float: the 30-day TTL
+        # index needs a BSON Date to fire, so sessions are never auto-expired.)
+        session_data.setdefault("last_active", time.time())
         return (
             await query(COL_SESSIONS, db)
             .where("user_id", "=", int(user_id))
@@ -1267,7 +1278,7 @@ async def get_user_session(user_id: int) -> dict[str, Any] | None:
     Uses prepared statement parameter binding.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return None
     try:
         return (
@@ -1283,7 +1294,7 @@ async def get_user_session(user_id: int) -> dict[str, Any] | None:
 async def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     """List recent user sessions."""
     db = await get_db()
-    if not db:
+    if db is None:
         return []
     try:
         return (
@@ -1299,7 +1310,7 @@ async def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
 async def count_sessions() -> int:
     """Count total user sessions in MongoDB."""
     db = await get_db()
-    if not db:
+    if db is None:
         return 0
     try:
         return await query(COL_SESSIONS, db).count()
@@ -1320,7 +1331,7 @@ async def save_forward_batch(chat_id: int, user_id: int, items: list) -> bool:
     Items are sanitized to prevent NoSQL injection.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         doc = {
@@ -1346,7 +1357,7 @@ async def get_forward_batch(chat_id: int, user_id: int) -> list | None:
     Uses prepared statement parameter binding.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return None
     try:
         result = (
@@ -1368,7 +1379,7 @@ async def delete_forward_batch(chat_id: int, user_id: int) -> bool:
     Uses prepared statement parameter binding.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         return (
@@ -1394,7 +1405,7 @@ async def save_telethon_forward(job: dict) -> bool:
     Only whitelisted fields are persisted.
     """
     db = await get_db()
-    if not db:
+    if db is None:
         return False
     try:
         result = await query(COL_TELETHON, db).insert(job)
@@ -1409,7 +1420,7 @@ async def save_telethon_forward(job: dict) -> bool:
 async def count_telethon_forwards() -> int:
     """Count total Telethon forward records."""
     db = await get_db()
-    if not db:
+    if db is None:
         return 0
     try:
         return await query(COL_TELETHON, db).count()
@@ -1423,7 +1434,7 @@ async def count_telethon_forwards() -> int:
 async def db_stats() -> dict[str, Any]:
     """Return a summary of all collection sizes."""
     db = await get_db()
-    if not db:
+    if db is None:
         return {"connected": False, "db_name": get_db_name()}
     try:
         stats = {
