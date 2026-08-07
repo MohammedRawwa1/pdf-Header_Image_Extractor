@@ -66,6 +66,17 @@ class TaskProgress:
     def start(self):
         self.start_time = time.time()
         self.status = "processing"
+        # Clear any terminal-state leftovers so a REUSED tracker (e.g. a
+        # completed/failed download tracker handed to the upload phase) can
+        # never show frozen speed/ETA (elapsed_time reads end_time), a stale
+        # error message from its previous lifecycle, or a throttled first edit
+        # from the previous phase's update cadence.
+        # NOTE: processed_size is deliberately NOT reset here - callers that
+        # want a fresh bar (e.g. the upload phase) reset it explicitly, while
+        # resume-from-progress paths rely on it surviving.
+        self.end_time = None
+        self.error_message = None
+        self._last_update = None
 
     def complete(self):
         self.end_time = time.time()

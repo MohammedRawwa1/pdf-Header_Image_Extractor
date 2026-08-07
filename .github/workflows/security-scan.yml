@@ -35,13 +35,14 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pip-audit
+          pip install -r requirements-dev.txt
 
       - name: Validate .bandit config
         run: |
@@ -107,6 +108,12 @@ jobs:
           python -m ruff check . --output-format github
           echo "✅ Ruff: no issues found"
 
+      - name: Run mypy type check (typed utils modules)
+        run: |
+          echo "Running mypy on typed modules (utils/tg_http.py, utils/progress_tracker.py)..."
+          python -m mypy
+          echo "✅ mypy: no type issues found"
+
       - name: Run static audit (wrong-kwarg + un-awaited async)
         run: |
           echo "Running static AST audit for wrong-kwarg calls and un-awaited async calls..."
@@ -161,7 +168,7 @@ jobs:
       - name: Install validation deps
         run: |
           python -m pip install --upgrade pip
-          pip install redis ruff
+          pip install -r requirements-dev.txt
 
       - name: Syntax check scripts/clear_jobs.py
         run: python -m py_compile scripts/clear_jobs.py

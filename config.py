@@ -93,20 +93,39 @@ REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 MAX_FILE_SIZE: int = int(
     os.getenv("MAX_FILE_SIZE", str(0))
 )  # bytes, 0 = unlimited
-BOT_API_MAX_MB: int = int(
-    os.getenv("BOT_API_MAX_MB", "50")
-)  # Telegram Bot API max in MB
-# Effective Bot API upload/download limit in bytes: honors BOT_API_MAX_MB
-# (floored at 1MB so a misconfigured 0 can't silently disable routing) and
-# caps at MAX_FILE_SIZE when that app-level limit is smaller.
+
+# Telegram Bot API has TWO different file size caps on the standard (cloud) server:
+#   - UPLOAD   (sendDocument): 50 MB
+#   - DOWNLOAD (getFile):       20 MB  -> getFile returns 400 "file is too big" above this
+# The old code conflated both into a single 50MB limit, which caused files
+# between 20MB and 50MB (e.g. a 38MB PDF) to be sent down the Bot API download
+# path that Telegram always rejects, wasting a full fallback-chain cycle.
+# These are now separate knobs (each floored at 1MB so a misconfigured 0 can't
+# silently disable routing, and each capped by MAX_FILE_SIZE when set).
+BOT_API_MAX_MB: int = int(os.getenv("BOT_API_MAX_MB", "50"))
+BOT_API_DOWNLOAD_MAX_MB: int = int(
+    os.getenv("BOT_API_DOWNLOAD_MAX_MB", "20")
+)
+
 _BOT_API_MB_EFFECTIVE = max(1, BOT_API_MAX_MB)
-BOT_API_UPLOAD_LIMIT_BYTES: int = min(
-    _BOT_API_MB_EFFECTIVE * 1024 * 1024,
-    (
-        MAX_FILE_SIZE
-        if MAX_FILE_SIZE and MAX_FILE_SIZE > 0
-        else _BOT_API_MB_EFFECTIVE * 1024 * 1024
-    ),
+_BOT_API_DL_MB_EFFECTIVE = max(1, BOT_API_DOWNLOAD_MAX_MB)
+
+
+def _cap_by_max_file_size(limit_bytes: int) -> int:
+    """Cap a Bot API limit by MAX_FILE_SIZE when that app-level cap is set."""
+    if MAX_FILE_SIZE and MAX_FILE_SIZE > 0:
+        return min(limit_bytes, MAX_FILE_SIZE)
+    return limit_bytes
+
+# Upload cap: max bytes the Bot API accepts for sendDocument.
+BOT_API_UPLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(
+    _BOT_API_MB_EFFECTIVE * 1024 * 1024
+)
+# Download cap: max bytes the Bot API can actually fetch via getFile.
+# Files above this CANNOT be downloaded through the Bot API and must route
+# through the userbot / BigFilePipeline instead.
+BOT_API_DOWNLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(
+    _BOT_API_DL_MB_EFFECTIVE * 1024 * 1024
 )
 
 # Temp directory for downloads (optional)

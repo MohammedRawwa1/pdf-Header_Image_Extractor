@@ -30,6 +30,14 @@ POLL_TIMEOUT = 60
 # Fallback sleep between retries after unexpected errors (seconds).
 ERROR_RETRY_SLEEP = 10
 
+# How long to wait between startup-check retries when the worker is blocked
+# on missing configuration (seconds).
+STARTUP_RETRY_SLEEP = 30
+
+# Log a heartbeat line every N startup-check retries so a misconfigured
+# deploy stays visible in logs instead of silently dying.
+HEARTBEAT_EVERY_RETRIES = 10
+
 # Minimum required env vars for the pipeline worker to function.
 _REQUIRED_ENV_VARS = {
     "REDIS_URL": "Redis connection string for job queue",
@@ -61,6 +69,64 @@ def _check_boto3() -> str | None:
         return None
     except ImportError:
         return "boto3 is not installed (run: pip install boto3)"
+
+
+def _startup_gate() -> None:
+    """Block until startup checks pass, retrying instead of exiting.
+
+    A worker that ``sys.exit(1)``s on missing config crash-loops under a
+    Railway ``ON_FAILURE`` restart policy and, once the retry budget is
+    exhausted, dies *silently* — the queue keeps growing and nothing is
+    visible in the logs.  This gate keeps the process alive, logs exactly
+    what is missing, and emits a periodic heartbeat so a misconfigured
+    deploy is impossible to miss.
+
+    It is also self-healing: if the env is fixed (or a late dependency
+    finishes installing) the worker proceeds to ``consume_loop`` on its
+    own without a redeploy.
+
+    Note: a permanently-missing dependency (e.g. boto3 not in the image)
+    keeps the worker blocked rather than crash-looping — deliberate, so the
+    failure stays visible; it normally resolves on the next deploy.
+    """
+    attempt = 0
+    while True:
+        missing = _check_env()
+        boto3_err = _check_boto3()
+        if not missing and boto3_err is None:
+            if attempt:
+                logger.info(
+                    "Startup checks passed after %d retries.", attempt
+                )
+            return
+
+        attempt += 1
+        if attempt == 1:
+            # First failure: spell out exactly what is wrong so the deploy
+            # is diagnosed from the first glance at the logs.
+            for item in missing:
+                logger.error("Missing required env var: %s", item)
+            if boto3_err:
+                logger.error("Startup check failed: %s", boto3_err)
+            logger.error(
+                "Pipeline worker is BLOCKED on configuration - it will stay "
+                "alive and retry every %ss instead of exiting, so this "
+                "misconfigured deploy stays visible in the logs.",
+                STARTUP_RETRY_SLEEP,
+            )
+        elif attempt % HEARTBEAT_EVERY_RETRIES == 0:
+            # Periodic heartbeat: proves the process is alive, just blocked.
+            issues = [", ".join(missing)] if missing else []
+            if boto3_err:
+                issues.append(boto3_err)
+            logger.warning(
+                "Pipeline worker heartbeat (attempt %d): still blocked on "
+                "startup checks - %s. Next retry in %ss.",
+                attempt,
+                "; ".join(issues),
+                STARTUP_RETRY_SLEEP,
+            )
+        time.sleep(STARTUP_RETRY_SLEEP)
 
 
 async def consume_loop():
@@ -163,17 +229,16 @@ def run_pipeline_worker():
         logging.WARNING
     )
 
-    # ── Startup checks ──────────────────────────────────────────
-    missing = _check_env()
-    if missing:
-        for item in missing:
-            logger.error("Missing required env var: %s", item)
-        sys.exit(1)
-
-    boto3_err = _check_boto3()
-    if boto3_err:
-        logger.error("Startup check failed: %s", boto3_err)
-        sys.exit(1)
+    # ── Startup checks (retry gate instead of exit) ────────────
+    # Missing env vars / missing boto3 no longer crash the process (which
+    # goes silent once Railway's ON_FAILURE retry budget is exhausted).
+    # The gate below keeps the worker alive, logs what is wrong, retries,
+    # and emits a heartbeat so a misconfigured deploy is visible.
+    try:
+        _startup_gate()
+    except KeyboardInterrupt:
+        logger.info("Pipeline worker stopped during startup wait.")
+        return
 
     logger.info(
         "Startup checks passed. Starting pipeline worker (pid=%d)...",

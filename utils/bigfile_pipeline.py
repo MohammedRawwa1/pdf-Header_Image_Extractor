@@ -1,7 +1,8 @@
 """Big PDF files pipeline: userbot download -> S3 upload -> Redis queue -> Worker -> userbot delivery.
 
-Handles PDFs that exceed the Telegram Bot API 50MB limit by routing them
-through a userbot-based download, S3 storage, and worker processing pipeline.
+Handles PDFs that exceed the Telegram Bot API DOWNLOAD limit (20MB via
+``getFile``) by routing them through a userbot-based download, S3 storage,
+and worker processing pipeline.
 
 Adapted from media_conersion_bot for PDF-only use (no video/FFmpeg).
 """
@@ -18,6 +19,10 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # Default thresholds
+# Memory-streaming threshold: files larger than this are downloaded to temp
+# disk (disk-based path, Telethon-first) instead of being held in RAM.  This
+# is a MEMORY strategy knob, not the Bot API limit — the routing limit is
+# config.BOT_API_DOWNLOAD_LIMIT_BYTES (20MB via getFile).
 DEFAULT_BOT_API_MAX_MB = int(os.getenv("BOT_API_MAX_MB", "50"))
 DEFAULT_BOT_API_MAX_BYTES = DEFAULT_BOT_API_MAX_MB * 1024 * 1024
 
@@ -98,12 +103,27 @@ class BigFilePipeline:
             file_unique_id: Telegram file_unique_id for caching/dedup.
             user_id: User who sent the file.
             original_filename: Original filename if known.
-            progress_callback: Optional callable(current_bytes, total_bytes) for download progress.
+            progress_callback: Optional callable(current_bytes, total_bytes, phase)
+                where phase is "download" or "s3_upload".  Used for LIVE progress
+                on both the userbot download and the S3 upload legs of the pipeline.
 
         Returns:
             IngestResult with job_id and s3_key on success.
         """
         await self._ensure_initialized()
+
+        # Phase-aware wrappers so callers can label the live progress message
+        # correctly for the download vs the S3-upload leg.
+        _dl_cb = (
+            (lambda recv, total: progress_callback(recv, total, "download"))
+            if progress_callback is not None
+            else None
+        )
+        _upload_cb = (
+            (lambda recv, total: progress_callback(recv, total, "s3_upload"))
+            if progress_callback is not None
+            else None
+        )
 
         # The pipeline requires S3 storage: the worker (separate process) only
         # knows how to fetch the input via `input_key`. Without storage, the
@@ -130,7 +150,9 @@ class BigFilePipeline:
         s3_key = input_s3_key
         _in_memory_success = False
 
-        # Try in-memory streaming for files 50-200MB when S3 is available
+        # Try in-memory streaming for files larger than the disk/memory cutoff
+        # (default 50MB) when S3 is available; smaller pipeline files use the
+        # proven disk-based download path instead.
         _use_in_memory = (
             self._storage is not None
             and file_size > DEFAULT_BOT_API_MAX_BYTES
@@ -150,12 +172,14 @@ class BigFilePipeline:
                 data = await download_bytes_via_userbot(
                     chat_id,
                     message_id,
-                    progress_callback=progress_callback,
+                    progress_callback=_dl_cb,
                     user_id=user_id,
                 )
                 if data is not None and len(data) > 0:
                     actual_size = len(data)
-                    await self._storage.upload_bytes(data, s3_key)
+                    await self._storage.upload_bytes(
+                        data, s3_key, progress_callback=_upload_cb
+                    )
                     logger.info(
                         "BigFilePipeline: S3 upload via bytes complete"
                     )
@@ -206,7 +230,7 @@ class BigFilePipeline:
                     chat_id,
                     message_id,
                     temp_path,
-                    progress_callback=progress_callback,
+                    progress_callback=_dl_cb,
                     user_id=user_id,
                 )
                 if (
@@ -250,7 +274,9 @@ class BigFilePipeline:
             # Upload to S3
             try:
                 if self._storage is not None:
-                    await self._storage.upload_file(temp_path, s3_key)
+                    await self._storage.upload_file(
+                        temp_path, s3_key, progress_callback=_upload_cb
+                    )
                     try:
                         if os.path.exists(temp_path):
                             os.remove(temp_path)

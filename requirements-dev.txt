@@ -1,0 +1,10 @@
+# Dev/CI tooling (bandit, ruff, mypy, types-requests, pip-audit).
+# Runtime dependencies come from requirements.txt (included below).
+# All versions are pinned exactly so CI results are reproducible; Dependabot
+# keeps these pins current (see .github/dependabot.yml).
+-r requirements.txt
+bandit==1.9.4
+ruff==0.16.0
+mypy==2.3.0
+types-requests==2.33.0.20260712
+pip-audit==2.10.0

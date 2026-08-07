@@ -35,8 +35,8 @@ class BotErrorHandler:
         ),
         "file_too_large": (
             "\U0001f4e6 File is too large. "
-            "Maximum file size is 50 MB via the Bot API. "
-            "Use a userbot account for larger files."
+            "The Bot API can only download files up to 20 MB "
+            "(getFile); use a userbot account for larger files."
         ),
         "invalid_format": (
             "\u274c Invalid file format. "

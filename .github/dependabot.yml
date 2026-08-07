@@ -1,0 +1,36 @@
+# Dependabot configuration
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Keeps pinned dependency versions current:
+#   - requirements.txt / requirements-dev.txt  -> pip ecosystem
+#   - workflow action versions                 -> github-actions ecosystem
+#
+# `versioning-strategy: increase` preserves the exact-pin style (bandit==1.9.4
+# becomes bandit==1.9.5), so CI stays reproducible after each update.
+# Dev-tool bumps (bandit, pip-audit, ruff, mypy, types-requests) are grouped
+# into a single PR per cycle to reduce noise.
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - "dependencies"
+    versioning-strategy: increase
+    groups:
+      dev-tools:
+        patterns:
+          - "bandit"
+          - "pip-audit"
+          - "ruff"
+          - "mypy"
+          - "types-requests"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - "dependencies"

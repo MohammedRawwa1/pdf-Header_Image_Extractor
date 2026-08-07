@@ -1,12 +1,12 @@
 # PDF Header / Cover Image Extractor Bot
 
-A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>50MB) via userbot fallback and runs as a FastAPI webhook service on Railway.
+A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>20MB) via userbot fallback and runs as a FastAPI webhook service on Railway.
 
 ## Features
 
 - **PDF Thumbnail Extraction** — Automatically selects the best page as cover image
 - **Automatic Thumb Detection** — Uses visual entropy to pick the most relevant page
-- **Big PDF Support** — Handles files >50MB via Telethon/Pyrogram userbot download
+- **Big PDF Support** — Handles files >20MB via Telethon/Pyrogram userbot download
 - **Progress Tracking** — Real-time download/upload progress bars
 - **Keep-Alive Heartbeat** — Prevents free-tier spin-down (15min inactivity)
 - **Background Worker** — In-process RQ worker for job processing
@@ -51,9 +51,10 @@ A Telegram bot that extracts a header/cover image (first PDF page) and generates
 | `S3_REGION` | (empty) | AWS region |
 | `AWS_ACCESS_KEY_ID` | (empty) | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | (empty) | AWS secret key |
-| `BOT_API_MAX_MB` | `50` | Telegram Bot API max file size in MB |
+| `BOT_API_MAX_MB` | `50` | Telegram Bot API UPLOAD max (sendDocument) in MB |
+| `BOT_API_DOWNLOAD_MAX_MB` | `20` | Telegram Bot API DOWNLOAD max (getFile) in MB — files above this route through the userbot/BigFilePipeline |
 
-### Optional — Userbot (for files >50MB)
+### Optional — Userbot (for files >20MB)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -150,6 +151,9 @@ owner-id: <OWNER_ID>
 # Install dependencies
 python -m pip install -r requirements.txt
 
+# Dev tooling (lint/type-check/security) - versions pinned in requirements-dev.txt
+python -m pip install -r requirements-dev.txt
+
 # Set environment
 export BOT_TOKEN="your-bot-token"
 export USE_POLLING=true
@@ -197,9 +201,9 @@ Configure these in the Railway dashboard under **Variables**:
 
 ## Big PDF Pipeline
 
-For files exceeding Telegram's 50MB Bot API limit:
+For files exceeding Telegram's Bot API DOWNLOAD limit (20MB via `getFile`):
 
-1. Bot detects file size > `BOT_API_MAX_MB`
+1. Bot detects file size > `BOT_API_DOWNLOAD_MAX_MB`
 2. Routes through `BigFilePipeline` in `utils/bigfile_pipeline.py`
 3. Downloads via Telethon/Pyrogram userbot
 4. Uploads to S3/R2 storage
@@ -249,8 +253,9 @@ The bot shows real-time progress bars for download/upload operations:
 ├── tasks.py            # Background job processing (RQ)
 ├── worker.py           # RQ worker process
 ├── storage.py          # S3/local storage backend
-├── requirements.txt    # Python dependencies
-├── Dockerfile          # Docker build
+├── requirements.txt     # Python dependencies (runtime)
+├── requirements-dev.txt # Dev/CI tooling (pinned, Dependabot-managed)
+├── Dockerfile           # Docker build
 ├── railway.json         # Railway deployment config
 ├── utils/
 │   ├── __init__.py

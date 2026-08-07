@@ -13,10 +13,12 @@ Usage example:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import shutil
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 try:
@@ -38,14 +40,50 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# Callback signature used for transfer progress: (bytes_transferred, total_bytes).
+ProgressCallback = Callable[[int, int], None] | None
+
+
+class _TransferProgress:
+    """Accumulating progress adapter for boto3/s3transfer and local copies.
+
+    boto3/s3transfer invoke the Callback with the number of bytes transferred
+    per chunk (incremental), so we accumulate and report ``(current, total)``
+    to the optional user-supplied callback.  ``total`` may be 0 when unknown
+    (renders as a bytes counter with no percentage).
+    """
+
+    def __init__(self, total: int, callback: ProgressCallback):
+        self.total = total or 0
+        self.callback = callback
+        self.seen = 0
+
+    def __call__(self, bytes_amount: int) -> None:
+        try:
+            self.seen += int(bytes_amount or 0)
+        except Exception:  # nosec B110 - never let progress break transfers
+            return
+        if self.total and self.seen > self.total:
+            self.seen = self.total
+        if self.callback is None:
+            return
+        try:
+            self.callback(self.seen, self.total)
+        except Exception:  # nosec B110 - progress is best-effort
+            pass
+
 
 class AsyncStorageBackend(ABC):
     @abstractmethod
-    async def upload_file(self, src_path: str, dest_key: str) -> str:
+    async def upload_file(
+        self, src_path: str, dest_key: str, progress_callback: ProgressCallback = None
+    ) -> str:
         """Upload a local file at `src_path` to storage and return the storage key or path."""
 
     @abstractmethod
-    async def download_file(self, key: str, dest_path: str) -> bool:
+    async def download_file(
+        self, key: str, dest_path: str, progress_callback: ProgressCallback = None
+    ) -> bool:
         """Download a storage object `key` to local `dest_path`. Return True on success."""
 
     @abstractmethod
@@ -76,18 +114,59 @@ class LocalStorageBackend(AsyncStorageBackend):
     def _abs_path(self, key: str) -> str:
         return os.path.join(self.base, key)
 
-    async def upload_file(self, src_path: str, dest_key: str) -> str:
+    async def upload_file(
+        self, src_path: str, dest_key: str, progress_callback: ProgressCallback = None
+    ) -> str:
         dest = self._abs_path(dest_key)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        await asyncio.to_thread(shutil.copy2, src_path, dest)
+        if progress_callback is None:
+            await asyncio.to_thread(shutil.copy2, src_path, dest)
+            return dest
+        # Chunked copy so the callback gets live progress on large files.
+        try:
+            total = os.path.getsize(src_path)
+        except Exception:
+            total = 0
+        _cb = _TransferProgress(total, progress_callback)
+
+        def _copy():
+            with open(src_path, "rb") as f_src, open(dest, "wb") as f_dst:
+                while True:
+                    chunk = f_src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f_dst.write(chunk)
+                    _cb(len(chunk))
+
+        await asyncio.to_thread(_copy)
         return dest
 
-    async def download_file(self, key: str, dest_path: str) -> bool:
+    async def download_file(
+        self, key: str, dest_path: str, progress_callback: ProgressCallback = None
+    ) -> bool:
         src = self._abs_path(key)
         if not os.path.exists(src):
             return False
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        await asyncio.to_thread(shutil.copy2, src, dest_path)
+        if progress_callback is None:
+            await asyncio.to_thread(shutil.copy2, src, dest_path)
+            return True
+        try:
+            total = os.path.getsize(src)
+        except Exception:
+            total = 0
+        _cb = _TransferProgress(total, progress_callback)
+
+        def _copy():
+            with open(src, "rb") as f_src, open(dest_path, "wb") as f_dst:
+                while True:
+                    chunk = f_src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f_dst.write(chunk)
+                    _cb(len(chunk))
+
+        await asyncio.to_thread(_copy)
         return True
 
     async def generate_presigned_post(
@@ -201,7 +280,9 @@ class S3AsyncBackend(AsyncStorageBackend):
             kw["aws_session_token"] = self.aws_session_token
         return kw
 
-    async def upload_file(self, src_path: str, dest_key: str) -> str:
+    async def upload_file(
+        self, src_path: str, dest_key: str, progress_callback: ProgressCallback = None
+    ) -> str:
         if not src_path:
             raise ValueError(f"Invalid src_path: {src_path}")
         src_path = os.path.abspath(src_path)
@@ -215,6 +296,11 @@ class S3AsyncBackend(AsyncStorageBackend):
             raise ValueError(
                 f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}"
             )
+        try:
+            _total = os.path.getsize(src_path)
+        except Exception:
+            _total = 0
+        _cb = _TransferProgress(_total, progress_callback)
 
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
@@ -245,7 +331,10 @@ class S3AsyncBackend(AsyncStorageBackend):
                         "s3", **self._client_kwargs()
                     ) as client:
                         await client.upload_file(
-                            src_path, self.bucket, dest_key
+                            src_path,
+                            self.bucket,
+                            dest_key,
+                            Callback=_cb,
                         )
                     return dest_key
 
@@ -256,7 +345,9 @@ class S3AsyncBackend(AsyncStorageBackend):
 
                 def _sync_upload():
                     client = boto3.client("s3", **self._client_kwargs())
-                    client.upload_file(src_path, self.bucket, dest_key)
+                    client.upload_file(
+                        src_path, self.bucket, dest_key, Callback=_cb
+                    )
 
                 await asyncio.to_thread(_sync_upload)
                 return dest_key
@@ -302,7 +393,9 @@ class S3AsyncBackend(AsyncStorageBackend):
         await asyncio.to_thread(_sync)
         return dest_key
 
-    async def upload_bytes(self, data: bytes, dest_key: str) -> str:
+    async def upload_bytes(
+        self, data: bytes, dest_key: str, progress_callback: ProgressCallback = None
+    ) -> str:
         """Upload bytes directly to S3 without writing to local disk first."""
         if not dest_key:
             raise ValueError("dest_key must not be empty")
@@ -312,6 +405,10 @@ class S3AsyncBackend(AsyncStorageBackend):
             raise ValueError(
                 f"S3_BUCKET must be a bucket name, not a URL: {self.bucket}"
             )
+        # put_object has no progress hook; when progress is wanted we stream the
+        # bytes through upload_fileobj (same result, live transfer updates).
+        _use_fileobj = progress_callback is not None
+        _cb = _TransferProgress(len(data), progress_callback)
 
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
@@ -332,9 +429,17 @@ class S3AsyncBackend(AsyncStorageBackend):
                     async with self._session.client(
                         "s3", **self._client_kwargs()
                     ) as client:
-                        await client.put_object(
-                            Bucket=self.bucket, Key=dest_key, Body=data
-                        )
+                        if _use_fileobj:
+                            await client.upload_fileobj(
+                                io.BytesIO(data),
+                                self.bucket,
+                                dest_key,
+                                Callback=_cb,
+                            )
+                        else:
+                            await client.put_object(
+                                Bucket=self.bucket, Key=dest_key, Body=data
+                            )
                     return dest_key
                 if boto3 is None:
                     raise RuntimeError(
@@ -343,9 +448,17 @@ class S3AsyncBackend(AsyncStorageBackend):
 
                 def _sync():
                     client = boto3.client("s3", **self._client_kwargs())
-                    client.put_object(
-                        Bucket=self.bucket, Key=dest_key, Body=data
-                    )
+                    if _use_fileobj:
+                        client.upload_fileobj(
+                            io.BytesIO(data),
+                            self.bucket,
+                            dest_key,
+                            Callback=_cb,
+                        )
+                    else:
+                        client.put_object(
+                            Bucket=self.bucket, Key=dest_key, Body=data
+                        )
 
                 await asyncio.to_thread(_sync)
                 return dest_key
@@ -365,11 +478,37 @@ class S3AsyncBackend(AsyncStorageBackend):
                 backoff = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
                 await asyncio.sleep(backoff + random.random())  # nosec B311
 
-    async def download_file(self, key: str, dest_path: str) -> bool:
+    async def download_file(
+        self, key: str, dest_path: str, progress_callback: ProgressCallback = None
+    ) -> bool:
         retries = int(os.getenv("S3_OP_RETRIES", "3"))
         backoff_base = float(os.getenv("S3_OP_BACKOFF_BASE", "1"))
         max_backoff = float(os.getenv("S3_OP_BACKOFF_MAX", "60"))
         import random
+
+        # Resolve the object size once so the callback can show a percentage.
+        _total = 0
+        if progress_callback is not None:
+            try:
+                if self._use_aioboto3:
+                    async with self._session.client(
+                        "s3", **self._client_kwargs()
+                    ) as client:
+                        _total = int(
+                            (await client.head_object(
+                                Bucket=self.bucket, Key=key
+                            ))["ContentLength"]
+                        )
+                elif boto3 is not None:
+                    client = boto3.client("s3", **self._client_kwargs())
+                    _total = int(
+                        client.head_object(Bucket=self.bucket, Key=key)[
+                            "ContentLength"
+                        ]
+                    )
+            except Exception:  # nosec B110 - unknown size still shows bytes
+                _total = 0
+        _cb = _TransferProgress(_total, progress_callback)
 
         for attempt in range(1, retries + 1):
             try:
@@ -377,7 +516,9 @@ class S3AsyncBackend(AsyncStorageBackend):
                     async with self._session.client(
                         "s3", **self._client_kwargs()
                     ) as client:
-                        await client.download_file(self.bucket, key, dest_path)
+                        await client.download_file(
+                            self.bucket, key, dest_path, Callback=_cb
+                        )
                     return True
                 if boto3 is None:
                     raise RuntimeError(
@@ -386,7 +527,9 @@ class S3AsyncBackend(AsyncStorageBackend):
 
                 def _sync_download():
                     client = boto3.client("s3", **self._client_kwargs())
-                    client.download_file(self.bucket, key, dest_path)
+                    client.download_file(
+                        self.bucket, key, dest_path, Callback=_cb
+                    )
 
                 await asyncio.to_thread(_sync_download)
                 return True

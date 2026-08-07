@@ -94,6 +94,10 @@ from utils.session_healthcheck import (  # noqa: E402
     start_session_healthcheck,
     stop_session_healthcheck,
 )
+from utils.tg_http import (  # noqa: E402
+    _tg_forward_message,
+    _tg_send_document,
+)
 from utils.url_validation import _validate_url_safe  # noqa: E402
 from utils.userbot_uploader import send_file_via_userbot  # noqa: E402
 
@@ -202,7 +206,7 @@ def _make_progress_cb(task_id: str, loop: asyncio.AbstractEventLoop):
     ``update_task_progress`` so it can be called from those contexts.
     """
 
-    def _cb(current: int, total: int):
+    def _cb(current: int, total: int, *args):
         try:
             asyncio.run_coroutine_threadsafe(
                 progress_tracker.update_task_progress(task_id, current),
@@ -251,6 +255,46 @@ def _register_progress_edit_cb(
     progress_tracker.register_callback(task_id, _edit)
 
 
+async def _begin_upload_phase(
+    bot,
+    chat_id: int,
+    task,
+    loop: asyncio.AbstractEventLoop,
+    progress_msg_id: int | None = None,
+):
+    """Switch a (possibly merged download->upload) tracker to the upload phase.
+
+    Shared by ``_send_with_upload_progress`` (userbot path) and
+    ``_send_document_via_bot_api`` (raw Bot API path) so both show identical
+    upload-progress behaviour:
+
+    * ``task.start()`` runs FIRST - it resets status to "processing" and
+      (re)sets start_time (also clearing end_time / error_message / throttle
+      state from any previous lifecycle), so a fresh tracker reads
+      "uploading" and a merged download->upload tracker's speed/ETA reflect
+      the UPLOAD phase only, with its bar climbing from 0 again.
+    * The phase switch is shown IMMEDIATELY (new progress message for a
+      fresh tracker, in-place edit for a merged one) before the first
+      streamed chunk lands.
+    * The progress callback and live-edit callback are wired up.
+
+    Returns ``(progress_msg_id, progress_cb)``.
+    """
+    task.start()
+    task.processed_size = 0
+    task.status = "uploading"
+    try:
+        if progress_msg_id is None:
+            progress_msg_id = await send_progress_update(chat_id, bot, task)
+        else:
+            await send_progress_update(chat_id, bot, task, progress_msg_id)
+    except Exception:  # nosec B110 - progress is best-effort
+        pass
+    _cb = _make_progress_cb(task.task_id, loop)
+    _register_progress_edit_cb(bot, chat_id, task.task_id, progress_msg_id)
+    return progress_msg_id, _cb
+
+
 async def _send_with_upload_progress(
     bot,
     chat_id: int,
@@ -290,17 +334,11 @@ async def _send_with_upload_progress(
         task = progress_tracker.create_task(
             task_id, user_id or 0, filename, file_size
         )
-        progress_msg_id = await send_progress_update(chat_id, bot, task)
-    else:
-        # Reused tracker (merged download -> upload): the download phase set
-        # processed_size to 100%, so reset it so the upload bar climbs from 0.
-        task.processed_size = 0
-    task.status = "uploading"
-    if task.start_time is None:
-        task.start()
-    _cb = _make_progress_cb(task.task_id, loop)
-    _register_progress_edit_cb(
-        bot, chat_id, task.task_id, progress_msg_id
+    # Switch the (possibly merged download->upload) tracker to the upload
+    # phase and show it immediately (post or in-place edit) before the
+    # userbot's first progress chunk lands.
+    progress_msg_id, _cb = await _begin_upload_phase(
+        bot, chat_id, task, loop, progress_msg_id
     )
 
     try:
@@ -351,6 +389,60 @@ async def _send_with_upload_progress(
         raise
 
 
+async def _send_document_via_bot_api(
+    bot,
+    chat_id: int,
+    file_path: str,
+    filename: str,
+    thumb_path: str,
+    caption: str,
+    task=None,
+    progress_msg_id: int | None = None,
+) -> None:
+    """Send a document via the Bot API with LIVE upload progress.
+
+    PTB's ``send_document`` exposes no upload-progress hook, and its
+    ``InputFile`` reads the whole file into memory up front (``load_file`` ->
+    ``obj.read()``), so wrapping the file object can only ever report 0% then
+    100%.  When a progress tracker exists, this instead streams the multipart
+    body via raw Bot API HTTP in a worker thread
+    (``utils.tg_http._tg_send_document`` + its ``_ProgressFileReader``) and
+    feeds the streamed byte counts into the shared progress tracker, which
+    live-edits the existing progress message (throttled, exactly like the
+    worker flow).  Retries on 429/5xx are handled inside ``_tg_send_document``.
+
+    When no tracker exists (tiny files that upload in under a second) the plain
+    PTB path is kept, so behaviour is unchanged for those.
+    """
+    if task is None or progress_msg_id is None:
+        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(f_doc, filename=filename),
+                thumbnail=f_thumb,
+                caption=caption,
+            )
+        return
+
+    # Switch the (possibly merged download->upload) tracker to the upload phase
+    # so the SAME progress message climbs from 0% with an "uploading" label.
+    _loop = asyncio.get_running_loop()
+    progress_msg_id, _cb = await _begin_upload_phase(
+        bot, chat_id, task, _loop, progress_msg_id
+    )
+    with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
+        await asyncio.to_thread(
+            _tg_send_document,
+            config.BOT_TOKEN,
+            chat_id,
+            f_doc,
+            filename,
+            f_thumb,
+            caption,
+            _cb,
+        )
+
+
 async def _notify_download_failed(msg, file_size=None):
     """Send a helpful error message when all download methods fail for a large file."""
     try:
@@ -365,13 +457,17 @@ async def _notify_download_failed(msg, file_size=None):
                 "- Set RELAY_CHAT_ID env var to a group where both bot and userbot are members."
             )
         options.append("- Send a public HTTPS URL to the file instead.")
+        _dl_limit_mb = config.BOT_API_DOWNLOAD_LIMIT_BYTES // (1024 * 1024)
         if file_size:
             mb_size = file_size // (1024 * 1024)
             options.append(
-                f"- Upload a smaller file (under 50MB). Your file is ~{mb_size} MB."
+                f"- Upload a smaller file (under {_dl_limit_mb}MB). "
+                f"Your file is ~{mb_size} MB."
             )
         else:
-            options.append("- Upload a smaller file (under 50MB).")
+            options.append(
+                f"- Upload a smaller file (under {_dl_limit_mb}MB)."
+            )
         await msg.reply_text(
             "Failed to download file. All methods tried:\n"
             "1. Relay group (forward + userbot download)\n"
@@ -534,21 +630,13 @@ async def _userbot_download_fallback(
                             _relay_ptb_err,
                         )
                         bot_token = config.BOT_TOKEN
-                        fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
-                        import requests as _requests
-
-                        fwd_resp = _requests.post(
-                            fwd_url,
-                            data={
-                                "chat_id": relay_chat_id,
-                                "from_chat_id": chat_id,
-                                "message_id": msg.message_id,
-                            },
-                            timeout=30,
+                        relay_msg_id = _tg_forward_message(
+                            bot_token,
+                            relay_chat_id,
+                            chat_id,
+                            msg.message_id,
                         )
-                        if fwd_resp.status_code == 200:
-                            fwd_data = fwd_resp.json()
-                            relay_msg_id = fwd_data["result"]["message_id"]
+                        if relay_msg_id:
                             logger.info(
                                 "relay (HTTP): forwarded %s/%s to %s/%s",
                                 msg.chat.id,
@@ -575,10 +663,7 @@ async def _userbot_download_fallback(
                                     except Exception:  # nosec B110
                                         pass
                         else:
-                            raise Exception(
-                                f"HTTP forwardMessage failed: {fwd_resp.status_code} "
-                                f"{fwd_resp.text[:200]}"
-                            )
+                            raise Exception("HTTP forwardMessage failed")
                     except Exception as _relay_http_err:
                         logger.warning(
                             "relay (HTTP) also failed for %s/%s: %s",
@@ -994,13 +1079,14 @@ async def handle_document(
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
-    # If Telegram reports a file_size on the Document, check it against the configured
-    # upload limit before attempting to enqueue or download. Telegram's Bot API will
-    # reject downloads for files larger than the bot's allowed size (returns 400 "file is too big").
+    # If Telegram reports a file_size on the Document, check it against the Bot API
+    # DOWNLOAD limit (getFile cap, 20MB) before attempting to enqueue or download.
+    # Telegram's Bot API rejects downloads above that cap with 400 "file is too big",
+    # so such files must route through the userbot / BigFilePipeline instead.
     file_size = getattr(doc, "file_size", None)
-    upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+    download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
     use_userbot_download = False
-    if file_size and upload_limit and file_size > upload_limit:
+    if file_size and download_limit and file_size > download_limit:
         _userbot_ok = _check_userbot_available(user_id)
         if _userbot_ok:
             use_userbot_download = True
@@ -1011,7 +1097,7 @@ async def handle_document(
         else:
             # Inform the user
             try:
-                mb_limit = upload_limit // (1024 * 1024)
+                mb_limit = download_limit // (1024 * 1024)
                 mb_size = file_size // (1024 * 1024)
                 await msg.reply_text(
                     f"I can't download files larger than {mb_limit} MB via the Bot API. "
@@ -1027,9 +1113,9 @@ async def handle_document(
             return
 
     if config.REDIS_URL:
-        # When file is too large (>50MB) and userbot is available, route through
+        # When file is too large (>20MB) and userbot is available, route through
         # userbot/BigFilePipeline instead. process_document_job uses the Bot API
-        # (getFile) which cannot handle files >50MB and will fail with "file is too big".
+        # (getFile) which cannot handle files >20MB and will fail with "file is too big".
         if not use_userbot_download:
             # Pass message_id + forward_info + file_size so the worker has context for userbot fallback
             ok = await asyncio.to_thread(
@@ -1191,17 +1277,16 @@ async def handle_document(
             task = None
             progress_msg_id = None
         else:
-            with (
-                open(file_path, "rb") as f_doc,
-                open(thumb_path, "rb") as f_thumb,
-            ):
-                input_doc = InputFile(f_doc, filename=filename)
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=input_doc,
-                    thumbnail=f_thumb,
-                    caption=caption,
-                )
+            await _send_document_via_bot_api(
+                bot=context.bot,
+                chat_id=chat_id,
+                file_path=file_path,
+                filename=filename,
+                thumb_path=thumb_path,
+                caption=caption,
+                task=task,
+                progress_msg_id=progress_msg_id,
+            )
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
@@ -1303,17 +1388,16 @@ async def handle_document(
                             progress_msg_id=_dl_msg_id,
                         )
                     else:
-                        with (
-                            open(file_path, "rb") as f_doc,
-                            open(thumb_path, "rb") as f_thumb,
-                        ):
-                            input_doc = InputFile(f_doc, filename=filename)
-                            await context.bot.send_document(
-                                chat_id=chat_id,
-                                document=input_doc,
-                                thumbnail=f_thumb,
-                                caption="Here is your file (downloaded via userbot) with an auto-generated cover preview.",
-                            )
+                        await _send_document_via_bot_api(
+                            bot=context.bot,
+                            chat_id=chat_id,
+                            file_path=file_path,
+                            filename=filename,
+                            thumb_path=thumb_path,
+                            caption="Here is your file (downloaded via userbot) with an auto-generated cover preview.",
+                            task=_dl_task,
+                            progress_msg_id=_dl_msg_id,
+                        )
                         # Auto-remove the transient download progress message
                         # now that the output was delivered.
                         if _dl_task:
@@ -1462,9 +1546,9 @@ async def handle_photo(
     try:
         file_path = os.path.join(tmpdir, filename)
 
-        upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+        download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
 
-        if photo_size > upload_limit and _check_userbot_available(user_id):
+        if photo_size > download_limit and _check_userbot_available(user_id):
             # ── Userbot download path for large photos ──
             _dl_result, _dl_task, _dl_msg_id = (
                 await _userbot_download_fallback(
@@ -1543,19 +1627,16 @@ async def handle_photo(
             task = None
             progress_msg_id = None
         else:
-            with (
-                open(file_path, "rb") as f_doc,
-                open(thumb_path, "rb") as f_thumb,
-            ):
-                input_doc = InputFile(
-                    f_doc, filename=os.path.basename(file_path)
-                )
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=input_doc,
-                    thumbnail=f_thumb,
-                    caption="Here is your image with an auto-generated thumbnail.",
-                )
+            await _send_document_via_bot_api(
+                bot=context.bot,
+                chat_id=chat_id,
+                file_path=file_path,
+                filename=os.path.basename(file_path),
+                thumb_path=thumb_path,
+                caption="Here is your image with an auto-generated thumbnail.",
+                task=task,
+                progress_msg_id=progress_msg_id,
+            )
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
@@ -1643,19 +1724,16 @@ async def handle_photo(
                             progress_msg_id=_dl_msg_id,
                         )
                     else:
-                        with (
-                            open(file_path, "rb") as f_doc,
-                            open(thumb_path, "rb") as f_thumb,
-                        ):
-                            input_doc = InputFile(
-                                f_doc, filename=os.path.basename(file_path)
-                            )
-                            await context.bot.send_document(
-                                chat_id=msg.chat.id,
-                                document=input_doc,
-                                thumbnail=f_thumb,
-                                caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail.",
-                            )
+                        await _send_document_via_bot_api(
+                            bot=context.bot,
+                            chat_id=msg.chat.id,
+                            file_path=file_path,
+                            filename=os.path.basename(file_path),
+                            thumb_path=thumb_path,
+                            caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail.",
+                            task=_dl_task,
+                            progress_msg_id=_dl_msg_id,
+                        )
                         # Auto-remove the transient download progress message
                         # now that the output was delivered.
                         if _dl_task:
@@ -3436,22 +3514,49 @@ async def handle_text_with_url(
                         target_chat_id="me",
                     )
                 else:
-                    with (
-                        open(file_path, "rb") as f_doc,
-                        open(thumb_path, "rb") as f_thumb,
-                    ):
-                        input_doc = InputFile(f_doc, filename=base)
-                        chat_id = (
-                            msg.chat.id
-                            if getattr(msg, "chat", None)
-                            else msg.chat_id
+                    _url_task = None
+                    _url_msg_id = None
+                    if _url_file_size and _url_file_size > 1024 * 1024:
+                        _url_task = progress_tracker.create_task(
+                            uuid.uuid4().hex[:12],
+                            user_id or 0,
+                            base,
+                            _url_file_size,
                         )
-                        await context.bot.send_document(
+                        _url_msg_id = await send_progress_update(
+                            chat_id, context.bot, _url_task
+                        )
+                    try:
+                        await _send_document_via_bot_api(
+                            bot=context.bot,
                             chat_id=chat_id,
-                            document=input_doc,
-                            thumbnail=f_thumb,
+                            file_path=file_path,
+                            filename=base,
+                            thumb_path=thumb_path,
                             caption="Generated thumbnail from URL",
+                            task=_url_task,
+                            progress_msg_id=_url_msg_id,
                         )
+                    except Exception:
+                        if _url_task:
+                            await progress_tracker.fail_task(
+                                _url_task.task_id, "Telegram send failed"
+                            )
+                        raise
+                    else:
+                        if _url_task:
+                            await progress_tracker.complete_task(
+                                _url_task.task_id
+                            )
+                    finally:
+                        if _url_msg_id:
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=chat_id,
+                                    message_id=_url_msg_id,
+                                )
+                            except Exception:  # nosec B110
+                                pass
             except Exception as e:
                 error_info = await handle_bot_error(
                     e, "URL PDF Processing", update=update
@@ -3491,22 +3596,56 @@ async def handle_text_with_url(
                                 create_thumbnail_from_pdf(
                                     file_path, thumb_path
                                 )
-                                with (
-                                    open(file_path, "rb") as f_doc,
-                                    open(thumb_path, "rb") as f_thumb,
-                                ):
-                                    input_doc = InputFile(f_doc, filename=base)
-                                    chat_id = (
-                                        msg.chat.id
-                                        if getattr(msg, "chat", None)
-                                        else msg.chat_id
+                                chat_id = (
+                                    msg.chat.id
+                                    if getattr(msg, "chat", None)
+                                    else msg.chat_id
+                                )
+                                _url_file_size = os.path.getsize(file_path)
+                                _url_task = None
+                                _url_msg_id = None
+                                if _url_file_size > 1024 * 1024:
+                                    _url_task = progress_tracker.create_task(
+                                        uuid.uuid4().hex[:12],
+                                        user_id or 0,
+                                        base,
+                                        _url_file_size,
                                     )
-                                    await context.bot.send_document(
+                                    _url_msg_id = await send_progress_update(
+                                        chat_id, context.bot, _url_task
+                                    )
+                                try:
+                                    await _send_document_via_bot_api(
+                                        bot=context.bot,
                                         chat_id=chat_id,
-                                        document=input_doc,
-                                        thumbnail=f_thumb,
+                                        file_path=file_path,
+                                        filename=base,
+                                        thumb_path=thumb_path,
                                         caption="Generated thumbnail from URL",
+                                        task=_url_task,
+                                        progress_msg_id=_url_msg_id,
                                     )
+                                except Exception:
+                                    if _url_task:
+                                        await progress_tracker.fail_task(
+                                            _url_task.task_id,
+                                            "Telegram send failed",
+                                        )
+                                    raise
+                                else:
+                                    if _url_task:
+                                        await progress_tracker.complete_task(
+                                            _url_task.task_id
+                                        )
+                                finally:
+                                    if _url_msg_id:
+                                        try:
+                                            await context.bot.delete_message(
+                                                chat_id=chat_id,
+                                                message_id=_url_msg_id,
+                                            )
+                                        except Exception:  # nosec B110
+                                            pass
                             except Exception as e:
                                 error_info = await handle_bot_error(
                                     e,

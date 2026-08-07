@@ -1,7 +1,7 @@
 """Userbot downloader for large PDF files via Telethon/Pyrogram.
 
 Adapted from media_conersion_bot for PDF-only use (no video/FFmpeg).
-Used when Telegram Bot API cannot download files >50MB.
+Used when Telegram Bot API cannot download files >20MB.
 """
 
 import asyncio

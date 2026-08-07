@@ -47,296 +47,45 @@ def _pipeline_cancel_flag(job_id: str | None) -> bool:
         return False
 
 
-# Use direct Telegram Bot HTTP API calls in background workers (synchronous)
+# Direct Telegram Bot HTTP API calls (getFile, file downloads, forwardMessage,
+# sendMessage/editMessageText/deleteMessage, sendDocument and progress) live in
+# utils/tg_http.py — imported below.  Only S3-presigned and user-supplied URL
+# downloads still use requests here.
 
 
-def _tg_get_file_path(bot_token: str | None, file_id: str) -> str:
-    # Use provided bot_token or fall back to configured token
-    if not bot_token:
-        try:
-            import config as _config
-
-            bot_token = _config.BOT_TOKEN
-        except Exception:
-            bot_token = None
-    logger = logging.getLogger(__name__)
-    url = f"https://api.telegram.org/bot{bot_token}/getFile"
-    # Try a couple of times for transient issues (e.g., 5xx or rate limits)
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params={"file_id": file_id}, timeout=30)
-        except Exception:
-            logger.exception(
-                "Network error fetching getFile for %s (attempt %s)",
-                file_id,
-                attempt + 1,
-            )
-            if attempt < 2:
-                time.sleep(1 + attempt)
-                continue
-            raise
-
-        if r.status_code != 200:
-            # Try to extract Telegram error description for more context
-            try:
-                body = r.json()
-                desc = body.get("description") or body
-            except Exception:
-                desc = r.text
-            msg = (
-                f"Telegram getFile failed: status={r.status_code} desc={desc}"
-            )
-            logger.error(msg)
-            # record diagnostic info in Redis io:out key for this file_id
-            try:
-                _set_io_keys(
-                    file_id,
-                    output_meta={
-                        "status": "getfile_failed",
-                        "http_status": r.status_code,
-                        "desc": str(desc),
-                        "timestamp": int(time.time()),
-                    },
-                )
-            except Exception:  # nosec B110
-                pass
-            # For server errors or rate limits, retry a couple times
-            if r.status_code >= 500 or r.status_code == 429:
-                if attempt < 2:
-                    time.sleep(1 + attempt)
-                    continue
-            # Raise an HTTPError with details so callers can include it in their handling
-            raise requests.HTTPError(msg)
-
-        try:
-            data = r.json()
-            return data["result"]["file_path"]
-        except Exception as e:
-            logger.exception("Failed parsing getFile JSON for %s", file_id)
-            # On 400 errors like 'file is too big' record diagnostic info in io:out key
-            try:
-                unique_key = file_id
-                _set_io_keys(
-                    unique_key,
-                    output_meta={
-                        "status": "getfile_failed",
-                        "error": str(e),
-                        "http_status": r.status_code,
-                        "desc": r.text,
-                        "timestamp": int(time.time()),
-                    },
-                )
-            except Exception:  # nosec B110
-                pass
-            raise
-
-
-def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
-    if not bot_token:
-        try:
-            import config as _config
-
-            bot_token = _config.BOT_TOKEN
-        except Exception:
-            bot_token = None
-    url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
-    last_exc = None
-    for attempt in range(3):
-        try:
-            with requests.get(url, stream=True, timeout=60) as r:
-                if r.status_code >= 500 or r.status_code == 429:
-                    # Server error or rate limit — retry with backoff
-                    last_exc = requests.HTTPError(
-                        f"Telegram download failed: status={r.status_code}"
-                    )
-                    logger.warning(
-                        "_tg_download_to_bytes: HTTP %s on attempt %d for %s",
-                        r.status_code,
-                        attempt + 1,
-                        tg_file_path,
-                    )
-                    if attempt < 2:
-                        time.sleep(2**attempt)
-                        continue
-                    raise last_exc
-                r.raise_for_status()
-                buf = io.BytesIO()
-                for chunk in r.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        buf.write(chunk)
-                return buf.getvalue()
-        except (
-            requests.ConnectionError,
-            requests.Timeout,
-            requests.ChunkedEncodingError,
-        ) as e:
-            # Transient network errors — retry with exponential backoff
-            last_exc = e
-            logger.warning(
-                "_tg_download_to_bytes: transient error %s on attempt %d for %s",
-                type(e).__name__,
-                attempt + 1,
-                tg_file_path,
-            )
-            if attempt < 2:
-                time.sleep(2**attempt)
-                continue
-        except requests.HTTPError:
-            # Non-retryable HTTP errors (e.g., 400, 404) — raise immediately
-            raise
-    raise last_exc or RuntimeError(
-        f"Failed to download {tg_file_path} after 3 attempts"
-    )
-
-
-def _tg_send_document(
-    bot_token: str | None,
+def _live_edit(
+    state: dict,
     chat_id: int,
-    doc_fileobj,
     filename: str,
-    thumb_fileobj=None,
-    caption: str | None = None,
-):
-    if not bot_token:
-        try:
-            import config as _config
-
-            bot_token = _config.BOT_TOKEN
-        except Exception:
-            bot_token = None
-    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    files = {"document": (filename, doc_fileobj)}
-    if thumb_fileobj is not None:
-        files["thumb"] = ("thumb.jpg", thumb_fileobj, "image/jpeg")
-    data = {"chat_id": str(chat_id)}
-    if caption:
-        data["caption"] = caption
-    # Retry on transient 429/5xx (Telegram flood control) with backoff —
-    # the worker shares the bot token with the web process, so sends must
-    # tolerate global-rate-limit responses instead of failing the job.
-    last_exc = None
-    for attempt in range(3):
-        try:
-            # Rewind file streams so a retry re-sends the FULL payload
-            # (requests consumes the file object; without seek(0) a retry
-            # would upload a truncated file).
-            try:
-                doc_fileobj.seek(0)
-                if thumb_fileobj is not None:
-                    thumb_fileobj.seek(0)
-            except Exception:  # nosec B110 - non-seekable streams
-                pass
-            r = requests.post(url, data=data, files=files, timeout=120)
-            if r.status_code in (429,) or r.status_code >= 500:
-                last_exc = requests.HTTPError(
-                    f"Telegram sendDocument failed: status={r.status_code}"
-                )
-                logger.warning(
-                    "_tg_send_document: HTTP %s on attempt %d for %s",
-                    r.status_code,
-                    attempt + 1,
-                    filename,
-                )
-                if attempt < 2:
-                    time.sleep(2**attempt)
-                    continue
-                raise last_exc
-            r.raise_for_status()
-            return r.json()
-        except (
-            requests.ConnectionError,
-            requests.Timeout,
-        ) as e:
-            last_exc = e
-            logger.warning(
-                "_tg_send_document: transient error %s on attempt %d for %s",
-                type(e).__name__,
-                attempt + 1,
-                filename,
-            )
-            if attempt < 2:
-                time.sleep(2**attempt)
-                continue
-    raise last_exc or RuntimeError(f"Failed to send document {filename}")
-
-
-def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
-    if not bot_token:
-        try:
-            import config as _config
-
-            bot_token = _config.BOT_TOKEN
-        except Exception:
-            bot_token = None
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": str(chat_id), "text": text}
-    # Retry on transient 429/5xx (Telegram flood control) with backoff —
-    # mirrors the sendDocument helper so background workers survive bursts.
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = requests.post(url, data=data, timeout=30)
-            if r.status_code in (429,) or r.status_code >= 500:
-                last_exc = requests.HTTPError(
-                    f"Telegram sendMessage failed: status={r.status_code}"
-                )
-                logger.warning(
-                    "_tg_send_message: HTTP %s on attempt %d (chat %s)",
-                    r.status_code,
-                    attempt + 1,
-                    chat_id,
-                )
-                if attempt < 2:
-                    time.sleep(2**attempt)
-                    continue
-                raise last_exc
-            r.raise_for_status()
-            return r.json()
-        except (
-            requests.ConnectionError,
-            requests.Timeout,
-        ) as e:
-            last_exc = e
-            logger.warning(
-                "_tg_send_message: transient error %s on attempt %d (chat %s)",
-                type(e).__name__,
-                attempt + 1,
-                chat_id,
-            )
-            if attempt < 2:
-                time.sleep(2**attempt)
-                continue
-    raise last_exc or RuntimeError(f"Failed to send message to chat {chat_id}")
-
-
-def _tg_edit_message_text(
-    chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown"
-):
-    """Edit a previously-sent message using Bot API's editMessageText.
-
-    Returns the API response dict on success, or None on failure (non-fatal).
-    """
-    try:
-        import config as _config
-
-        bot_token = _config.BOT_TOKEN
-    except Exception:
-        bot_token = None
-    if not bot_token:
-        return None
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
-        data = {
-            "chat_id": str(chat_id),
-            "message_id": message_id,
-            "text": text,
-            "parse_mode": parse_mode,
-        }
-        r = requests.post(url, data=data, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+    stage: str,
+    detail: str,
+    recv: int,
+    total: int,
+) -> None:
+    """Throttled live edit of the progress message (>=2% jumps or >=2s apart)."""
+    if not total:
+        return
+    if not state.get("msg_id"):
+        # No progress message to edit (the initial post failed); posting one
+        # here would create an untracked message that cleanup couldn't remove.
+        return
+    pct = int(recv * 100 / total)
+    now = time.time()
+    if pct - state["last_pct"] < 2 and now - state["last_t"] < 2.0:
+        return
+    state["last_pct"] = pct
+    state["last_t"] = now
+    new_id = _tg_send_progress(
+        chat_id,
+        filename,
+        stage,
+        detail=detail,
+        file_size=total,
+        message_id=state["msg_id"],
+        progress_pct=pct,
+    )
+    if new_id:
+        state["msg_id"] = new_id
 
 
 # ── Transient-message auto-delete helpers ────────────────────────
@@ -347,31 +96,6 @@ def _tg_edit_message_text(
 
 QUEUED_MSG_KEY = "queued_msg:{}"
 QUEUED_MSG_TTL = 7 * 24 * 3600
-
-
-def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
-    """Delete a message via the Bot API ``deleteMessage`` endpoint (best-effort)."""
-    if not message_id:
-        return False
-    try:
-        import config as _config
-
-        bot_token = _config.BOT_TOKEN
-    except Exception:
-        bot_token = None
-    if not bot_token:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
-        r = requests.post(
-            url,
-            data={"chat_id": str(chat_id), "message_id": message_id},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return True
-    except Exception:
-        return False
 
 
 def _append_queued_message(job_id: str, message_id: int) -> None:
@@ -506,86 +230,6 @@ def _short_error(exc: BaseException, limit: int = 120) -> str:
     return first
 
 
-# ── Progress bar helpers (HTTP-based, no PTB needed) ─────────────
-# These mirror bot.py's send_progress_update but use raw HTTP calls
-# so they work in background workers without a PTB bot instance.
-
-_PROGRESS_STAGES = {
-    "queued": 0,
-    "downloading": 25,
-    "downloaded": 50,
-    "thumbnailing": 65,
-    "compressing": 80,
-    "sending": 90,
-    "done": 100,
-}
-
-
-def _tg_send_progress(
-    chat_id: int,
-    filename: str,
-    stage: str,
-    detail: str = "",
-    file_size: int = 0,
-    message_id: int | None = None,
-    progress_pct: int | None = None,
-) -> int | None:
-    """Send or update a progress message with a visual Unicode progress bar.
-
-    Args:
-        chat_id: Telegram chat ID to send to.
-        filename: Display name of the file being processed.
-        stage: Key from _PROGRESS_STAGES dict (e.g. "downloading", "done").
-        detail: Optional detail line (e.g. "40.2 MB downloaded").
-        file_size: Total file size for display.
-        message_id: If provided, *edit* the existing message instead of sending new.
-        progress_pct: Optional live byte percentage (0-100) that overrides the
-            stage's fixed percentage (used while downloading via userbot).
-
-    Returns:
-        message_id of the sent/edited message, or None on failure.
-    """
-    pct = _PROGRESS_STAGES.get(stage, 0)
-    if progress_pct is not None:
-        pct = max(0, min(100, int(progress_pct)))
-    bar = _build_progress_bar(pct)
-
-    size_str = _format_size(file_size) if file_size else ""
-    emojis = {
-        "queued": "\u23f3",
-        "downloading": "\U0001f4e5",
-        "downloaded": "\u2705",
-        "thumbnailing": "\U0001f5bc\ufe0f",
-        "compressing": "\U0001f5dc\ufe0f",
-        "sending": "\U0001f4e4",
-        "done": "\u2705",
-    }
-    emoji = emojis.get(stage, "\u2753")
-
-    lines = [
-        f"\U0001f4c1 **{filename}**",
-        f"{bar} `{pct}%`",
-    ]
-    if size_str:
-        lines.insert(1, f"\U0001f4cf Size: `{size_str}`")
-    if detail:
-        lines.append(f"\n{emoji} {detail}")
-
-    text = "\n".join(lines)
-
-    try:
-        if message_id:
-            _tg_edit_message_text(chat_id, message_id, text)
-            return message_id
-        else:
-            res = _tg_send_message(None, chat_id, text)
-            if res and "result" in res and "message_id" in res["result"]:
-                return res["result"]["message_id"]
-            return None
-    except Exception:
-        return None
-
-
 import config  # noqa: E402
 from tools import (  # noqa: E402
     compress_pdf,
@@ -596,9 +240,17 @@ from tools import (  # noqa: E402
     extract_pdf_metadata,
     is_supported_format,
 )
-from utils.progress_tracker import (  # noqa: E402
-    _build_progress_bar,
-    _format_size,
+from utils.progress_tracker import _format_size  # noqa: E402
+from utils.storage import _TransferProgress  # noqa: E402,F401
+from utils.tg_http import (  # noqa: E402
+    _tg_delete_message,
+    _tg_download_to_bytes,
+    _tg_download_to_file,
+    _tg_forward_message,
+    _tg_get_file_path,
+    _tg_send_document,
+    _tg_send_message,
+    _tg_send_progress,
 )
 
 try:
@@ -612,10 +264,13 @@ except Exception:
     upload_file_and_get_presigned_url = None
 
 
-def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
+def _download_s3_key_to_file(
+    key: str, dest_path: str, progress_callback=None
+) -> bool:
     """Download an S3 object (by key) to local `dest_path` using boto3.
 
-    Returns True on success, False on failure.
+    ``progress_callback(current_bytes, total_bytes)`` (optional) receives LIVE
+    transfer progress.  Returns True on success, False on failure.
     """
     try:
         import boto3
@@ -650,10 +305,21 @@ def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
         logger.exception("Failed to create S3 client for download of %s", key)
         return False
 
+    # Resolve the object size once so the live callback can show a percentage.
+    _s3_total = 0
+    if progress_callback is not None:
+        try:
+            _s3_total = int(
+                s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+            )
+        except Exception:  # nosec B110 - unknown size still shows bytes
+            _s3_total = 0
+    _cb = _TransferProgress(_s3_total, progress_callback)
+
     try:
         # ensure parent dir exists
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        s3.download_file(bucket, key, dest_path)
+        s3.download_file(bucket, key, dest_path, Callback=_cb)
         return True
     except Exception:
         logger.exception("Failed to download S3 key %s to %s", key, dest_path)
@@ -670,6 +336,7 @@ def _download_s3_key_to_file(key: str, dest_path: str) -> bool:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             fh.write(chunk)
+                            _cb(len(chunk))
             return True
         except Exception:
             logger.exception(
@@ -747,10 +414,31 @@ def process_input_key_job(job: dict) -> dict:
         if job_id and _progress_msg_id:
             _append_queued_message(job_id, _progress_msg_id)
 
+        # Live byte progress while pulling the object from S3 (throttled edits).
+        _live_state = {
+            "msg_id": _progress_msg_id,
+            "last_pct": -1,
+            "last_t": 0.0,
+        }
+
+        def _live_download_cb(recv: int, total: int) -> None:
+            _live_edit(
+                _live_state,
+                chat_id,
+                filename,
+                "downloading",
+                f"\U0001f4e5 Downloading from S3: "
+                f"{_format_size(recv)} / {_format_size(total)}",
+                recv,
+                total,
+            )
+
         dl_start = time.time()
         ok = False
         if input_key:
-            ok = _download_s3_key_to_file(input_key, dest_path)
+            ok = _download_s3_key_to_file(
+                input_key, dest_path, progress_callback=_live_download_cb
+            )
         if not ok:
             # Notify the user and clear the transient progress + "Queued..."
             # messages instead of leaving a stale "failed" bar in the chat.
@@ -985,6 +673,25 @@ def process_input_key_job(job: dict) -> dict:
             file_size=os.path.getsize(upload_path),
             message_id=_progress_msg_id,
         )
+        # Live upload progress while the result is pushed to Telegram.
+        _send_state = {
+            "msg_id": _progress_msg_id,
+            "last_pct": -1,
+            "last_t": 0.0,
+        }
+
+        def _live_send_cb(recv: int, total: int) -> None:
+            _live_edit(
+                _send_state,
+                chat_id,
+                filename,
+                "sending",
+                f"\U0001f4e4 Sending to Telegram: "
+                f"{_format_size(recv)} / {_format_size(total)}",
+                recv,
+                total,
+            )
+
         send_start = time.time()
         with (
             open(upload_path, "rb") as f_doc,
@@ -997,6 +704,7 @@ def process_input_key_job(job: dict) -> dict:
                 filename,
                 thumb_fileobj=f_thumb,
                 caption="Here is your file with an auto-generated cover preview.",
+                progress_callback=_live_send_cb,
             )
         send_elapsed = time.time() - send_start
         out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -1137,7 +845,7 @@ def process_document_job(
 ) -> dict | None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
 
-    When the Bot API cannot handle a large file (>50MB), falls back through:
+    When the Bot API cannot handle a large file (>20MB download cap), falls back through:
       1. File_id-based userbot download (fast, but may fail for modern file_id formats)
       2. Chat-based userbot download ``download_bytes_via_userbot(chat_id, message_id)``
       3. BigFilePipeline (S3 pipeline + separate worker) — only if S3 is configured
@@ -1227,30 +935,34 @@ def process_document_job(
     # Flag for userbot fallback data (large files that Bot API can't handle)
     _userbot_dl_data = None
     # Calculate upload limit BEFORE getFile so the early size check can use it
+    # Upload cap (sendDocument) gates compression/send decisions; the Bot API
+    # DOWNLOAD cap (getFile) gates whether getFile is even attempted.
     upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+    download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
     # Track progress message ID so we can edit the same message
     _progress_msg_id = None
     try:
-        # 1) getFile (path) — with multi-level userbot fallback for files >50MB
+        # 1) getFile (path) — with multi-level userbot fallback for files >20MB
         #
         # Fallback chain when Bot API cannot handle the file:
         #   a) File_id-based download  — fastest, but broken for v4+ file_ids
         #   b) Chat-based download     — works reliably with any file_id
         #   d) Relay group             — forward to relay, then userbot download
-        #   c) BigFilePipeline         — S3 pipeline + separate worker
+        #   c) BigFilePipeline         — S3 pipeline + separate worker (files >20MB)
         #
         gf_start = time.time()
         try:
-            # If we already know the file exceeds Bot API limits, skip getFile entirely
+            # If we already know the file exceeds the Bot API DOWNLOAD limit,
+            # skip getFile entirely (getFile would 400 "file is too big").
             _skip_bot_api = (
-                file_size and upload_limit and file_size > upload_limit
+                file_size and download_limit and file_size > download_limit
             )
             if _skip_bot_api:
                 logger.info(
-                    "file_size=%d > upload_limit=%d; skipping Bot API getFile, "
+                    "file_size=%d > download_limit=%d; skipping Bot API getFile, "
                     "proceeding directly to userbot download",
                     file_size,
-                    upload_limit,
+                    download_limit,
                 )
                 raise requests.HTTPError("Bad Request: file is too big")
             # For small files going through Bot API: send initial progress
@@ -1266,7 +978,13 @@ def process_document_job(
             # "Queued..." confirmation.
             if _rq_job_id and _progress_msg_id:
                 _append_queued_message(_rq_job_id, _progress_msg_id)
-            tg_file_path = _tg_get_file_path(None, file_id)
+            tg_file_path = _tg_get_file_path(
+                None,
+                file_id,
+                diagnostic=lambda meta: _set_io_keys(
+                    file_id, output_meta=meta
+                ),
+            )
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
@@ -1316,9 +1034,12 @@ def process_document_job(
                     "msg_id": _progress_msg_id,
                     "last_pct": -1,
                     "last_t": 0.0,
+                    "phase": None,
                 }
 
-                def _userbot_progress_cb(recv: int, total: int) -> None:
+                def _userbot_progress_cb(
+                    recv: int, total: int, phase: str = "download"
+                ) -> None:
                     if not total:
                         return
                     if not _ub_state["msg_id"]:
@@ -1326,6 +1047,12 @@ def process_document_job(
                         # posting one here would create an untracked message
                         # that cleanup couldn't remove on cancel.
                         return
+                    if phase != _ub_state.get("phase"):
+                        # Phase switch (e.g. userbot download -> S3 upload):
+                        # reset the throttle state so the new phase's bar
+                        # climbs from 0 instead of being suppressed.
+                        _ub_state["phase"] = phase
+                        _ub_state["last_pct"] = -1
                     pct = int(recv * 100 / total)
                     now = time.time()
                     if (
@@ -1335,14 +1062,21 @@ def process_document_job(
                         return
                     _ub_state["last_pct"] = pct
                     _ub_state["last_t"] = now
+                    if phase == "s3_upload":
+                        detail = (
+                            f"\U0001f4e4 Uploading to S3: "
+                            f"{_format_size(recv)} / {_format_size(total)}"
+                        )
+                    else:
+                        detail = (
+                            f"\U0001f4e5 Downloading: "
+                            f"{_format_size(recv)} / {_format_size(total)}"
+                        )
                     new_id = _tg_send_progress(
                         chat_id,
                         filename,
                         "downloading",
-                        detail=(
-                            f"\U0001f4e5 {_format_size(recv)} / "
-                            f"{_format_size(total)}"
-                        ),
+                        detail=detail,
                         file_size=total,
                         message_id=_ub_state["msg_id"],
                         progress_pct=pct,
@@ -1427,7 +1161,6 @@ def process_document_job(
                         if relay_chat:
                             relay_chat_id = int(relay_chat)
                             bot_token = config.BOT_TOKEN
-                            fwd_url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
                             _progress_msg_id = _tg_send_progress(
                                 chat_id,
                                 filename,
@@ -1442,18 +1175,13 @@ def process_document_job(
                                 message_id,
                                 relay_chat_id,
                             )
-                            fwd_resp = requests.post(
-                                fwd_url,
-                                data={
-                                    "chat_id": relay_chat_id,
-                                    "from_chat_id": chat_id,
-                                    "message_id": message_id,
-                                },
-                                timeout=30,
+                            fwd_msg_id = _tg_forward_message(
+                                bot_token,
+                                relay_chat_id,
+                                chat_id,
+                                message_id,
                             )
-                            if fwd_resp.status_code == 200:
-                                fwd_data = fwd_resp.json()
-                                fwd_msg_id = fwd_data["result"]["message_id"]
+                            if fwd_msg_id:
                                 logger.info(
                                     "Forwarded to relay %s/%s, trying userbot download",
                                     relay_chat_id,
@@ -1482,10 +1210,7 @@ def process_document_job(
                                         "relay download returned empty"
                                     )
                             else:
-                                raise Exception(
-                                    f"forwardMessage failed: {fwd_resp.status_code} "
-                                    f"{fwd_resp.text[:200]}"
-                                )
+                                raise Exception("forwardMessage failed")
                         else:
                             logger.info(
                                 "RELAY_CHAT_ID not configured, skipping fallback (d)"
@@ -1527,6 +1252,7 @@ def process_document_job(
                                 file_unique_id=file_unique_id,
                                 original_filename=filename,
                                 user_id=user_id,
+                                progress_callback=_userbot_progress_cb,
                             )
                         )
                         if _result and _result.ok:
@@ -1622,16 +1348,32 @@ def process_document_job(
                 except Exception:
                     bot_token = None
 
-                with requests.get(
-                    f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}",
-                    stream=True,
-                    timeout=60,
-                ) as r:
-                    r.raise_for_status()
-                    with open(file_path, "wb") as fh:
-                        for chunk in r.iter_content(chunk_size=64 * 1024):
-                            if chunk:
-                                fh.write(chunk)
+                _bot_dl_state = {
+                    "msg_id": _progress_msg_id,
+                    "last_pct": -1,
+                    "last_t": 0.0,
+                }
+                _bot_dl_total = file_size or 0
+
+                def _bot_dl_cb(recv: int, total: int) -> None:
+                    _live_edit(
+                        _bot_dl_state,
+                        chat_id,
+                        filename,
+                        "downloading",
+                        f"\U0001f4e5 Downloading via Bot API: "
+                        f"{_format_size(recv)} / {_format_size(total)}",
+                        recv,
+                        total,
+                    )
+
+                _tg_download_to_file(
+                    bot_token,
+                    tg_file_path,
+                    file_path,
+                    total=_bot_dl_total,
+                    progress_callback=_bot_dl_cb,
+                )
             dl_elapsed = time.time() - dl_start
             out_meta.setdefault("durations", {})["download_ms"] = int(
                 dl_elapsed * 1000
