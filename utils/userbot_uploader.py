@@ -86,15 +86,22 @@ async def _send_with_telethon(
 
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
+        # Telethon's send_file() does not forward part_size_kb to
+        # upload_file(), so upload explicitly with the desired chunk size and
+        # pass the returned InputFile handle (send_file accepts pre-uploaded
+        # handles directly).
+        file_handle = await client.upload_file(
+            file_path,
+            file_name=os.path.basename(file_path),
+            part_size_kb=TELETHON_UPLOAD_PART_SIZE_KB,
+            progress_callback=progress_callback,
+        )
         kwargs = {
-            "file": file_path,
+            "file": file_handle,
             "caption": caption or "",
-            "part_size_kb": TELETHON_UPLOAD_PART_SIZE_KB,
         }
         if thumb_path and os.path.exists(thumb_path):
             kwargs["thumb"] = thumb_path
-        if progress_callback is not None:
-            kwargs["progress_callback"] = progress_callback
         await client.send_file(target, **kwargs)
         logger.info("userbot: Telethon sent file %s to %s", file_path, target)
         return True

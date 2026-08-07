@@ -42,6 +42,33 @@ TELETHON_DOWNLOAD_PART_SIZE_KB = int(
     os.getenv("TELETHON_DOWNLOAD_PART_SIZE_KB", "512")
 )
 
+
+async def _download_media_with_part_size(client, msg, **kwargs):
+    """download_media() with a custom chunk size.
+
+    Telethon's ``download_media()`` does not accept ``part_size_kb`` (only
+    ``download_file()`` does), so resolve the media's input location and route
+    through ``download_file()`` when a part size was requested.  Falls back to
+    a plain ``download_media()`` if the location cannot be resolved.
+    """
+    part_size_kb = kwargs.pop("part_size_kb", None)
+    location = None
+    if part_size_kb:
+        try:
+            from telethon.utils import get_input_location
+
+            location = get_input_location(msg)
+        except Exception:
+            # Could not resolve the media location (e.g. missing access hash);
+            # fall back to download_media() below.
+            location = None
+    if location is not None:
+        kwargs["part_size_kb"] = part_size_kb
+        # Transfer errors propagate to the caller's retry logic instead of
+        # triggering a redundant full re-download via download_media().
+        return await client.download_file(location, **kwargs)
+    return await client.download_media(msg, **kwargs)
+
 # Check if PyMuPDF (fitz) is available for PDF validation after download.
 # If not installed, PDF validation is skipped and all downloads are accepted
 # at the file-exists level (graceful degradation — the error will surface later
@@ -830,7 +857,7 @@ async def _download_with_telethon(
                         # This is more portable than Telethon's native timeout param
                         # (which was added in a later version).
                         await asyncio.wait_for(
-                            client.download_media(msg, **kwargs),
+                            _download_media_with_part_size(client, msg, **kwargs),
                             timeout=DOWNLOAD_TOTAL_TIMEOUT,
                         )
                         if (
@@ -896,7 +923,7 @@ async def _download_with_telethon(
                                 kwargs["progress_callback"] = progress_callback
                             # Wrap in asyncio.wait_for to enforce total-download timeout
                             await asyncio.wait_for(
-                                client.download_media(m, **kwargs),
+                                _download_media_with_part_size(client, m, **kwargs),
                                 timeout=DOWNLOAD_TOTAL_TIMEOUT,
                             )
                             if (
@@ -1602,7 +1629,7 @@ async def download_bytes_via_userbot(
                                             progress_callback
                                         )
                                     await asyncio.wait_for(
-                                        _client.download_media(msg, **kwargs),
+                                        _download_media_with_part_size(_client, msg, **kwargs),
                                         timeout=TELETHON_DOWNLOAD_TIMEOUT,
                                     )
                                     data = buf.getvalue()

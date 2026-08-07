@@ -16,6 +16,16 @@ C. Calls to known-async Telegram library methods (python-telegram-bot,
    Pyrogram, Telethon) that are never awaited, when the receiver variable
    looks like a client/bot/message object.  Only unambiguous method names
    are checked so the report stays free of false positives.
+D. Calls that pass ``part_size_kb=`` to ``download_media()``.  Telethon's
+   ``download_media()`` does not accept that keyword (only
+   ``download_file()`` does) and crashes every download with
+   ``TypeError: download_media() got an unexpected keyword argument
+   'part_size_kb'`` — a past production incident this check prevents from
+   regressing.  Note: this only catches *literal* ``part_size_kb=``
+   keywords; a ``**kwargs`` splat that smuggles the key through a dict is
+   invisible to a pure AST check (route part sizes through
+   ``download_file()`` or the ``_download_media_with_part_size`` helper
+   instead).
 
 The exit code is 0 when no findings are reported and 1 otherwise, so the
 script can gate CI on pull requests.  Under GitHub Actions the findings
@@ -407,6 +417,32 @@ def _check_kwargs(path, node, params, kwarg_var, findings, lines) -> None:
             )
 
 
+def _check_download_media_kwargs(path, node, func, findings, lines) -> None:
+    """Flag ``part_size_kb=`` passed to any ``download_media()`` call.
+
+    Telethon 1.42's ``download_media()`` has no ``part_size_kb`` parameter
+    (only ``download_file()`` does), so this pattern crashes at runtime with
+    ``TypeError: ... got an unexpected keyword argument 'part_size_kb'``.
+    Use ``telethon.utils.get_input_location`` + ``download_file`` instead.
+    """
+    if func.attr != "download_media":
+        return
+    for kw in node.keywords:
+        if kw.arg != "part_size_kb":
+            continue  # also skips **kwargs splats (kw.arg is None)
+        code = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        findings.append(
+            (
+                path,
+                node.lineno,
+                "download-media-kwarg",
+                "download_media() does not accept part_size_kb=; use "
+                "get_input_location() + download_file() instead",
+                code,
+            )
+        )
+
+
 def _check_lib_async(path, node, func, parents, findings, lines) -> None:
     if not _unawaited(node, parents):
         return
@@ -470,6 +506,7 @@ def _check_module(path, src, tree, funcs, classes, imports, findings) -> None:
                     )
         if isinstance(func, ast.Attribute):
             _check_lib_async(path, node, func, parents, findings, lines)
+            _check_download_media_kwargs(path, node, func, findings, lines)
 
 
 def main(argv: list[str]) -> int:

@@ -1005,9 +1005,21 @@ async def main():
             try:
                 for attempt in range(3):
                     try:
-                        await client_instance.download_media(
-                            msg, file=tmp, part_size_kb=512
-                        )
+                        # download_media() has no part_size_kb param; resolve
+                        # the location and use download_file() for larger chunks
+                        location = None
+                        try:
+                            from telethon.utils import get_input_location
+
+                            location = get_input_location(msg)
+                        except Exception:
+                            location = None
+                        if location is not None:
+                            await client_instance.download_file(
+                                location, file=tmp, part_size_kb=512
+                            )
+                        else:
+                            await client_instance.download_media(msg, file=tmp)
                         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                             logger.info(
                                 "Downloaded incoming media to %s (attempt %d)",

@@ -479,6 +479,33 @@ def _cleanup_after_success(
         _delete_queued_messages(job_id)
 
 
+def _cleanup_after_failure(
+    chat_id: int,
+    job_id: str | None,
+    progress_msg_id: int | None,
+    skip_queued_delete: bool = False,
+) -> None:
+    """Delete transient progress + "Queued..." messages after a failed job.
+
+    Mirrors ``_cleanup_after_success`` so a failure leaves no stale progress
+    bar or confirmation in the chat; the caller sends its own user-facing
+    error notification.
+    """
+    _cleanup_after_success(chat_id, job_id, progress_msg_id, skip_queued_delete)
+
+
+def _short_error(exc: BaseException, limit: int = 120) -> str:
+    """First line of an exception message, truncated for a Telegram reply."""
+    try:
+        text = str(exc).strip()
+    except Exception:  # nosec B110
+        text = ""
+    first = (text.splitlines() or ["unknown error"])[0]
+    if len(first) > limit:
+        first = first[: limit - 3] + "..."
+    return first
+
+
 # ── Progress bar helpers (HTTP-based, no PTB needed) ─────────────
 # These mirror bot.py's send_progress_update but use raw HTTP calls
 # so they work in background workers without a PTB bot instance.
@@ -491,7 +518,6 @@ _PROGRESS_STAGES = {
     "compressing": 80,
     "sending": 90,
     "done": 100,
-    "failed": 0,
 }
 
 
@@ -502,6 +528,7 @@ def _tg_send_progress(
     detail: str = "",
     file_size: int = 0,
     message_id: int | None = None,
+    progress_pct: int | None = None,
 ) -> int | None:
     """Send or update a progress message with a visual Unicode progress bar.
 
@@ -512,11 +539,15 @@ def _tg_send_progress(
         detail: Optional detail line (e.g. "40.2 MB downloaded").
         file_size: Total file size for display.
         message_id: If provided, *edit* the existing message instead of sending new.
+        progress_pct: Optional live byte percentage (0-100) that overrides the
+            stage's fixed percentage (used while downloading via userbot).
 
     Returns:
         message_id of the sent/edited message, or None on failure.
     """
     pct = _PROGRESS_STAGES.get(stage, 0)
+    if progress_pct is not None:
+        pct = max(0, min(100, int(progress_pct)))
     bar = _build_progress_bar(pct)
 
     size_str = _format_size(file_size) if file_size else ""
@@ -528,7 +559,6 @@ def _tg_send_progress(
         "compressing": "\U0001f5dc\ufe0f",
         "sending": "\U0001f4e4",
         "done": "\u2705",
-        "failed": "\u274c",
     }
     emoji = emojis.get(stage, "\u2753")
 
@@ -668,13 +698,9 @@ def process_input_key_job(job: dict) -> dict:
     unique_key = job_id
 
     # Honour /canceljob: abort before downloading when the flag is set.
+    # (/canceljob's "\u2705 Cancelled..." reply is the user-facing
+    # confirmation, so no lingering extra message is posted here.)
     if _job_cancelled(job_id) or _pipeline_cancel_flag(job_id):
-        try:
-            _tg_send_message(
-                None, chat_id, "\u274c Job cancelled by user."
-            )
-        except Exception:  # nosec B110
-            pass
         return {"status": "cancelled"}
 
     # write input metadata for observability
@@ -716,19 +742,24 @@ def process_input_key_job(job: dict) -> dict:
             detail="\U0001f4e5 Downloading from S3 storage...",
             file_size=job.get("size") or job.get("file_size") or 0,
         )
+        # Register the live progress message in the job's auto-delete record so
+        # /canceljob removes it alongside the "Large file queued..." message.
+        if job_id and _progress_msg_id:
+            _append_queued_message(job_id, _progress_msg_id)
 
         dl_start = time.time()
         ok = False
         if input_key:
             ok = _download_s3_key_to_file(input_key, dest_path)
         if not ok:
-            _tg_send_progress(
+            # Notify the user and clear the transient progress + "Queued..."
+            # messages instead of leaving a stale "failed" bar in the chat.
+            _tg_send_message(
+                None,
                 chat_id,
-                filename,
-                "failed",
-                detail="\u274c Failed to download from S3 storage.",
-                message_id=_progress_msg_id,
+                "\u274c Failed to download from S3 storage.",
             )
+            _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
             out_meta.setdefault("status", "download_failed")
             out_meta.setdefault("error", "s3_download_failed")
             out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -931,6 +962,9 @@ def process_input_key_job(job: dict) -> dict:
                 )
             except Exception:  # nosec B110
                 pass
+            # The job is over: clear the transient progress + "Queued..."
+            # messages (the notification above remains as feedback).
+            _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
             out_meta.setdefault("status", "too_large_after_compress")
             out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
             out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -1002,13 +1036,9 @@ def process_input_key_job(job: dict) -> dict:
 
     except Exception as e:
         logger.exception("Error processing input_key job %s", job_id)
-        _tg_send_progress(
-            chat_id,
-            filename,
-            "failed",
-            detail="\u274c Processing failed. Check server logs for details.",
-            message_id=_progress_msg_id,
-        )
+        # Clear the transient progress + "Queued..." messages; the standalone
+        # error notification below remains as the failure message.
+        _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
         out_meta.setdefault("status", "error")
         out_meta.setdefault("error", str(e))
         out_meta.setdefault("timestamps", {})["finished"] = int(time.time())
@@ -1020,7 +1050,9 @@ def process_input_key_job(job: dict) -> dict:
             _tg_send_message(
                 None,
                 chat_id,
-                "\u274c Error processing uploaded file. Check server logs for details.",
+                "\u274c Error processing uploaded file: "
+                f"{_short_error(e)}\n"
+                "Check server logs for details.",
             )
         except Exception:  # nosec B110
             pass
@@ -1151,6 +1183,14 @@ def process_document_job(
             )
         except Exception:  # nosec B110
             pass
+        # No progress message was posted yet, but the "Queued your file..."
+        # confirmation must still be cleaned up.
+        _cleanup_after_failure(
+            chat_id,
+            _rq_job_id,
+            None,
+            skip_queued_delete=_skip_queued_delete,
+        )
         return {"error": "unsupported format", "filename": filename, "mime": mime}
 
     # persist input metadata
@@ -1221,6 +1261,11 @@ def process_document_job(
                 detail="\U0001f4e5 Downloading via Bot API...",
                 file_size=file_size or 0,
             )
+            # Register the live progress message in the job's auto-delete record
+            # so /canceljob (and any cleanup) can remove it too, not just the
+            # "Queued..." confirmation.
+            if _rq_job_id and _progress_msg_id:
+                _append_queued_message(_rq_job_id, _progress_msg_id)
             tg_file_path = _tg_get_file_path(None, file_id)
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
@@ -1243,19 +1288,67 @@ def process_document_job(
                     "Bot API cannot handle large file; trying userbot fallback chain"
                 )
 
-                # Send initial progress message
+                # Send initial progress message (edits the existing one posted
+                # before the Bot API attempt, so the user sees a single message)
                 _progress_msg_id = _tg_send_progress(
                     chat_id,
                     filename,
                     "downloading",
                     detail="\U0001f504 Connecting to userbot...",
                     file_size=file_size or 0,
+                    message_id=_progress_msg_id,
                 )
+                # Register the live progress message in the auto-delete record
+                # (covers the skipped-Bot-API path too, where the message above
+                # is a fresh post rather than an edit).
+                if _rq_job_id and _progress_msg_id:
+                    _append_queued_message(_rq_job_id, _progress_msg_id)
 
                 import asyncio as _asyncio
 
                 _ub_data = None
                 _fallback_errors = []
+
+                # Live byte progress during userbot downloads: a throttled
+                # callback that edits the progress message with real
+                # bytes-downloaded numbers (edits >=2s apart or >=2% jumps).
+                _ub_state = {
+                    "msg_id": _progress_msg_id,
+                    "last_pct": -1,
+                    "last_t": 0.0,
+                }
+
+                def _userbot_progress_cb(recv: int, total: int) -> None:
+                    if not total:
+                        return
+                    if not _ub_state["msg_id"]:
+                        # No progress message to edit (initial post failed);
+                        # posting one here would create an untracked message
+                        # that cleanup couldn't remove on cancel.
+                        return
+                    pct = int(recv * 100 / total)
+                    now = time.time()
+                    if (
+                        pct - _ub_state["last_pct"] < 2
+                        and now - _ub_state["last_t"] < 2.0
+                    ):
+                        return
+                    _ub_state["last_pct"] = pct
+                    _ub_state["last_t"] = now
+                    new_id = _tg_send_progress(
+                        chat_id,
+                        filename,
+                        "downloading",
+                        detail=(
+                            f"\U0001f4e5 {_format_size(recv)} / "
+                            f"{_format_size(total)}"
+                        ),
+                        file_size=total,
+                        message_id=_ub_state["msg_id"],
+                        progress_pct=pct,
+                    )
+                    if new_id:
+                        _ub_state["msg_id"] = new_id
 
                 # ── Fallback (a): file_id-based download ──
                 try:
@@ -1264,7 +1357,11 @@ def process_document_job(
                     )
 
                     _ub_data = _asyncio.run(
-                        _dl_file_id(file_id, user_id=user_id)
+                        _dl_file_id(
+                            file_id,
+                            progress_callback=_userbot_progress_cb,
+                            user_id=user_id,
+                        )
                     )
                     if _ub_data and len(_ub_data) > 0:
                         logger.info(
@@ -1301,7 +1398,12 @@ def process_document_job(
                             message_id,
                         )
                         _ub_data = _asyncio.run(
-                            _dl_chat(chat_id, message_id, user_id=user_id)
+                            _dl_chat(
+                                chat_id,
+                                message_id,
+                                progress_callback=_userbot_progress_cb,
+                                user_id=user_id,
+                            )
                         )
                         if _ub_data and len(_ub_data) > 0:
                             logger.info(
@@ -1365,6 +1467,7 @@ def process_document_job(
                                     _dl_relay(
                                         relay_chat_id,
                                         fwd_msg_id,
+                                        progress_callback=_userbot_progress_cb,
                                         user_id=user_id,
                                     )
                                 )
@@ -1474,15 +1577,9 @@ def process_document_job(
                         message_id,
                         "; ".join(_fallback_errors),
                     )
-                    # Update progress to failed with details
-                    _tg_send_progress(
-                        chat_id,
-                        filename,
-                        "failed",
-                        detail="\u274c All download methods failed. Check server logs.",
-                        file_size=file_size or 0,
-                        message_id=_progress_msg_id,
-                    )
+                    # The transient progress message is deleted by the outer
+                    # exception handler, which also sends the error
+                    # notification (with the failure reason).
                     raise _gf_err from RuntimeError(
                         f"All {len(_fallback_errors)} fallbacks exhausted: "
                         + "; ".join(_fallback_errors)
@@ -1739,6 +1836,14 @@ def process_document_job(
                     )
                 except Exception:  # nosec B110
                     pass
+                # The job is over: clear the transient progress + "Queued..."
+                # messages (the notification above remains as feedback).
+                _cleanup_after_failure(
+                    chat_id,
+                    _rq_job_id,
+                    _progress_msg_id,
+                    skip_queued_delete=_skip_queued_delete,
+                )
                 out_meta.setdefault("status", "too_large_after_compress")
                 out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
                 out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -1752,14 +1857,11 @@ def process_document_job(
 
             # ── Honour /canceljob while the job is in flight ──
             if _job_cancelled(_cancel_check_id):
-                _tg_send_progress(
-                    chat_id,
-                    filename,
-                    "cancelled",
-                    detail="\u274c Job cancelled by user.",
-                    file_size=orig_size or 0,
-                    message_id=_progress_msg_id,
-                )
+                # Auto-delete the transient progress + "Queued..." messages
+                # (the /canceljob command reply already confirmed the
+                # cancellation to the user).
+                _tg_delete_message(chat_id, _progress_msg_id)
+                _delete_queued_messages(_cancel_check_id)
                 out_meta.setdefault("status", "cancelled")
                 out_meta.setdefault("timestamps", {})["finished"] = int(
                     time.time()
@@ -2022,6 +2124,12 @@ def process_document_job(
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:  # nosec B110
                             pass
+                        _cleanup_after_failure(
+                            chat_id,
+                            _rq_job_id,
+                            _progress_msg_id,
+                            skip_queued_delete=_skip_queued_delete,
+                        )
                         return {"error": "file too large after compression"}
                 finally:
                     shutil.rmtree(td, ignore_errors=True)
@@ -2085,22 +2193,22 @@ def process_document_job(
             _set_io_keys(unique_key, output_meta=out_meta)
         except Exception:  # nosec B110
             pass
-        # Update progress to failed if a progress message exists
-        try:
-            _tg_send_progress(
-                chat_id,
-                filename,
-                "failed",
-                detail="\u274c Processing failed. Check server logs for details.",
-                message_id=_progress_msg_id,
-            )
-        except Exception:  # nosec B110
-            pass
+        # Auto-delete the transient progress + "Queued..." messages now that
+        # the job failed; the standalone error notification below remains as
+        # the user-facing failure message.
+        _cleanup_after_failure(
+            chat_id,
+            _rq_job_id,
+            _progress_msg_id,
+            skip_queued_delete=_skip_queued_delete,
+        )
         try:
             _tg_send_message(
                 None,
                 chat_id,
-                "\u274c Error processing file in background. Check server logs for details.",
+                "\u274c Error processing file in background: "
+                f"{_short_error(e)}\n"
+                "Check server logs for details.",
             )
         except Exception:  # nosec B110
             pass
