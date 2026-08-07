@@ -57,13 +57,18 @@ async def _download_media_with_part_size(client, msg, **kwargs):
         try:
             from telethon.utils import get_input_location
 
-            location = get_input_location(msg)
+            # get_input_location() returns a (dc_id, location) tuple — unpack
+            # it and hand download_file() the bare InputFileLocation (with the
+            # DC hint).  Passing the tuple whole raises
+            # "Cannot cast tuple to any kind of InputFileLocation".
+            dc_id, location = get_input_location(msg)
         except Exception:
             # Could not resolve the media location (e.g. missing access hash);
             # fall back to download_media() below.
             location = None
     if location is not None:
         kwargs["part_size_kb"] = part_size_kb
+        kwargs["dc_id"] = dc_id
         # Transfer errors propagate to the caller's retry logic instead of
         # triggering a redundant full re-download via download_media().
         return await client.download_file(location, **kwargs)

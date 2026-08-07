@@ -1011,12 +1011,16 @@ async def main():
                         try:
                             from telethon.utils import get_input_location
 
-                            location = get_input_location(msg)
+                            # get_input_location() returns a (dc_id, location)
+                            # tuple — unpack it; download_file() needs the bare
+                            # InputFileLocation (passing the tuple whole raises
+                            # "Cannot cast tuple to any kind of InputFileLocation").
+                            dc_id, location = get_input_location(msg)
                         except Exception:
                             location = None
                         if location is not None:
                             await client_instance.download_file(
-                                location, file=tmp, part_size_kb=512
+                                location, file=tmp, part_size_kb=512, dc_id=dc_id
                             )
                         else:
                             await client_instance.download_media(msg, file=tmp)
