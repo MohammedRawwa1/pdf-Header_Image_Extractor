@@ -21,9 +21,16 @@ from fastapi import (
     HTTPException,
     Request,
 )
-from telegram import BotCommand, InputFile, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -99,7 +106,10 @@ from utils.tg_http import (  # noqa: E402
     _tg_send_document,
 )
 from utils.url_validation import _validate_url_safe  # noqa: E402
-from utils.userbot_uploader import send_file_via_userbot  # noqa: E402
+from utils.userbot_downloader import _get_bot_user_id  # noqa: E402
+from utils.userbot_uploader import (  # noqa: E402
+    send_file_via_userbot_with_fallback,
+)
 
 # ── Logging configuration (must be before any logger usage) ──
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -313,12 +323,13 @@ async def _send_with_upload_progress(
 
     ``chat_id`` is used for the **progress message** (shown in the DM with the bot).
     ``target_chat_id`` controls where the actual file is uploaded.
-    When ``target_chat_id`` is ``'me'``, the file lands in the userbot's Saved Messages.
-    Defaults to ``chat_id`` when not provided (backward-compatible).
+    Delivery call sites pass the bot's user ID (``BOT_USER_ID``) so large
+    results land in the user's DM with the bot; ``'me'`` sends to the userbot's
+    Saved Messages.  Defaults to ``chat_id`` when not provided (backward-compatible).
 
     Creates a progress task, shows 'uploading' status with a progress bar,
-    then calls send_file_via_userbot with a progress callback that updates
-    the task in real time. On success, marks the task as completed and
+    then calls send_file_via_userbot_with_fallback with a progress callback
+    that updates the task in real time. On success, marks the task as completed and
     DELETES the progress message (same auto-removal as the worker flow).
     On failure, marks as failed and re-raises.
 
@@ -345,7 +356,10 @@ async def _send_with_upload_progress(
         _upload_target = (
             target_chat_id if target_chat_id is not None else chat_id
         )
-        success = await send_file_via_userbot(
+        # Shared helper: retries to the userbot's Saved Messages ('me') when
+        # the send to the preferred target fails (e.g. the userbot can't
+        # resolve the bot's entity — a known production failure).
+        success = await send_file_via_userbot_with_fallback(
             chat_id=_upload_target,
             file_path=file_path,
             caption=caption,
@@ -723,7 +737,8 @@ async def _userbot_download_fallback(
                         pass
                 queued_msg = await msg.reply_text(
                     f"Large file ({file_size // (1024 * 1024)} MB) queued for processing.\n"
-                    f"Job: {_ingest.job_id[:8]}... You'll receive the result when ready."
+                    f"Job: {_ingest.job_id[:8]}... You'll receive the result when ready.",
+                    reply_markup=_queued_cancel_kb(user_id, _ingest.job_id),
                 )
                 _store_queued_message(
                     _ingest.job_id,
@@ -880,6 +895,13 @@ BOT_TOKEN = config.BOT_TOKEN
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is not set")
     raise SystemExit("Missing BOT_TOKEN")
+
+# Numeric user ID of the bot (first segment of BOT_TOKEN).  Used as the
+# userbot's delivery target for large results (> Bot API upload cap) so the
+# file lands in the user's DM with the bot instead of the userbot's own
+# Saved Messages ("me").  None when the token is malformed — callers then
+# fall back to "me".
+BOT_USER_ID: int | None = _get_bot_user_id()
 
 WEBHOOK_URL = config.WEBHOOK_URL
 USE_POLLING = config.USE_POLLING
@@ -1134,7 +1156,8 @@ async def handle_document(
             if ok:
                 queued_msg = await msg.reply_text(
                     "Queued your file for background processing; I'll send the result when ready.\n"
-                    f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+                    f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                    reply_markup=_queued_cancel_kb(user_id, ok),
                 )
                 _store_queued_message(
                     ok,
@@ -1268,7 +1291,7 @@ async def handle_document(
                 filename=filename,
                 file_size=_dl_size,
                 loop=_loop,
-                target_chat_id="me",
+                target_chat_id=BOT_USER_ID or "me",
                 task=task,
                 progress_msg_id=progress_msg_id,
             )
@@ -1383,7 +1406,7 @@ async def handle_document(
                             filename=filename,
                             file_size=_fb_size,
                             loop=_loop,
-                            target_chat_id="me",
+                            target_chat_id=BOT_USER_ID or "me",
                             task=_dl_task,
                             progress_msg_id=_dl_msg_id,
                         )
@@ -1525,7 +1548,8 @@ async def handle_photo(
         if ok:
             queued_msg = await msg.reply_text(
                 "Queued your photo for background processing; I'll send the result when ready.\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(user_id, ok),
             )
             _store_queued_message(
                 ok,
@@ -1618,7 +1642,7 @@ async def handle_photo(
                 filename=filename,
                 file_size=_ph_size,
                 loop=_loop,
-                target_chat_id="me",
+                target_chat_id=BOT_USER_ID or "me",
                 task=task,
                 progress_msg_id=progress_msg_id,
             )
@@ -1719,7 +1743,7 @@ async def handle_photo(
                             filename=filename,
                             file_size=_ph_fb_size,
                             loop=_loop,
-                            target_chat_id="me",
+                            target_chat_id=BOT_USER_ID or "me",
                             task=_dl_task,
                             progress_msg_id=_dl_msg_id,
                         )
@@ -1805,7 +1829,7 @@ async def cmd_start(
         "• /login — connect **your** Telethon account (large files)\n"
         "• /loginpyro — connect **your** Pyrogram account (large files)\n"
         "• /loginstatus — check **your** session health\n"
-        "• /canceljob <id> — cancel a queued/in-flight job\n"
+        "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n"
         "• /startbatch + /endbatch — process multiple files at once\n\n"
         "_Sessions are per-user: nobody else can use your account._",
         parse_mode="Markdown",
@@ -1825,7 +1849,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📄 Core\n"
         "• /start — welcome & quick start\n"
         "• /help — this help\n"
-        "• /status — bot status\n\n"
+        "• /status — bot status, queue depth & your active/queued jobs\n\n"
         "🔐 Your sessions (per-user)\n"
         "• /login [phone] — connect your Telethon account\n"
         "• /loginpyro [phone] — connect your Pyrogram account\n"
@@ -1835,7 +1859,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /clearflood — reset a stuck login flow\n"
         "• /cancel — cancel an active login flow\n\n"
         "📦 Jobs\n"
-        "• /canceljob <id> — cancel a queued/in-flight job\n\n"
+        "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n"
+        "• /cancelall — cancel all of your jobs (asks for confirmation)\n\n"
         "🗂 Batch\n"
         "• /startbatch — start collecting forwarded files\n"
         "• /endbatch — process the collected batch\n"
@@ -1851,17 +1876,317 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text)
 
 
+def _ago(ts: float | None) -> str:
+    """Human-readable age for a unix timestamp, e.g. '2m ago'."""
+    if not ts:
+        return ""
+    s = int(time.time() - ts)
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _job_user_id(job: object) -> int | None:
+    """Attribute an RQ job to the requesting user (job.meta first, then args).
+
+    Covers every enqueue path from bot.py / telethon_ingest:
+      process_input_key_job(job_dict), process_document_job(...),
+      process_url_job(...), process_document_batch_job(...).
+    """
+    try:
+        meta_uid = (getattr(job, "meta", None) or {}).get("user_id")
+        if meta_uid:
+            return meta_uid
+        args = list(getattr(job, "args", None) or [])
+        if not args:
+            return None
+        if isinstance(args[0], dict):  # process_input_key_job(job dict)
+            return args[0].get("user_id")
+        if len(args) >= 9 and isinstance(args[8], int):  # process_document_job
+            return args[8]
+        if len(args) >= 7 and isinstance(args[6], dict):  # forward_info fallback
+            return args[6].get("user_id")
+        if len(args) >= 4 and isinstance(args[3], int):  # process_url_job
+            return args[3]
+        if len(args) >= 3 and isinstance(args[2], int):  # batch job
+            return args[2]
+    except Exception:  # nosec B110 - best-effort
+        pass
+    return None
+
+
+def _job_label(job: object) -> str:
+    """Best-effort human label for a job: filename or a short description."""
+    try:
+        args = list(getattr(job, "args", None) or [])
+        if not args:
+            return getattr(job, "func_name", "job") or "job"
+        if isinstance(args[0], dict):  # pipeline job dict
+            return (
+                args[0].get("original_filename")
+                or args[0].get("filename")
+                or "pipeline job"
+            )
+        if len(args) >= 2:
+            if isinstance(args[1], list):  # batch job
+                return f"batch ({len(args[1])} items)"
+            if isinstance(args[1], str):
+                if args[1].startswith(("http://", "https://")):  # URL job
+                    return str(args[2]) if len(args) >= 3 else "URL job"
+                if len(args[1]) > 40:  # Telegram file_id -> document job
+                    return str(args[2]) if len(args) >= 3 else "document"
+    except Exception:  # nosec B110 - best-effort
+        pass
+    return getattr(job, "func_name", "job") or "job"
+
+
+def _job_cancel_id(job: object, fallback: str) -> str:
+    """Cancel token for a job: pipeline dicts carry their own ``job_id``.
+
+    RQ jobs use their registry id; BigFilePipeline jobs use the id inside the
+    job dict (that is what /canceljob resolves via ``_cancel_pipeline_job``).
+    """
+    try:
+        args = list(getattr(job, "args", None) or [])
+        if args and isinstance(args[0], dict):
+            return str(args[0].get("job_id") or fallback)
+    except Exception:  # nosec B110
+        pass
+    return fallback
+
+
+def _cancel_all_kb() -> InlineKeyboardMarkup:
+    """The one-tap cancel-all button shown under the /status job list."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "\U0001f5d1 Cancel all my jobs", callback_data="cancelall"
+                )
+            ]
+        ]
+    )
+
+
+def _cancel_status_reply(
+    uid: int | None, header: str
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Build a post-cancel reply: ``header`` + refreshed /status summary.
+
+    Shared by the /cancelall and /canceljob confirm flows so a successful
+    cancel shows the updated job list instead of a one-line confirmation.
+    The cancel-all button is re-attached when the caller still has
+    queued/running jobs; ``None`` is returned otherwise. Callers that EDIT a
+    message must substitute an empty keyboard for ``None`` — Telegram keeps
+    the existing inline keyboard when ``reply_markup`` is omitted, so plain
+    ``None`` would leave stale confirmation buttons behind. New replies can
+    pass ``None`` as-is (never send an empty keyboard on sendMessage: it
+    serializes to ``{}``, which Telegram rejects for a required field).
+    """
+    summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
+    text = header + "\n\n" + summary
+    kb = _cancel_all_kb() if has_jobs else None
+    return text, kb
+
+
+def _queued_cancel_kb(user_id: int | None, job_id: str) -> InlineKeyboardMarkup | None:
+    """The ❌ cancel button attached to a 'Queued...' reply.
+
+    ``callback_data`` is ``canceljob:<user_id>:<job_id>`` — tapping it arms a
+    same-user-bound confirmation (see ``handle_canceljob_arm_callback``), so
+    a user can cancel a just-queued job without typing /canceljob. Returns
+    None when the owner or job id is missing (no button then).
+    """
+    if not user_id or not job_id:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel this job",
+                    callback_data=f"canceljob:{user_id}:{job_id[:32]}",
+                )
+            ]
+        ]
+    )
+
+
+def _build_status_summary(uid: int | None, is_owner: bool) -> str:
+    """Per-user /status summary: global depth + the caller's jobs.
+
+    Reads the RQ registries directly from Redis using the NON-decoding
+    connection (same requirement as the RQ worker — job payloads are pickled
+    raw bytes). The per-user section is private to the caller; the owner
+    additionally sees a breakdown of who else is loading the bot.
+    """
+    try:
+        from rq.job import Job
+
+        from utils.redis_client import get_sync_redis_raw
+
+        r = get_sync_redis_raw()
+        if not r:
+            return (
+                "Bot: active\n(Redis unreachable \u2014 job summary unavailable)",
+                False,
+            )
+
+        now = time.time()
+
+        def _list_ids(key: str) -> list[str]:
+            try:
+                return [
+                    m.decode() if isinstance(m, bytes) else str(m)
+                    for m in r.lrange(key, 0, -1)
+                ]
+            except Exception:  # nosec B110
+                return []
+
+        def _zset_since(
+            key: str, since: float, num: int = 50
+        ) -> list[tuple[str, float]]:
+            """Most recent ``num`` members of a registry zset (id, score)."""
+            try:
+                return [
+                    (m.decode() if isinstance(m, bytes) else str(m), float(score))
+                    for m, score in r.zrevrangebyscore(
+                        key, now, since, start=0, num=num, withscores=True
+                    )
+                ]
+            except Exception:  # nosec B110
+                return []
+
+        def _zcount(key: str, since: float) -> int:
+            """Full registry count since a timestamp (for the header line)."""
+            try:
+                return int(r.zcount(key, since, now))
+            except Exception:  # nosec B110
+                return 0
+
+        def _fetch(job_id: str):
+            try:
+                return Job.fetch(job_id, connection=r)
+            except Exception:  # nosec B110 - job may have expired mid-scan
+                return None
+
+        queued_ids = _list_ids("rq:queue:default")
+        started = _zset_since("rq:wip:default", 0)
+        finished_24h = _zset_since("rq:finished:default", now - 86400)
+        failed_24h = _zset_since("rq:failed:default", now - 86400)
+        finished_total = _zcount("rq:finished:default", now - 86400)
+        failed_total = _zcount("rq:failed:default", now - 86400)
+
+        per_user: dict[int, dict[str, int]] = {}
+        mine: list[tuple[str, str, str, float | None]] = []  # (label, status, cancel_id, ts)
+
+        def _tally(job_id: str, status: str, ts: float | None = None) -> None:
+            job = _fetch(job_id)
+            if job is None:
+                return
+            u = _job_user_id(job)
+            if u is not None:
+                bucket = per_user.setdefault(
+                    u, {"queued": 0, "running": 0, "finished": 0, "failed": 0}
+                )
+                bucket[status] += 1
+                if u == uid and status in ("queued", "running"):
+                    mine.append(
+                        (_job_label(job), status, _job_cancel_id(job, job_id), ts)
+                    )
+
+        for jid in queued_ids:
+            _tally(jid, "queued")
+        for jid, ts in started:
+            _tally(jid, "running", ts)
+        for jid, ts in finished_24h:
+            _tally(jid, "finished", ts)
+        for jid, ts in failed_24h:
+            _tally(jid, "failed", ts)
+
+        lines = ["\u2705 Bot: active"]
+        parts = []
+        if queued_ids:
+            parts.append(f"{len(queued_ids)} queued")
+        if started:
+            parts.append(f"{len(started)} running")
+        if finished_total:
+            parts.append(f"{finished_total} finished (24h)")
+        if failed_total:
+            parts.append(f"{failed_total} failed (24h)")
+        lines.append(" \u00b7 ".join(parts) if parts else "No jobs in the last 24h")
+
+        if uid is not None:
+            b = per_user.get(uid, {})
+            lines.append("")
+            if mine:
+                lines.append("\U0001f464 Your jobs:")
+                for label, status, cid, ts in mine:
+                    icon = "\U0001f4e5" if status == "queued" else "\U0001f504"
+                    age = f" \u00b7 {_ago(ts)}" if ts else ""
+                    lines.append(
+                        f"\u2022 {icon} {label} \u2014 {status}{age}"
+                        f" \u00b7 `/canceljob {cid[:8]}`"
+                    )
+            else:
+                lines.append("\U0001f464 Your jobs: none active/queued")
+            extra = []
+            if b.get("finished"):
+                extra.append(f"{b['finished']} finished")
+            if b.get("failed"):
+                extra.append(f"{b['failed']} failed")
+            if extra:
+                lines.append("   (" + ", ".join(extra) + " in the last 24h)")
+
+        if is_owner and uid is not None:
+            others = [
+                (u, b)
+                for u, b in per_user.items()
+                if u != uid and (b["queued"] or b["running"])
+            ]
+            if others:
+                lines.append("")
+                lines.append("\U0001f465 Other users (queued/running):")
+                for u, b in sorted(
+                    others, key=lambda x: -(x[1]["queued"] + x[1]["running"])
+                ):
+                    lines.append(
+                        f"\u2022 {u}: {b['queued']} queued, {b['running']} running"
+                    )
+
+        # Show the cancel button when the user has something to cancel: any
+        # queued/running RQ job OR an active inline progress task.
+        has_jobs = bool(mine) or any(
+            getattr(t, "user_id", None) == uid
+            for t in progress_tracker.tasks.values()
+        )
+        return "\n".join(lines), has_jobs
+    except Exception:
+        logger.exception("Failed to build /status summary")
+        return "Bot: active", False
+
+
 async def cmd_status(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    uid = getattr(update.effective_user, "id", None)
+    logger.info("/status: user_id=%s", uid)
     await _track_user_session(update, "/status")
-    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+    if not config.is_user_allowed(uid):
         await update.effective_message.reply_text(
             "Access denied. This bot is private."
         )
         return
-    # Minimal, non-sensitive status reply
-    await update.effective_message.reply_text("active")
+    # Per-user summary: global queue depth + the caller's active/queued jobs.
+    # Falls back to "Bot: active" if Redis is unreachable.
+    summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
+    if has_jobs:
+        await update.effective_message.reply_text(summary, reply_markup=_cancel_all_kb())
+    else:
+        await update.effective_message.reply_text(summary)
 
 
 async def cmd_setwebhook(
@@ -1976,7 +2301,7 @@ async def cmd_setcommands(
     commands = [
         BotCommand("start", "Start interaction with the bot"),
         BotCommand("help", "Show help and available commands"),
-        BotCommand("status", "Get bot status"),
+        BotCommand("status", "Bot status: queue & your jobs"),
         BotCommand("login", "Login your Telethon userbot"),
         BotCommand("loginpyro", "Login your Pyrogram userbot"),
         BotCommand("loginstatus", "Check your live session health"),
@@ -1987,7 +2312,8 @@ async def cmd_setcommands(
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
-        BotCommand("canceljob", "Cancel a queued/in-flight job"),
+        BotCommand("canceljob", "Cancel a job (asks to confirm)"),
+        BotCommand("cancelall", "Cancel all of your jobs"),
         BotCommand("cancel", "Cancel an active login flow"),
         BotCommand("setcommands", "(owner) Update the command list"),
         BotCommand("sessionstatus", "(owner) Check userbot session health"),
@@ -2070,7 +2396,8 @@ async def cmd_endbatch(
             await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
             queued_msg = await update.effective_message.reply_text(
                 f"Queued batch with {len(items)} items for processing.\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(user_id, ok),
             )
             _store_queued_message(
                 ok,
@@ -2674,9 +3001,72 @@ def _wipe_job_redis_keys(job_id: str) -> None:
         pass
 
 
-def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
+def _resolve_rq_job(job_id: str, chat_id: int | None, r=None):
+    """Resolve an RQ job id/prefix to a Job the caller may cancel, or None.
+
+    Non-mutating — used by the /canceljob confirmation prompt to describe
+    what WOULD be cancelled, and by ``_cancel_rq_job`` which then performs
+    the actual cancel. Ownership is enforced here: the job is only returned
+    when it originated from ``chat_id`` (enqueues pass chat_id as the first
+    positional argument).
+
+    ``r`` is an optional raw Redis connection to reuse; ``_cancel_rq_job``
+    passes its own so the fetch and the cancel flag share ONE connection
+    (a transiently-broken second connection must not silently lose the
+    flag). When omitted a fresh connection is opened.
+    """
+    try:
+        from rq.job import Job
+
+        from utils.redis_client import get_sync_redis_raw
+
+        # A full RQ id is 32-char uuid4 hex; refuse unusably short inputs so
+        # prefix matching can never accidentally match everything ("").
+        if len(job_id) < 4:
+            return None
+        if r is None:
+            r = get_sync_redis_raw()
+        if not r:
+            return None
+        job = None
+        try:
+            job = Job.fetch(job_id, connection=r)
+        except Exception:  # nosec B110 - fall through to prefix resolution
+            pass
+        if job is None:
+            for candidate in _rq_ids_by_prefix(r, job_id):
+                try:
+                    cand = Job.fetch(candidate, connection=r)
+                except Exception:  # nosec B110
+                    continue
+                if cand is None:
+                    continue
+                # Ownership: only cancel jobs from the caller's chat — keep
+                # looking if the first prefix candidate belongs to someone else.
+                c_args = list(getattr(cand, "args", None) or [])
+                if chat_id is not None and (not c_args or c_args[0] != chat_id):
+                    continue
+                job = cand
+                break
+        if job is None:
+            return None
+        # All enqueued jobs pass chat_id as the first positional argument.
+        args = list(getattr(job, "args", None) or [])
+        if chat_id is not None and (not args or args[0] != chat_id):
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _cancel_rq_job(job_id: str, chat_id: int | None) -> str | None:
     """Best-effort cancel of an RQ job by id, but only when the job originated
     from the caller's chat (ownership check for shared group chats).
+
+    Returns the RESOLVED full job id on success (RQ ids are 36-char dashed
+    UUIDs, but the queued-button payload embeds ``job_id[:32]`` — callers
+    must clean up Redis keys under the full id, not the possibly-truncated
+    input) or None on failure.
 
     Robust against a known RQ 2.x race: ``job.cancel()`` can raise
     ``ValueError: Execution {id} not found in Redis`` when the job is in the
@@ -2689,7 +3079,7 @@ def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
     registries manually and marked canceled so it can never run.
     """
     try:
-        from rq.job import Job, JobStatus
+        from rq.job import JobStatus
 
         from utils.redis_client import get_sync_redis_raw
 
@@ -2698,20 +3088,17 @@ def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
         # would UnicodeDecodeError on Job.fetch and silently fail to cancel).
         r = get_sync_redis_raw()
         if not r:
-            return False
-        job = Job.fetch(job_id, connection=r)
-        # All enqueued jobs pass chat_id as the first positional argument.
-        args = list(getattr(job, "args", None) or [])
-        if chat_id is not None and (not args or args[0] != chat_id):
-            return False
+            return None
+        job = _resolve_rq_job(job_id, chat_id, r)
+        if job is None:
+            return None
+        # The flag uses the RESOLVED full id (prefix inputs resolve to it).
+        full_id = getattr(job, "id", None) or job_id
 
         # Belt: the worker aborts jobs on this flag, so set it BEFORE RQ
         # bookkeeping — a failed job.cancel() must never lose the cancel.
-        # Use the SAME raw connection that just succeeded at Job.fetch (a
-        # second connection may be in a transient error state and would
-        # silently lose the flag inside the best-effort guard below).
         try:
-            r.setex(f"cancel:{job_id}", 3600, "1")
+            r.setex(f"cancel:{full_id}", 3600, "1")
         except Exception:  # nosec B110 - flag is best-effort
             pass
 
@@ -2722,11 +3109,11 @@ def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
             # Wrong-type errors are impossible (queue is a list, wip is a
             # zset); each key op is independently guarded.
             try:
-                r.lrem(f"rq:queue:{origin}", 0, job_id)
+                r.lrem(f"rq:queue:{origin}", 0, full_id)
             except Exception:  # nosec B110
                 pass
             try:
-                r.zrem(f"rq:wip:{origin}", job_id)
+                r.zrem(f"rq:wip:{origin}", full_id)
             except Exception:  # nosec B110
                 pass
             try:
@@ -2735,31 +3122,88 @@ def _cancel_rq_job(job_id: str, chat_id: int | None) -> bool:
                 pass
             # Re-set the abort flag in case the belt attempt above failed.
             try:
-                r.setex(f"cancel:{job_id}", 3600, "1")
+                r.setex(f"cancel:{full_id}", 3600, "1")
             except Exception:  # nosec B110
                 pass
 
         try:
             job.cancel()
-            return True
+            return full_id
         except Exception:  # nosec B110 - RQ 2.x execution-registry race etc.
             _drop_from_registries()
-            return True
+            return full_id
     except Exception:
+        return None
+
+
+def _rq_ids_by_prefix(r, prefix: str) -> list[str]:
+    """Job ids in the default queue/started registries starting with ``prefix``."""
+    found = []
+    try:
+        for m in r.lrange("rq:queue:default", 0, -1):
+            s = m.decode() if isinstance(m, bytes) else str(m)
+            if s.startswith(prefix):
+                found.append(s)
+    except Exception:  # nosec B110
+        pass
+    try:
+        for m, _ in r.zrange("rq:wip:default", 0, -1, withscores=True):
+            s = m.decode() if isinstance(m, bytes) else str(m)
+            if s.startswith(prefix):
+                found.append(s)
+    except Exception:  # nosec B110
+        pass
+    return found
+
+
+def _pipeline_hash_cancellable(h: dict) -> bool:
+    """True when a ``pdf:job:<id>`` hash is a live, not-yet-cancelled job.
+
+    Shared by ``_cancel_pipeline_job`` and ``_pipeline_job_exists`` so the
+    terminal/already-cancelled guards can't drift.  Terminal statuses are
+    written by the worker on completion/cancel/failure (``done``,
+    ``s3_fallback``, ``too_large``, ``cancelled``, ``failed``, ``error``); a
+    hash whose cancel flag is already set has nothing new to cancel.
+    """
+    _st = h.get("status") or h.get(b"status") or ""
+    if isinstance(_st, bytes):
+        _st = _st.decode()
+    if _st in (
+        "done",
+        "s3_fallback",
+        "too_large",
+        "cancelled",
+        "failed",
+        "error",
+    ):
         return False
+    if (h.get("cancel") or h.get(b"cancel") or "") in ("1", b"1"):
+        return False
+    return True
 
 
 def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
-    """Best-effort cancel of a BigFilePipeline job: set the cancel flag and
-    remove any queued entry from the ``pdf:jobs`` Redis list — but only for
-    jobs owned by ``user_id`` (multi-user isolation)."""
+    """Best-effort cancel of a BigFilePipeline job — queued or in-flight.
+
+    Sets the ``pdf:job:<id>`` hash ``cancel`` flag and removes any queued
+    entry from the ``pdf:jobs`` Redis list — but only for jobs owned by
+    ``user_id`` (multi-user isolation).  Jobs already popped by the pipeline
+    worker are cancelled via the hash flag (the worker's mid-flight checks
+    abort the S3 download); ownership is verified against the ``user_id``
+    field stored on the hash at enqueue time.
+    """
     removed = False
+    flag_set = False
     try:
         from utils.job_queue import JOB_LIST
 
         r = get_sync_redis()
         if not r:
             return False
+        # Refuse unusably short inputs so prefix matching can't match everything.
+        if len(job_id) < 4:
+            return False
+        # 1) Queued: remove the entry from pdf:jobs (ownership via job dict).
         raw_items = r.lrange(JOB_LIST, 0, -1)
         for item in raw_items:
             raw = item.decode() if isinstance(item, bytes) else item
@@ -2767,11 +3211,13 @@ def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
                 d = json.loads(raw)
             except Exception:  # nosec B112 - skip non-JSON entries in the queue
                 continue
-            if d.get("job_id") == job_id and (
+            _dj = str(d.get("job_id") or "")
+            if (_dj == job_id or _dj.startswith(job_id)) and (
                 user_id is None or d.get("user_id") == user_id
             ):
                 try:
                     r.hset(f"pdf:job:{job_id}", mapping={"cancel": "1"})
+                    flag_set = True
                 except Exception:  # nosec B110
                     pass
                 try:
@@ -2779,15 +3225,184 @@ def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
                     removed = True
                 except Exception:  # nosec B110
                     pass
-        return removed
+        # 2) In-flight: the job was already popped; verify ownership via the
+        #    pdf:job:<id> hash (user_id stored by enqueue_job) and set the
+        #    cancel flag so the worker's mid-flight checks abort it.  Terminal
+        #    statuses and an already-set cancel flag mean nothing NEW to cancel.
+        if not removed and user_id is not None:
+            try:
+                h = r.hgetall(f"pdf:job:{job_id}") or {}
+            except Exception:  # nosec B110
+                h = {}
+            if h:
+                if not _pipeline_hash_cancellable(h):
+                    return removed or flag_set
+                howner = h.get("user_id") or h.get(b"user_id") or ""
+                if isinstance(howner, bytes):
+                    howner = howner.decode()
+                if str(howner) == str(user_id):
+                    try:
+                        r.hset(f"pdf:job:{job_id}", mapping={"cancel": "1"})
+                        flag_set = True
+                    except Exception:  # nosec B110
+                        pass
+        return removed or flag_set
     except Exception:
         return False
+
+
+def _pipeline_job_exists(job_id: str, user_id: int | None) -> bool:
+    """Non-mutating: does a BigFilePipeline job owned by ``user_id`` exist?
+
+    Mirrors ``_cancel_pipeline_job``'s matching (exact or prefix, with the
+    per-user ownership gate) but performs no cancellation — used by the
+    /canceljob confirmation prompt.  Also recognizes in-flight jobs via the
+    ``pdf:job:<id>`` hash (ownership from the stored ``user_id`` field).
+    """
+    if len(job_id) < 4:
+        return False
+    try:
+        from utils.job_queue import JOB_LIST
+
+        r = get_sync_redis()
+        if not r:
+            return False
+        for item in r.lrange(JOB_LIST, 0, -1):
+            raw = item.decode() if isinstance(item, bytes) else item
+            try:
+                d = json.loads(raw)
+            except Exception:  # nosec B112 - skip non-JSON entries in the queue
+                continue
+            _dj = str(d.get("job_id") or "")
+            if (_dj == job_id or _dj.startswith(job_id)) and (
+                user_id is None or d.get("user_id") == user_id
+            ):
+                return True
+        # In-flight check: the hash exists (job was popped) and is owned by
+        # the caller (user_id stored by enqueue_job).  Terminal statuses and
+        # already-cancelled hashes are not offered for cancellation.
+        try:
+            h = r.hgetall(f"pdf:job:{job_id}") or {}
+        except Exception:  # nosec B110
+            h = {}
+        if h:
+            if not _pipeline_hash_cancellable(h):
+                return False
+            howner = h.get("user_id") or h.get(b"user_id") or ""
+            if isinstance(howner, bytes):
+                howner = howner.decode()
+            if user_id is None or str(howner) == str(user_id):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _owned_progress_task_id(job_id: str, uid: int | None) -> str | None:
+    """Resolve a progress task id/prefix owned by ``uid``, or None.
+
+    Shared by the /canceljob arm (describe what WOULD be cancelled) and the
+    actual cancel so both agree on the ownership rule.
+    """
+    task_id = progress_tracker.find_task_id_by_prefix(job_id)
+    if not task_id:
+        return None
+    task = progress_tracker.get_task(task_id)
+    if task is not None and getattr(task, "user_id", None) == uid:
+        return task_id
+    return None
+
+
+def _resolve_cancel_targets(
+    job_id: str, uid: int | None, chat_id: int | None
+) -> list[str]:
+    """Describe what /canceljob WOULD cancel for this caller (no mutation).
+
+    Returns the same action labels ``_do_cancel_job`` reports, so the
+    confirmation prompt never offers to cancel a dead job or someone else's.
+    """
+    targets = []
+    task_id = _owned_progress_task_id(job_id, uid)
+    if task_id:
+        targets.append(f"progress task `{task_id[:8]}`")
+    rq_job = _resolve_rq_job(job_id, chat_id)
+    if rq_job is not None:
+        # Label with the FULL resolved id (RQ ids are 36-char dashed UUIDs;
+        # the caller may have passed a truncated 32-char prefix).
+        targets.append(f"RQ job `{getattr(rq_job, 'id', None) or job_id}`")
+    if _pipeline_job_exists(job_id, uid):
+        targets.append(f"pipeline job `{job_id}`")
+    return targets
+
+
+async def _do_cancel_job(
+    job_id: str, uid: int | None, chat_id: int | None
+) -> tuple[bool, list[str]]:
+    """Perform the actual /canceljob cancellation (progress, RQ, pipeline).
+
+    Mirrors the pre-confirmation cancel body: every path enforces its own
+    ownership gate (progress by user_id, RQ by chat_id, pipeline by user_id).
+    On any owned hit, the per-job cleanup runs — auto-delete the "Queued..."
+    confirmations, wipe the io/queued_msg keys, re-arm the in-flight abort
+    flag — and ``(owned, action_labels)`` is returned.
+    """
+    actions = []
+    owned = False
+    # The Redis keys (queued_msg:<id>, cancel:<id>, ...) were stored under the
+    # FULL job id at queue time. The queued-button payload truncates RQ ids to
+    # 32 chars (they are 36-char dashed UUIDs), so cleanup must use the
+    # resolved full id — otherwise the "Queued..." message and keys survive.
+    cleanup_id: str | None = job_id
+
+    # 1) Inline progress task — only the owning user may cancel it
+    task_id = _owned_progress_task_id(job_id, uid)
+    if task_id:
+        owned = True
+        if await progress_tracker.cancel_task(task_id):
+            actions.append(f"progress task `{task_id[:8]}`")
+
+    # 2) RQ job (queued/started Bot API pipeline) — caller's chat only.
+    # _cancel_rq_job resolves the full id internally and returns it.
+    full_rq_id = await asyncio.to_thread(_cancel_rq_job, job_id, chat_id)
+    if full_rq_id:
+        owned = True
+        cleanup_id = full_rq_id
+        actions.append(f"RQ job `{full_rq_id}`")
+
+    # 3) BigFilePipeline job — caller's own only
+    if _cancel_pipeline_job(job_id, uid):
+        owned = True
+        actions.append(f"pipeline job `{job_id}`")
+
+    if owned and cleanup_id:
+        # Auto-delete the "Queued..." confirmation(s) for this job BEFORE
+        # wiping keys (the wipe would remove the queued_msg:<id> record that
+        # _delete_queued_messages needs to read the message ids).
+        try:
+            import tasks
+
+            tasks._delete_queued_messages(cleanup_id)
+        except Exception:  # nosec B110
+            pass
+        # Ownership verified: wipe Redis keys + set the in-flight abort flag
+        _wipe_job_redis_keys(cleanup_id)
+        try:
+            r = get_sync_redis()
+            if r:
+                r.setex(f"cancel:{cleanup_id}", 3600, "1")
+        except Exception:  # nosec B110
+            pass
+    return owned, actions
 
 
 async def cmd_canceljob(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Cancel a queued or in-flight job by id (progress task, RQ job, or pipeline job)."""
+    """Cancel a queued or in-flight job by id (progress task, RQ job, or pipeline job).
+
+    Requires an explicit confirmation — ``/canceljob <id> confirm`` or the
+    inline button — so an accidental cancel can't kill a job.
+    """
     await _track_user_session(update, "/canceljob")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
@@ -2797,63 +3412,551 @@ async def cmd_canceljob(
     args = context.args if hasattr(context, "args") else []
     if not args:
         await update.effective_message.reply_text(
-            "Usage: /canceljob <job_id>\n\n"
-            "You can find the job id in the 'Queued...' reply or the progress "
-            "message (ID: xxxxxxxx)."
+            "Usage: /canceljob <job_id> [confirm]\n\n"
+            "You can find the job id in the 'Queued...' reply, the progress "
+            "message (ID: xxxxxxxx), or the /status job list.\n"
+            "The first run asks for confirmation; append 'confirm' to skip it."
         )
         return
-    job_id = args[0].strip()
     uid = getattr(update.effective_user, "id", None)
     chat_id = update.effective_chat.id if update.effective_chat else None
 
-    actions = []
-    owned = False
+    if args[0].strip().lower() == "confirm":
+        if len(args) < 2:
+            await update.effective_message.reply_text(
+                "Usage: /canceljob <job_id> confirm"
+            )
+            return
+        job_id = args[1].strip()
+        owned, actions = await _do_cancel_job(job_id, uid, chat_id)
+        if owned:
+            header = "✅ Cancelled: " + ", ".join(actions)
+        else:
+            header = (
+                f"No active job found for you with id `{job_id}`. "
+                "It may have already finished."
+            )
+        # Append the refreshed /status summary (mirrors the confirm callback
+        # and cancel-all): the cancel-all button is offered when jobs remain.
+        text, kb = _cancel_status_reply(uid, header)
+        await update.effective_message.reply_text(text, reply_markup=kb)
+        return
 
-    # 1) Inline progress task — only the owning user may cancel it
-    task_id = progress_tracker.find_task_id_by_prefix(job_id)
-    if task_id:
-        task = progress_tracker.get_task(task_id)
-        if task is not None and task.user_id == uid:
-            owned = True
-            if await progress_tracker.cancel_task(task_id):
-                actions.append(f"progress task `{task_id[:8]}`")
-
-    # 2) RQ job (queued/started Bot API pipeline) — caller's chat only
-    if await asyncio.to_thread(_cancel_rq_job, job_id, chat_id):
-        owned = True
-        actions.append(f"RQ job `{job_id}`")
-
-    # 3) BigFilePipeline job — caller's own only
-    if _cancel_pipeline_job(job_id, uid):
-        owned = True
-        actions.append(f"pipeline job `{job_id}`")
-
-    if owned:
-        # Auto-delete the "Queued..." confirmation(s) for this job BEFORE
-        # wiping keys (the wipe would remove the queued_msg:<id> record that
-        # _delete_queued_messages needs to read the message ids).
-        try:
-            import tasks
-
-            tasks._delete_queued_messages(job_id)
-        except Exception:  # nosec B110
-            pass
-        # Ownership verified: wipe Redis keys + set the in-flight abort flag
-        _wipe_job_redis_keys(job_id)
-        try:
-            r = get_sync_redis()
-            if r:
-                r.setex(f"cancel:{job_id}", 3600, "1")
-        except Exception:  # nosec B110
-            pass
-        await update.effective_message.reply_text(
-            "✅ Cancelled: " + ", ".join(actions)
-        )
-    else:
+    job_id = args[0].strip()
+    targets = _resolve_cancel_targets(job_id, uid, chat_id)
+    if not targets:
         await update.effective_message.reply_text(
             f"No active job found for you with id `{job_id}`. "
             "It may have already finished."
         )
+        return
+    # Same-user-bound confirm/abort buttons (well under the 64-byte callback
+    # data limit: 17 + uid + ':' + job_id capped at 32 chars).
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Yes, cancel job",
+                    callback_data=f"canceljob_confirm:{uid}:{job_id[:32]}",
+                ),
+                InlineKeyboardButton(
+                    "❌ No",
+                    callback_data=f"canceljob_abort:{uid}:{job_id[:32]}",
+                ),
+            ]
+        ]
+    )
+    await update.effective_message.reply_text(
+        "⚠️ This will cancel:\n• "
+        + "\n• ".join(targets)
+        + "\n\nReply with /canceljob <id> confirm, or tap the button below.",
+        reply_markup=confirm_kb,
+    )
+
+
+async def _cancel_all_for(
+    uid: int | None, chat_id: int | None
+) -> tuple[int, int, int]:
+    """Cancel all of a user's jobs; returns (progress, RQ, pipeline) counts.
+
+    Only touches jobs owned by the caller: progress tasks by user_id, RQ jobs
+    by chat_id, and pipeline jobs by user_id — the same isolation as /canceljob.
+    """
+    tasks_cancelled = 0
+    rq_cancelled = 0
+    pipe_cancelled = 0
+    cleaned: list[str] = []
+
+    # 1) Inline progress tasks owned by this user
+    try:
+        task_ids = [
+            tid
+            for tid, t in progress_tracker.tasks.items()
+            if getattr(t, "user_id", None) == uid
+        ]
+        try:
+            r = get_sync_redis()
+            if r:
+                for key in r.scan_iter(
+                    f"{progress_tracker.PREFIX_PROGRESS}*", count=100
+                ):
+                    k = key.decode() if isinstance(key, bytes) else key
+                    tid = k[len(progress_tracker.PREFIX_PROGRESS):]
+                    if tid not in task_ids:
+                        t = progress_tracker.get_task(tid)
+                        if t is not None and getattr(t, "user_id", None) == uid:
+                            task_ids.append(tid)
+        except Exception:  # nosec B110 - Redis fallback is best-effort
+            pass
+        for tid in task_ids:
+            if await progress_tracker.cancel_task(tid):
+                tasks_cancelled += 1
+    except Exception:
+        logger.exception("cancelall: progress-task cancellation failed")
+
+    # 2) RQ jobs (queued + started) from the caller's chat
+    try:
+        from utils.redis_client import get_sync_redis_raw
+
+        r = get_sync_redis_raw()
+        if r:
+            candidates = []
+            for m in r.lrange("rq:queue:default", 0, -1):
+                candidates.append(m.decode() if isinstance(m, bytes) else str(m))
+            for m, _ in r.zrange("rq:wip:default", 0, -1, withscores=True):
+                candidates.append(m.decode() if isinstance(m, bytes) else str(m))
+            for cid in candidates:
+                if await asyncio.to_thread(_cancel_rq_job, cid, chat_id):
+                    rq_cancelled += 1
+                    cleaned.append(cid)
+    except Exception:
+        logger.exception("cancelall: RQ job cancellation failed")
+
+    # 3) BigFilePipeline jobs owned by this user
+    try:
+        from utils.job_queue import JOB_LIST
+
+        r = get_sync_redis()
+        if r:
+            for item in r.lrange(JOB_LIST, 0, -1):
+                raw = item.decode() if isinstance(item, bytes) else item
+                try:
+                    d = json.loads(raw)
+                except Exception:  # nosec B112 - skip non-JSON entries
+                    continue
+                if d.get("user_id") == uid and d.get("job_id"):
+                    _jid = str(d["job_id"])
+                    if _cancel_pipeline_job(_jid, uid):
+                        pipe_cancelled += 1
+                        cleaned.append(_jid)
+    except Exception:
+        logger.exception("cancelall: pipeline job cancellation failed")
+
+    # Mirror cmd_canceljob's per-job cleanup: delete the "Queued..."
+    # confirmation FIRST (the wipe would remove the queued_msg:<id> record
+    # it needs), then wipe bookkeeping keys, then re-arm the abort flag.
+    for cid in cleaned:
+        try:
+            import tasks  # noqa: PLC0415 - same pattern as cmd_canceljob
+
+            tasks._delete_queued_messages(cid)
+        except Exception:  # nosec B110
+            pass
+        _wipe_job_redis_keys(cid)
+        try:
+            r = get_sync_redis()
+            if r:
+                r.setex(f"cancel:{cid}", 3600, "1")
+        except Exception:  # nosec B110
+            pass
+
+    return tasks_cancelled, rq_cancelled, pipe_cancelled
+
+
+async def cmd_cancelall(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel ALL of the caller's queued/running jobs (progress, RQ, pipeline).
+
+    Requires an explicit ``/cancelall confirm`` so an accidental tap can't
+    wipe every job at once.
+    """
+    await _track_user_session(update, "/cancelall")
+    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
+    uid = getattr(update.effective_user, "id", None)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    args = context.args if hasattr(context, "args") else []
+    if not (args and args[0].strip().lower() == "confirm"):
+        confirm_kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "\u2705 Yes, cancel all",
+                        callback_data=f"cancelall_confirm:{uid}",
+                    )
+                ]
+            ]
+        )
+        await update.effective_message.reply_text(
+            "⚠️ This will cancel ALL of your own queued/running jobs "
+            "(documents, batches, URL jobs, and large-file pipeline jobs).\n\n"
+            "Reply with /cancelall confirm, or tap the button below.",
+            reply_markup=confirm_kb,
+        )
+        return
+    tasks_cancelled, rq_cancelled, pipe_cancelled = await _cancel_all_for(
+        uid, chat_id
+    )
+    total = tasks_cancelled + rq_cancelled + pipe_cancelled
+    if total:
+        bits = []
+        if rq_cancelled:
+            bits.append(f"{rq_cancelled} queued/running")
+        if pipe_cancelled:
+            bits.append(f"{pipe_cancelled} pipeline")
+        if tasks_cancelled:
+            bits.append(f"{tasks_cancelled} progress")
+        await update.effective_message.reply_text(
+            f"✅ Cancelled {total} of your job(s): " + ", ".join(bits) + "."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "✅ Nothing to cancel \u2014 you have no queued/running jobs."
+        )
+
+
+async def handle_cancelall_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """First tap on the /status cancel-all button: show a confirmation."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        await query.answer()
+    except Exception:  # nosec B110
+        pass
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "\u2705 Yes, cancel all",
+                    callback_data=f"cancelall_confirm:{uid}",
+                ),
+                InlineKeyboardButton(
+                    "\u274c No",
+                    callback_data=f"cancelall_abort:{uid}",
+                ),
+            ]
+        ]
+    )
+    try:
+        await query.edit_message_text(
+            "⚠️ Cancel ALL of your own queued/running jobs?",
+            reply_markup=confirm_kb,
+        )
+    except Exception:
+        logger.exception("cancelall: failed to show confirmation")
+
+
+async def handle_cancelall_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Second tap: actually cancel all of the armer's jobs (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        armer = int(str(query.data).split(":", 1)[1])
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can confirm.", show_alert=True
+        )
+        return
+    # Answer immediately so the button never shows as stuck while the
+    # blocking cancellation work runs; the result lands in the edit below.
+    try:
+        await query.answer()
+    except Exception:  # nosec B110
+        pass
+    await _track_user_session(update, "/cancelall")
+    chat_id = query.message.chat.id if query.message else None
+    try:
+        tasks_cancelled, rq_cancelled, pipe_cancelled = await _cancel_all_for(
+            uid, chat_id
+        )
+    except Exception:
+        logger.exception("cancelall: confirm-callback cancellation failed")
+        try:
+            await query.answer("Something went wrong", show_alert=True)
+        except Exception:  # nosec B110
+            pass
+        return
+    total = tasks_cancelled + rq_cancelled + pipe_cancelled
+    header = (
+        f"✅ Cancelled {total} of your job(s)."
+        if total
+        else "✅ Nothing was cancelled."
+    )
+    # Refresh the /status message with the updated job list instead of a
+    # one-line confirmation: after a successful cancel the list is (usually)
+    # empty, but any jobs that could not be cancelled stay visible with the
+    # cancel-all button re-attached. An empty keyboard (for None) removes the
+    # stale confirmation buttons from the message.
+    text, kb = _cancel_status_reply(uid, header)
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=kb if kb is not None else InlineKeyboardMarkup([]),
+        )
+    except Exception:
+        logger.exception("cancelall: failed to edit refreshed status message")
+
+
+async def handle_cancelall_stale_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Old unsuffixed cancelall buttons from before the same-user binding."""
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer(
+            "This button is outdated \u2014 run /cancelall instead", show_alert=True
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_cancelall_abort_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Second tap on the confirmation: keep everything (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        armer = int(str(query.data).split(":", 1)[1])
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can abort it.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "/cancelall")
+    try:
+        await query.answer("Nothing was cancelled")
+    except Exception:  # nosec B110
+        pass
+    try:
+        # Empty keyboard: clear the stale confirmation buttons.
+        await query.edit_message_text(
+            "✅ Nothing was cancelled.", reply_markup=InlineKeyboardMarkup([])
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_canceljob_arm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Tap on a 'Queued...' reply's ❌ Cancel button: arm the confirmation.
+
+    Same-user bound to the person who QUEUED the job (embedded in the
+    callback data) so another group member can't trigger the flow. Replies a
+    fresh confirmation message with ✅/❌ buttons, reusing the existing
+    canceljob_confirm/canceljob_abort handlers, and removes the queued
+    message's button so it can't be re-armed.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        parts = str(query.data).split(":", 2)
+        armer = int(parts[1])
+        job_id = parts[2]
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who queued this job can cancel it.",
+            show_alert=True,
+        )
+        return
+    if len(job_id) < 4:
+        await query.answer("Invalid job id", show_alert=True)
+        return
+    # Consistent with cmd_canceljob's arm: don't offer to cancel a job that
+    # already finished (the confirm handler would only say 'not found').
+    chat_id = query.message.chat.id if query.message else None
+    if not _resolve_cancel_targets(job_id, uid, chat_id):
+        try:
+            await query.answer(
+                "This job is no longer active.", show_alert=True
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    # Answer immediately so the button never shows as stuck.
+    try:
+        await query.answer()
+    except Exception:  # nosec B110
+        pass
+    await _track_user_session(update, "/canceljob")
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Yes, cancel job",
+                    callback_data=f"canceljob_confirm:{uid}:{job_id[:32]}",
+                ),
+                InlineKeyboardButton(
+                    "❌ No",
+                    callback_data=f"canceljob_abort:{uid}:{job_id[:32]}",
+                ),
+            ]
+        ]
+    )
+    # Remove the queued reply's button so it can't be re-armed (the confirm
+    # flow edits the NEW confirmation message, which is never deleted by the
+    # cancel cleanup — only the original 'Queued...' message is).
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+    except Exception as e:
+        logger.debug(
+            "canceljob: could not remove queued cancel button: %s", e
+        )
+    try:
+        if query.message is not None:
+            await query.message.reply_text(
+                f"⚠️ Cancel job `{job_id[:8]}`?", reply_markup=confirm_kb
+            )
+    except Exception:
+        logger.exception("canceljob: failed to show queue-cancel confirmation")
+
+
+async def handle_canceljob_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Confirm tap on the /canceljob prompt: cancel the single job (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        parts = str(query.data).split(":", 2)
+        armer = int(parts[1])
+        job_id = parts[2]
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can confirm.", show_alert=True
+        )
+        return
+    if len(job_id) < 4:
+        await query.answer("Invalid job id", show_alert=True)
+        return
+    # Answer immediately so the button never shows as stuck while the
+    # blocking cancellation work runs; the result lands in the edit below.
+    try:
+        await query.answer()
+    except Exception:  # nosec B110
+        pass
+    await _track_user_session(update, "/canceljob")
+    chat_id = query.message.chat.id if query.message else None
+    try:
+        owned, actions = await _do_cancel_job(job_id, uid, chat_id)
+    except Exception:
+        logger.exception("canceljob: confirm-callback cancellation failed")
+        try:
+            await query.answer("Something went wrong", show_alert=True)
+        except Exception:  # nosec B110
+            pass
+        return
+    if owned:
+        header = "✅ Cancelled: " + ", ".join(actions)
+    else:
+        header = (
+            f"No active job found for you with id `{job_id}`. "
+            "It may have already finished."
+        )
+    # Show the refreshed /status job list below the result (same treatment as
+    # cancel-all): the cancel-all button re-appears when jobs remain, and an
+    # empty keyboard clears the stale confirmation buttons otherwise.
+    text, kb = _cancel_status_reply(uid, header)
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=kb if kb is not None else InlineKeyboardMarkup([]),
+        )
+    except Exception:
+        logger.exception("canceljob: failed to edit confirmation result")
+
+
+async def handle_canceljob_abort_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Abort tap on the /canceljob prompt: keep the job (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        armer = int(str(query.data).split(":", 2)[1])
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can abort it.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "/canceljob")
+    try:
+        await query.answer("Nothing was cancelled")
+    except Exception:  # nosec B110
+        pass
+    try:
+        # Empty keyboard: clear the stale confirmation buttons.
+        await query.edit_message_text(
+            "✅ Nothing was cancelled.", reply_markup=InlineKeyboardMarkup([])
+        )
+    except Exception:  # nosec B110
+        pass
 
 
 # ── Register per-user login + auth commands ────────────────────
@@ -2865,6 +3968,47 @@ application.add_handler(CommandHandler("admin", cmd_admin))
 application.add_handler(CommandHandler("clearflood", cmd_clearflood))
 application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("canceljob", cmd_canceljob))
+application.add_handler(CommandHandler("cancelall", cmd_cancelall))
+application.add_handler(
+    CallbackQueryHandler(handle_cancelall_callback, pattern="^cancelall$")
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_cancelall_confirm_callback, pattern=r"^cancelall_confirm:\d+$"
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_cancelall_abort_callback, pattern=r"^cancelall_abort:\d+$"
+    )
+)
+# Legacy unsuffixed buttons (pre same-user binding) — tell the user what to do.
+application.add_handler(
+    CallbackQueryHandler(
+        handle_cancelall_stale_callback,
+        pattern=r"^cancelall_(confirm|abort)$",
+    )
+)
+# 'Queued...' reply cancel button (arms the confirmation, same-user bound).
+application.add_handler(
+    CallbackQueryHandler(
+        handle_canceljob_arm_callback,
+        pattern=r"^canceljob:\d+:\S+$",
+    )
+)
+# /canceljob confirmation buttons (same-user bound, id in callback data).
+application.add_handler(
+    CallbackQueryHandler(
+        handle_canceljob_confirm_callback,
+        pattern=r"^canceljob_confirm:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_canceljob_abort_callback,
+        pattern=r"^canceljob_abort:\d+:\S+$",
+    )
+)
 
 
 @asynccontextmanager
@@ -3477,7 +4621,12 @@ async def handle_text_with_url(
                 except Exception:  # nosec B110 - throttling is best-effort
                     pass
                 ok = await asyncio.to_thread(
-                    enqueue_job, "process_url_job", chat_id, url, base
+                    enqueue_job,
+                    "process_url_job",
+                    chat_id,
+                    url,
+                    base,
+                    user_id,
                 )
                 if ok:
                     await msg.reply_text(
@@ -3511,7 +4660,7 @@ async def handle_text_with_url(
                         filename=base,
                         file_size=_url_file_size,
                         loop=_loop,
-                        target_chat_id="me",
+                        target_chat_id=BOT_USER_ID or "me",
                     )
                 else:
                     _url_task = None
@@ -3874,7 +5023,7 @@ async def set_commands(
                 [
                     BotCommand("start", "Start interaction with the bot"),
                     BotCommand("help", "Show help and available commands"),
-                    BotCommand("status", "Get bot status"),
+                    BotCommand("status", "Bot status: queue & your jobs"),
                 ]
             )
         return {"ok": True}

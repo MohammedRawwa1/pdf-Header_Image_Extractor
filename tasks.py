@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 
 import requests
 
@@ -45,6 +46,41 @@ def _pipeline_cancel_flag(job_id: str | None) -> bool:
         return flag in (b"1", "1")
     except Exception:
         return False
+
+
+class _JobCancelledError(Exception):
+    """Raised to abort a BigFilePipeline job mid-flight after /canceljob fires."""
+
+
+def _check_cancel_flags(job_id: str | None) -> bool:
+    """True when either pipeline cancel flag (``cancel:<id>`` or the
+    ``pdf:job:<id>`` hash) is set — used by the mid-flight abort checks."""
+    return _job_cancelled(job_id) or _pipeline_cancel_flag(job_id)
+
+
+def _mark_pipeline_hash_status(job_id: str | None, status: str) -> None:
+    """Best-effort update of the ``pdf:job:<id>`` hash ``status`` field.
+
+    Kept in sync as jobs finish/cancel so /canceljob's existence checks can
+    tell live jobs apart from completed ones (the hash survives up to
+    JOB_METADATA_TTL after completion).  Terminal statuses are ``done``,
+    ``s3_fallback``, ``too_large``, ``cancelled``, ``failed``, ``error``.
+    """
+    if not job_id:
+        return
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return
+        # Never resurrect a wiped hash (e.g. one already removed by
+        # _do_cancel_job's cleanup): only update an existing job record.
+        if not r.exists(f"pdf:job:{job_id}"):
+            return
+        r.hset(f"pdf:job:{job_id}", mapping={"status": status})
+    except Exception:  # nosec B110
+        pass
 
 
 # Direct Telegram Bot HTTP API calls (getFile, file downloads, forwardMessage,
@@ -160,6 +196,37 @@ def _delete_queued_messages(job_id: str | None) -> None:
         pass
 
 
+def _clear_queued_message_buttons(job_id: str | None) -> None:
+    """Strip the cancel button from a job's recorded "Queued..." message(s).
+
+    Used when an RQ job hands off to the BigFilePipeline: the RQ job is done
+    and its cancel button would be stale (the live job now runs under the
+    pipeline job id). The handoff progress message carries the pipeline's own
+    live cancel button instead, so a file never shows two cancel controls.
+    Best-effort — the queued_msg record is left intact for delivery cleanup.
+    """
+    if not job_id:
+        return
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return
+        raw = r.get(QUEUED_MSG_KEY.format(job_id))
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:  # nosec B112 - non-JSON record is not ours to fix
+            return
+        chat_id = data.get("chat_id")
+        for mid in data.get("message_ids", []):
+            _tg_edit_message_reply_markup(chat_id, mid)
+    except Exception:  # nosec B110
+        pass
+
+
 def _transfer_queued_messages(
     src_job_id: str | None, dst_job_id: str | None
 ) -> None:
@@ -182,6 +249,55 @@ def _transfer_queued_messages(
             r.delete(src_key)
     except Exception:  # nosec B110
         pass
+
+
+def _deliver_result_via_userbot(
+    chat_id: int,
+    file_path: str,
+    filename: str,
+    caption: str,
+    thumb_path: str | None,
+    user_id: int | None,
+) -> bool:
+    """Deliver a too-large result via the userbot using the user's session.
+
+    Sends to the bot's user ID so the file lands in the requesting user's DM
+    with the bot (mirroring the web process's big-file delivery); falls back
+    to the userbot's Saved Messages ('me') when the bot entity can't be
+    resolved.  Returns True on delivery, False when no userbot session is
+    available (caller then falls back to S3 URL / error message).
+    """
+    import asyncio as _asyncio
+
+    try:
+        from utils.userbot_downloader import _get_bot_user_id
+        from utils.userbot_uploader import (
+            send_file_via_userbot_with_fallback,
+        )
+    except Exception:
+        return False
+    target = _get_bot_user_id() or "me"
+    try:
+        return _asyncio.run(
+            send_file_via_userbot_with_fallback(
+                chat_id=target,
+                file_path=file_path,
+                caption=caption,
+                thumb_path=thumb_path,
+                progress_callback=None,
+                user_id=user_id,
+            )
+        )
+    except Exception:
+        # Never let a userbot send failure escape: the caller degrades to the
+        # S3 URL / error-message fallback instead of failing the whole job.
+        logger.exception(
+            "worker: userbot result delivery raised (chat=%s target=%s user_id=%s)",
+            chat_id,
+            target,
+            user_id,
+        )
+        return False
 
 
 def _cleanup_after_success(
@@ -218,6 +334,34 @@ def _cleanup_after_failure(
     _cleanup_after_success(chat_id, job_id, progress_msg_id, skip_queued_delete)
 
 
+def _cancel_pipeline_cleanup(
+    job_id: str | None,
+    chat_id: int | None,
+    progress_msg_id: int | None,
+    out_meta: dict | None,
+    unique_key: str,
+) -> dict:
+    """Mark a pipeline job cancelled and remove its transient messages.
+
+    Deletes the live progress message and the queued_msg record — which may
+    hold the RQ handoff progress message AND the "Large file queued via S3
+    pipeline..." confirmation (transferred to the pipeline job id at
+    handoff) — then persists ``status=cancelled`` into io:out.
+    """
+    _cleanup_after_failure(chat_id, job_id, progress_msg_id)
+    _mark_pipeline_hash_status(job_id, "cancelled")
+    if out_meta is not None:
+        try:
+            out_meta.setdefault("status", "cancelled")
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
+            _set_io_keys(unique_key, output_meta=out_meta)
+        except Exception:  # nosec B110
+            pass
+    return {"status": "cancelled"}
+
+
 def _short_error(exc: BaseException, limit: int = 120) -> str:
     """First line of an exception message, truncated for a Telegram reply."""
     try:
@@ -246,6 +390,7 @@ from utils.tg_http import (  # noqa: E402
     _tg_delete_message,
     _tg_download_to_bytes,
     _tg_download_to_file,
+    _tg_edit_message_reply_markup,
     _tg_forward_message,
     _tg_get_file_path,
     _tg_send_document,
@@ -265,12 +410,18 @@ except Exception:
 
 
 def _download_s3_key_to_file(
-    key: str, dest_path: str, progress_callback=None
+    key: str,
+    dest_path: str,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> bool:
     """Download an S3 object (by key) to local `dest_path` using boto3.
 
     ``progress_callback(current_bytes, total_bytes)`` (optional) receives LIVE
-    transfer progress.  Returns True on success, False on failure.
+    transfer progress.  ``cancel_check()`` (optional) is polled per chunk —
+    when it returns True the transfer aborts by raising ``_JobCancelledError`` so a
+    /canceljob can stop a pipeline job mid-download.  Returns True on success,
+    False on failure (``_JobCancelledError`` is re-raised, never swallowed).
     """
     try:
         import boto3
@@ -319,8 +470,27 @@ def _download_s3_key_to_file(
     try:
         # ensure parent dir exists
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        s3.download_file(bucket, key, dest_path, Callback=_cb)
+        if cancel_check is None:
+            s3.download_file(bucket, key, dest_path, Callback=_cb)
+        else:
+            # Chunked get_object loop: poll cancel_check per chunk so a
+            # /canceljob flag can abort a large download mid-transfer
+            # (boto3's download_file can't be interrupted, and
+            # _TransferProgress swallows callback exceptions).
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            body = obj["Body"]
+            with open(dest_path, "wb") as fh:
+                while True:
+                    if cancel_check():
+                        raise _JobCancelledError()
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    _cb(len(chunk))
         return True
+    except _JobCancelledError:
+        raise
     except Exception:
         logger.exception("Failed to download S3 key %s to %s", key, dest_path)
         # fallback: try to generate a presigned URL and download via requests
@@ -335,9 +505,13 @@ def _download_s3_key_to_file(
                 with open(dest_path, "wb") as fh:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
+                            if cancel_check is not None and cancel_check():
+                                raise _JobCancelledError()
                             fh.write(chunk)
                             _cb(len(chunk))
             return True
+        except _JobCancelledError:
+            raise
         except Exception:
             logger.exception(
                 "Presigned GET fallback failed for S3 key %s", key
@@ -360,15 +534,32 @@ def process_input_key_job(job: dict) -> dict:
         or f"{job_id}.bin"
     )
     chat_id = job.get("chat_id")
+    user_id = job.get("user_id")
     cleanup_input = job.get("cleanup_input", True)
 
     unique_key = job_id
+
+    logger.info(
+        "process_input_key_job: start chat_id=%s user_id=%s filename=%s size=%s",
+        chat_id,
+        user_id,
+        filename,
+        job.get("size") or job.get("file_size"),
+    )
 
     # Honour /canceljob: abort before downloading when the flag is set.
     # (/canceljob's "\u2705 Cancelled..." reply is the user-facing
     # confirmation, so no lingering extra message is posted here.)
     if _job_cancelled(job_id) or _pipeline_cancel_flag(job_id):
-        return {"status": "cancelled"}
+        # The shared cancelled-cleanup removes the queued_msg record — which
+        # may hold the RQ handoff progress message and the "Large file queued
+        # via S3 pipeline..." confirmation — in the race where the flag was
+        # set after the job was popped but before this pre-flight check ran,
+        # and marks the job hash status as cancelled (when the hash still
+        # exists).
+        return _cancel_pipeline_cleanup(
+            job_id, chat_id, None, None, unique_key
+        )
 
     # write input metadata for observability
     try:
@@ -378,6 +569,7 @@ def process_input_key_job(job: dict) -> dict:
             "filename": filename,
             "size": job.get("size") or job.get("file_size"),
             "chat_id": chat_id,
+            "user_id": user_id,
             "enqueued_at": int(time.time()),
         }
         _set_io_keys(unique_key, input_meta=input_meta)
@@ -389,6 +581,7 @@ def process_input_key_job(job: dict) -> dict:
         "timestamps": {"start": int(time.time())},
         "durations": {},
         "sizes": {},
+        "user_id": user_id,
     }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
@@ -435,9 +628,19 @@ def process_input_key_job(job: dict) -> dict:
 
         dl_start = time.time()
         ok = False
-        if input_key:
-            ok = _download_s3_key_to_file(
-                input_key, dest_path, progress_callback=_live_download_cb
+        try:
+            if input_key:
+                ok = _download_s3_key_to_file(
+                    input_key,
+                    dest_path,
+                    progress_callback=_live_download_cb,
+                    cancel_check=lambda: _check_cancel_flags(job_id),
+                )
+        except _JobCancelledError:
+            # /canceljob fired mid-download: the S3 transfer was aborted, so
+            # remove the transient messages and record the cancellation.
+            return _cancel_pipeline_cleanup(
+                job_id, chat_id, _progress_msg_id, out_meta, unique_key
             )
         if not ok:
             # Notify the user and clear the transient progress + "Queued..."
@@ -457,7 +660,13 @@ def process_input_key_job(job: dict) -> dict:
                 _set_io_keys(unique_key, output_meta=out_meta)
             except Exception:  # nosec B110
                 pass
+            _mark_pipeline_hash_status(job_id, "failed")
             return {"error": "s3_download_failed"}
+        # ── Honour /canceljob fired between the last chunk and here ──
+        if _check_cancel_flags(job_id):
+            return _cancel_pipeline_cleanup(
+                job_id, chat_id, _progress_msg_id, out_meta, unique_key
+            )
         dl_elapsed = time.time() - dl_start
         out_meta.setdefault("durations", {})["download_ms"] = int(
             dl_elapsed * 1000
@@ -595,13 +804,49 @@ def process_input_key_job(job: dict) -> dict:
                 except Exception:  # nosec B110
                     pass
 
-        # If still too large, try S3 fallback (should rarely be needed since input was uploaded already)
+        # ── Honour /canceljob before the userbot delivery attempt ──
+        if _check_cancel_flags(job_id):
+            return _cancel_pipeline_cleanup(
+                job_id, chat_id, _progress_msg_id, out_meta, unique_key
+            )
+
+        # If still too large, deliver via userbot first, then S3 fallback
         if (
             upload_path == dest_path
             and orig_size
             and upload_limit
             and orig_size > upload_limit
         ):
+            # ── Userbot delivery first: puts the actual file into the user's
+            # DM with the bot before degrading to an S3 URL / error. ──
+            try:
+                _progress_msg_id = _tg_send_progress(
+                    chat_id,
+                    filename,
+                    "sending",
+                    detail="\U0001f4e4 Sending via userbot (large file)...",
+                    file_size=os.path.getsize(upload_path),
+                    message_id=_progress_msg_id,
+                )
+            except Exception:  # nosec B110
+                pass
+            if _deliver_result_via_userbot(
+                chat_id,
+                upload_path,
+                filename,
+                "Here is your file with an auto-generated cover preview.",
+                thumb_path,
+                user_id,
+            ):
+                try:
+                    out_meta.setdefault("status", "done")
+                    out_meta.setdefault("delivery", "userbot")
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+                _cleanup_after_success(chat_id, job_id, _progress_msg_id)
+                _mark_pipeline_hash_status(job_id, "done")
+                return {"status": "done", "delivery": "userbot"}
             if (
                 getattr(config, "ENABLE_S3_FALLBACK", False)
                 and getattr(config, "S3_BUCKET", None)
@@ -637,6 +882,7 @@ def process_input_key_job(job: dict) -> dict:
                         _cleanup_after_success(
                             chat_id, job_id, _progress_msg_id
                         )
+                        _mark_pipeline_hash_status(job_id, "s3_fallback")
                         return {"s3_url": url}
                 except Exception:
                     logger.exception("S3 fallback failed for job %s", job_id)
@@ -653,6 +899,7 @@ def process_input_key_job(job: dict) -> dict:
             # The job is over: clear the transient progress + "Queued..."
             # messages (the notification above remains as feedback).
             _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
+            _mark_pipeline_hash_status(job_id, "too_large")
             out_meta.setdefault("status", "too_large_after_compress")
             out_meta.setdefault("sizes", {})["orig_bytes"] = orig_size
             out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -663,6 +910,12 @@ def process_input_key_job(job: dict) -> dict:
             except Exception:  # nosec B110
                 pass
             return {"error": "file too large after compression"}
+
+        # ── Honour /canceljob while the job is in flight ──
+        if _check_cancel_flags(job_id):
+            return _cancel_pipeline_cleanup(
+                job_id, chat_id, _progress_msg_id, out_meta, unique_key
+            )
 
         # send final document via Telegram
         _progress_msg_id = _tg_send_progress(
@@ -730,6 +983,7 @@ def process_input_key_job(job: dict) -> dict:
         # Auto-delete the transient messages now that the output was
         # delivered: the progress bar and the "Queued..." confirmation.
         _cleanup_after_success(chat_id, job_id, _progress_msg_id)
+        _mark_pipeline_hash_status(job_id, "done")
 
         try:
             if get_current_job is not None:
@@ -764,6 +1018,7 @@ def process_input_key_job(job: dict) -> dict:
             )
         except Exception:  # nosec B110
             pass
+        _mark_pipeline_hash_status(job_id, "error")
         return {"error": "processing_error"}
     finally:
         try:
@@ -831,6 +1086,23 @@ def _set_io_keys(
     return redis_ok
 
 
+def _attach_job_user_meta(user_id: int | None) -> str | None:
+    """Best-effort: tag the current RQ job with ``user_id`` (returns its job id).
+
+    Mirrors the per-user observability in process_document_job so queued/running
+    jobs are attributable to a user in RQ dashboards and /status.
+    """
+    try:
+        _j = get_current_job()
+        if _j is None:
+            return None
+        _j.meta["user_id"] = user_id
+        _j.save_meta()
+        return getattr(_j, "id", None)
+    except Exception:  # nosec B110 - best-effort
+        return None
+
+
 def process_document_job(
     chat_id: int,
     file_id: str,
@@ -857,6 +1129,14 @@ def process_document_job(
     """
     unique_key = file_unique_id or file_id
 
+    logger.info(
+        "process_document_job: start chat_id=%s user_id=%s filename=%s size=%s",
+        chat_id,
+        user_id,
+        filename,
+        file_size,
+    )
+
     # Capture the RQ job id (when running under the RQ worker) so /canceljob can
     # abort this job via the `cancel:<id>` Redis flag even while it is running.
     _rq_job_id = None
@@ -876,10 +1156,11 @@ def process_document_job(
     # ── Early format validation: reject unsupported formats before any processing ──
     if not is_supported_format(filename, mime or ""):
         logger.info(
-            "process_document_job: rejected unsupported format: filename=%s mime=%s chat_id=%s",
+            "process_document_job: rejected unsupported format: filename=%s mime=%s chat_id=%s user_id=%s",
             filename,
             mime,
             chat_id,
+            user_id,
         )
         try:
             _tg_send_message(
@@ -909,6 +1190,7 @@ def process_document_job(
             "filename": filename,
             "mime": mime,
             "chat_id": chat_id,
+            "user_id": user_id,
             "message_id": message_id,
             "forward_info": forward_info,
             "enqueued_at": int(time.time()),
@@ -925,6 +1207,7 @@ def process_document_job(
         "timestamps": {"start": int(time.time())},
         "durations": {},
         "sizes": {},
+        "user_id": user_id,
     }
     try:
         _set_io_keys(unique_key, output_meta=out_meta)
@@ -1261,13 +1544,43 @@ def process_document_job(
                                 _result.job_id,
                                 _result.s3_key,
                             )
+                            # The RQ job is done — strip its (now stale) cancel
+                            # button from the original "Queued your file"
+                            # message so this file never shows two cancel
+                            # controls. Do this BEFORE the transfer moves the
+                            # queued_msg record to the pipeline job id.
+                            _clear_queued_message_buttons(_rq_job_id)
+                            # Attach a LIVE cancel button for the pipeline job
+                            # to the handoff message (same payload format as
+                            # the web process's queued replies) and surface the
+                            # new job id so the user can /canceljob it.
+                            _handoff_kb = None
+                            if user_id and _result.job_id:
+                                _handoff_kb = {
+                                    "inline_keyboard": [
+                                        [
+                                            {
+                                                "text": "\u274c Cancel this job",
+                                                "callback_data": (
+                                                    f"canceljob:{user_id}:"
+                                                    f"{_result.job_id[:32]}"
+                                                ),
+                                            }
+                                        ]
+                                    ]
+                                }
                             _tg_send_progress(
                                 chat_id,
                                 filename,
                                 "done",
-                                detail="\u2705 Large file queued via S3 pipeline. You'll receive the result when ready.",
+                                detail=(
+                                    "\u2705 Large file queued via S3 pipeline. "
+                                    f"Job: {_result.job_id[:8]}... "
+                                    "You'll receive the result when ready."
+                                ),
                                 file_size=file_size or 0,
                                 message_id=_progress_msg_id,
+                                reply_markup=_handoff_kb,
                             )
                             # Hand the queued-message record over to the
                             # pipeline job id so the pipeline worker cleans up
@@ -1297,10 +1610,11 @@ def process_document_job(
                     tg_file_path = "__userbot_fallback__"
                 else:
                     logger.error(
-                        "All download methods failed for file_id=%s chat=%s msg=%s. Errors: %s",
+                        "All download methods failed for file_id=%s chat=%s msg=%s user_id=%s. Errors: %s",
                         file_id,
                         chat_id,
                         message_id,
+                        user_id,
                         "; ".join(_fallback_errors),
                     )
                     # The transient progress message is deleted by the outer
@@ -1518,13 +1832,47 @@ def process_document_job(
                     except Exception:  # nosec B110
                         pass
 
-            # if still too large, try S3 fallback
+            # if still too large, deliver via userbot first, then S3 fallback
             if (
                 upload_path == file_path
                 and orig_size
                 and upload_limit
                 and orig_size > upload_limit
             ):
+                # ── Userbot delivery first: puts the actual file into the
+                # user's DM with the bot before degrading to S3 URL / error. ──
+                try:
+                    _progress_msg_id = _tg_send_progress(
+                        chat_id,
+                        filename,
+                        "sending",
+                        detail="\U0001f4e4 Sending via userbot (large file)...",
+                        file_size=os.path.getsize(upload_path),
+                        message_id=_progress_msg_id,
+                    )
+                except Exception:  # nosec B110
+                    pass
+                if _deliver_result_via_userbot(
+                    chat_id,
+                    upload_path,
+                    filename,
+                    "Here is your file with an auto-generated cover preview.",
+                    thumb_path,
+                    user_id,
+                ):
+                    try:
+                        out_meta.setdefault("status", "done")
+                        out_meta.setdefault("delivery", "userbot")
+                        _set_io_keys(unique_key, output_meta=out_meta)
+                    except Exception:  # nosec B110
+                        pass
+                    _cleanup_after_success(
+                        chat_id,
+                        _rq_job_id,
+                        _progress_msg_id,
+                        skip_queued_delete=_skip_queued_delete,
+                    )
+                    return {"status": "done", "delivery": "userbot"}
                 if (
                     getattr(config, "ENABLE_S3_FALLBACK", False)
                     and getattr(config, "S3_BUCKET", None)
@@ -1675,6 +2023,7 @@ def process_document_job(
                     job = get_current_job()
                     if job is not None:
                         job.meta["tg_response"] = res
+                        job.meta["user_id"] = user_id
                         job.save_meta()
             except Exception:  # nosec B110
                 pass
@@ -1790,8 +2139,44 @@ def process_document_job(
                         except Exception:  # nosec B110
                             pass
 
-                    # if still too big, try S3
+                    # if still too big, deliver via userbot first, then S3
                     if len(file_bytes) > upload_limit:
+                        # ── Userbot delivery first: write the bytes to temp
+                        # files and deliver into the user's DM with the bot.
+                        # The temp file keeps the real ``filename`` so the
+                        # delivered document is not renamed. ──
+                        _ub_tmp = os.path.join(td, filename)
+                        with open(_ub_tmp, "wb") as _ub_fh:
+                            _ub_fh.write(file_bytes)
+                        _ub_thumb = os.path.join(td, "userbot_thumb.jpg")
+                        with open(_ub_thumb, "wb") as _ub_th:
+                            _ub_th.write(thumb_bytes)
+                        if _deliver_result_via_userbot(
+                            chat_id,
+                            _ub_tmp,
+                            filename,
+                            "Here is your file with an auto-generated cover preview.",
+                            _ub_thumb,
+                            user_id,
+                        ):
+                            try:
+                                out_meta.setdefault("status", "done")
+                                out_meta.setdefault("delivery", "userbot")
+                                _set_io_keys(
+                                    unique_key, output_meta=out_meta
+                                )
+                            except Exception:  # nosec B110
+                                pass
+                            _cleanup_after_success(
+                                chat_id,
+                                _rq_job_id,
+                                _progress_msg_id,
+                                skip_queued_delete=_skip_queued_delete,
+                            )
+                            return {
+                                "status": "done",
+                                "delivery": "userbot",
+                            }
                         if (
                             getattr(config, "ENABLE_S3_FALLBACK", False)
                             and getattr(config, "S3_BUCKET", None)
@@ -1911,6 +2296,7 @@ def process_document_job(
                     job = get_current_job()
                     if job is not None:
                         job.meta["tg_response"] = res
+                        job.meta["user_id"] = user_id
                         job.save_meta()
             except Exception:  # nosec B110
                 pass
@@ -1971,20 +2357,46 @@ def process_document_batch_job(
     Each item dict is expected to have: file_id, filename, mime.
     ``user_id`` is threaded to each item so per-user sessions are used.
     """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "process_document_batch_job: start chat_id=%s user_id=%s items=%d",
+        chat_id,
+        user_id,
+        len(items),
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "items": len(items),
+                    "enqueued_at": int(time.time()),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to write io:in for batch job %s", _rq_job_id)
     results = []
     for item in items:
         file_id = item.get("file_id")
         filename = item.get("filename", "unknown")
         mime = item.get("mime", "")
         if not file_id:
-            logger.warning("Skipping batch item with no file_id: %s", item)
+            logger.warning(
+                "process_document_batch_job: skipping item with no file_id: %s (user_id=%s)",
+                item,
+                user_id,
+            )
             continue
         # ── Early format validation: skip unsupported items in batch ──
         if not is_supported_format(filename, mime):
             logger.info(
-                "process_document_batch_job: skipping unsupported format: filename=%s mime=%s",
+                "process_document_batch_job: skipping unsupported format: filename=%s mime=%s (user_id=%s)",
                 filename,
                 mime,
+                user_id,
             )
             results.append({"skipped": "unsupported format", "filename": filename, "mime": mime})
             continue
@@ -2003,7 +2415,11 @@ def process_document_batch_job(
             )
             results.append(res)
         except Exception:
-            logger.exception("Failed processing batch item %s", filename)
+            logger.exception(
+                "Failed processing batch item %s (user_id=%s)",
+                filename,
+                user_id,
+            )
             results.append({"error": f"failed: {filename}"})
     # All items delivered — delete the batch's "Queued batch..." confirmation.
     try:
@@ -2013,6 +2429,13 @@ def process_document_batch_job(
         )
     except Exception:  # nosec B110
         pass
+    logger.info(
+        "process_document_batch_job: complete chat_id=%s user_id=%s items=%d processed=%d",
+        chat_id,
+        user_id,
+        len(items),
+        len(results),
+    )
     _tg_send_message(
         None,
         chat_id,
@@ -2021,16 +2444,42 @@ def process_document_batch_job(
     return results
 
 
-def process_url_job(chat_id: int, url: str, filename: str) -> None:
+def process_url_job(
+    chat_id: int, url: str, filename: str, user_id: int | None = None
+) -> None:
     """RQ job: download a PDF from URL, create thumbnail, and send back.
 
     Validates the URL to prevent SSRF attacks before downloading.
     """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "process_url_job: start chat_id=%s user_id=%s url=%s filename=%s",
+        chat_id,
+        user_id,
+        url[:100],
+        filename,
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "url": url[:200],
+                    "filename": filename,
+                    "enqueued_at": int(time.time()),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to write io:in for URL job %s", _rq_job_id)
     # SSRF prevention: validate the URL before making any requests
     if not _validate_url_safe(url):
         logger.warning(
-            "SSRF prevention: blocked invalid/dangerous URL in process_url_job: %s",
+            "SSRF prevention: blocked invalid/dangerous URL in process_url_job: %s (user_id=%s)",
             url[:100],
+            user_id,
         )
         try:
             _tg_send_message(
@@ -2064,6 +2513,33 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
         else:
             create_thumbnail_from_image(file_path, thumb_path)
 
+        # Oversized result (> Bot API upload cap): deliver via userbot into
+        # the user's DM with the bot instead of failing the Bot API send.
+        try:
+            _dl_size = os.path.getsize(file_path)
+        except Exception:
+            _dl_size = 0
+        if (
+            _dl_size
+            and config.BOT_API_UPLOAD_LIMIT_BYTES
+            and _dl_size > config.BOT_API_UPLOAD_LIMIT_BYTES
+        ):
+            if _deliver_result_via_userbot(
+                chat_id,
+                file_path,
+                filename,
+                "Here is your file with an auto-generated cover preview.",
+                thumb_path,
+                user_id,
+            ):
+                logger.info(
+                    "process_url_job: complete chat_id=%s user_id=%s url=%s",
+                    chat_id,
+                    user_id,
+                    url[:100],
+                )
+                return
+
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
             _tg_send_document(
                 None,
@@ -2073,8 +2549,16 @@ def process_url_job(chat_id: int, url: str, filename: str) -> None:
                 thumb_fileobj=f_thumb,
                 caption="Here is your file with an auto-generated cover preview.",
             )
+        logger.info(
+            "process_url_job: complete chat_id=%s user_id=%s url=%s",
+            chat_id,
+            user_id,
+            url[:100],
+        )
     except Exception:
-        logger.exception("Failed processing URL job: %s", url)
+        logger.exception(
+            "Failed processing URL job: %s (user_id=%s)", url, user_id
+        )
         try:
             _tg_send_message(
                 None,

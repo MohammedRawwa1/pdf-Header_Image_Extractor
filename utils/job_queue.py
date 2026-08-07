@@ -54,6 +54,10 @@ async def enqueue_job(job: dict) -> None:
                 "output": job.get("output_path") or job.get("output") or "",
                 "created_at": str(time.time()),
                 "request_id": job.get("request_id") or "",
+                # Stored so /canceljob can verify ownership of in-flight jobs
+                # (jobs already popped from the pdf:jobs list are cancelled via
+                # this hash's cancel flag).
+                "user_id": str(job.get("user_id") or ""),
             }
             try:
                 await r.hset(f"pdf:job:{job_id}", mapping=mapping)

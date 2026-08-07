@@ -299,6 +299,7 @@ async def _upload_and_enqueue(
     original_name: str,
     chat_id: int | None,
     message_id: int | None,
+    user_id: int | None = None,
 ):
     job_id = uuid.uuid4().hex
     size = None
@@ -446,6 +447,7 @@ async def _upload_and_enqueue(
         "original_filename": original_name or os.path.basename(local_path),
         "size": size or 0,
         "chat_id": chat_id,
+        "user_id": user_id,
         "message_id": message_id,
         "progress_channel": f"ffmpeg:progress:{job_id}",
         # Let the worker decide whether to delete local input; here we
@@ -560,6 +562,7 @@ async def _process_forward_hash(forward_hash: str):
             meta.get("name"),
             meta.get("chat_id"),
             meta.get("message_id") or meta.get("msg_id"),
+            user_id=meta.get("user_id"),
         )
     except Exception:
         logger.exception(
@@ -1061,12 +1064,22 @@ async def main():
 
             # Upload & enqueue
             try:
+                # Per-user identity: the ingest userbot's own account owns the
+                # ingested media, so its ID is the job's user_id (falls back to
+                # None -> global/admin session when unresolvable).
+                _me_id = None
+                try:
+                    _me = getattr(client_instance, "_me", None)
+                    _me_id = getattr(_me, "id", None)
+                except Exception:  # nosec B110
+                    _me_id = None
                 await _upload_and_enqueue(
                     tmp,
                     fname,
                     getattr(msg.chat, "id", None)
                     or getattr(msg, "chat_id", None),
                     getattr(msg, "id", None),
+                    user_id=_me_id,
                 )
             except Exception:
                 logger.exception("Failed to upload/enqueue for %s", tmp)

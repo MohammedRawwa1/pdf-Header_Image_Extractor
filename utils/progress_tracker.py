@@ -264,6 +264,9 @@ class ProgressTracker:
 
     def find_task_id_by_prefix(self, prefix: str) -> str | None:
         """Find an active task id by prefix (users see truncated ids like `abc12345`)."""
+        # Refuse unusably short inputs so prefix matching can't match everything.
+        if len(prefix) < 4:
+            return None
         # in-memory first
         for tid in self.tasks:
             if tid.startswith(prefix):

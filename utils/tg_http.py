@@ -232,10 +232,17 @@ def _tg_send_document(
     raise last_exc or RuntimeError(f"Failed to send document {filename}")
 
 
-def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
+def _tg_send_message(
+    bot_token: str | None,
+    chat_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+):
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {"chat_id": str(chat_id), "text": text}
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
     # Retry on transient 429/5xx (Telegram flood control) with backoff —
     # mirrors the sendDocument helper so background workers survive bursts.
     last_exc: Exception | None = None
@@ -285,9 +292,16 @@ def _tg_send_message(bot_token: str | None, chat_id: int, text: str):
 
 
 def _tg_edit_message_text(
-    chat_id: int, message_id: int, text: str, parse_mode: str = "Markdown"
+    chat_id: int,
+    message_id: int,
+    text: str,
+    parse_mode: str = "Markdown",
+    reply_markup: dict | None = None,
 ):
     """Edit a previously-sent message using Bot API's editMessageText.
+
+    ``reply_markup`` is an optional inline-keyboard payload (``{"inline_keyboard":
+    [...]}``). Pass ``{"inline_keyboard": []}`` to remove an existing keyboard.
 
     Returns the API response dict on success, or None on failure (non-fatal).
     """
@@ -302,11 +316,43 @@ def _tg_edit_message_text(
             "text": text,
             "parse_mode": parse_mode,
         }
+        if reply_markup is not None:
+            data["reply_markup"] = reply_markup
         r = _SESSION.post(url, data=data, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception:
         return None
+
+
+def _tg_edit_message_reply_markup(
+    chat_id: int, message_id: int | None
+) -> bool:
+    """Remove the inline keyboard from a message (editMessageReplyMarkup).
+
+    Used to strip a stale cancel button once a job hands off to a different
+    pipeline, so a file never shows two cancel controls. Best-effort.
+    """
+    if not message_id:
+        return False
+    bot_token = _get_bot_token()
+    if not bot_token:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup"
+        r = _SESSION.post(
+            url,
+            data={
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
 
 
 def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
@@ -582,6 +628,7 @@ def _tg_send_progress(
     file_size: int = 0,
     message_id: int | None = None,
     progress_pct: int | None = None,
+    reply_markup: dict | None = None,
 ) -> int | None:
     """Send or update a progress message with a visual Unicode progress bar.
 
@@ -594,6 +641,9 @@ def _tg_send_progress(
         message_id: If provided, *edit* the existing message instead of sending new.
         progress_pct: Optional live byte percentage (0-100) that overrides the
             stage's fixed percentage (used while downloading via userbot).
+        reply_markup: Optional inline-keyboard payload to attach (e.g. a live
+            cancel button on the handoff message). Pass ``{"inline_keyboard":
+            []}`` to remove an existing keyboard.
 
     Returns:
         message_id of the sent/edited message, or None on failure.
@@ -628,10 +678,14 @@ def _tg_send_progress(
 
     try:
         if message_id:
-            _tg_edit_message_text(chat_id, message_id, text)
+            _tg_edit_message_text(
+                chat_id, message_id, text, reply_markup=reply_markup
+            )
             return message_id
         else:
-            res = _tg_send_message(None, chat_id, text)
+            res = _tg_send_message(
+                None, chat_id, text, reply_markup=reply_markup
+            )
             if res and "result" in res and "message_id" in res["result"]:
                 return res["result"]["message_id"]
             return None

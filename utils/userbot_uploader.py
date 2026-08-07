@@ -247,3 +247,50 @@ async def send_file_via_userbot(
 
     logger.warning("userbot: all send methods failed for %s", chat_id)
     return False
+
+
+async def send_file_via_userbot_with_fallback(
+    chat_id: int | str,
+    file_path: str,
+    caption: str | None = None,
+    thumb_path: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    user_id: int | None = None,
+) -> bool:
+    """Send a file via the userbot, retrying to Saved Messages on failure.
+
+    Used for large-file delivery: when ``chat_id`` is the bot's user ID the
+    file lands in the requesting user's DM with the bot; if that send fails
+    (e.g. the userbot can't resolve the bot's entity — a known production
+    failure), it retries to the userbot's Saved Messages (``'me'``) so the
+    file is still delivered instead of being lost.
+
+    Shares the retry logic between the web process (``bot.py``) and the
+    worker (``tasks.py``) so the delivery-target fallback stays in one place.
+
+    Returns True on delivery, False when no userbot session is available or
+    both attempts fail.
+    """
+    ok = await send_file_via_userbot(
+        chat_id=chat_id,
+        file_path=file_path,
+        caption=caption,
+        thumb_path=thumb_path,
+        progress_callback=progress_callback,
+        user_id=user_id,
+    )
+    if not ok and str(chat_id) != "me":
+        logger.warning(
+            "userbot: upload to %s failed; retrying to Saved Messages ('me') user_id=%s",
+            chat_id,
+            user_id,
+        )
+        ok = await send_file_via_userbot(
+            chat_id="me",
+            file_path=file_path,
+            caption=caption,
+            thumb_path=thumb_path,
+            progress_callback=progress_callback,
+            user_id=user_id,
+        )
+    return ok
