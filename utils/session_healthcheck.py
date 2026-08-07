@@ -505,7 +505,7 @@ class SessionHealthChecker:
                 # Extract DC from raw session data
                 try:
                     h.dc_id = (
-                        client.storage.dc_id()
+                        await client.storage.dc_id()
                         if hasattr(client.storage, "dc_id")
                         else None
                     )

@@ -1722,7 +1722,7 @@ def process_document_job(
                                 chat_id,
                                 _rq_job_id,
                                 _progress_msg_id,
-                                skip_queued=_skip_queued_delete,
+                                skip_queued_delete=_skip_queued_delete,
                             )
                             return {"s3_url": url}
                     except Exception:
@@ -1823,7 +1823,7 @@ def process_document_job(
                 chat_id,
                 _rq_job_id,
                 _progress_msg_id,
-                skip_queued=_skip_queued_delete,
+                skip_queued_delete=_skip_queued_delete,
             )
 
             try:
@@ -1996,7 +1996,7 @@ def process_document_job(
                                         chat_id,
                                         _rq_job_id,
                                         _progress_msg_id,
-                                        skip_queued=_skip_queued_delete,
+                                        skip_queued_delete=_skip_queued_delete,
                                     )
                                     return {"s3_url": url}
                             except Exception:
@@ -2070,7 +2070,7 @@ def process_document_job(
                 chat_id,
                 _rq_job_id,
                 _progress_msg_id,
-                skip_queued=_skip_queued_delete,
+                skip_queued_delete=_skip_queued_delete,
             )
             return res
 

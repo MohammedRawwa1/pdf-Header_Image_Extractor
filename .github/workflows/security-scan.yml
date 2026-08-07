@@ -23,7 +23,7 @@ env:
 
 jobs:
   security-scan:
-    name: "Bandit + pip-audit + Ruff Lint"
+    name: "Bandit + pip-audit + Ruff Lint + Static Audit"
     runs-on: ubuntu-latest
 
     steps:
@@ -107,6 +107,11 @@ jobs:
           python -m ruff check . --output-format github
           echo "✅ Ruff: no issues found"
 
+      - name: Run static audit (wrong-kwarg + un-awaited async)
+        run: |
+          echo "Running static AST audit for wrong-kwarg calls and un-awaited async calls..."
+          python scripts/audit_static.py .
+
       - name: Check for OWASP exception leak patterns
         run: |
           echo "Checking for exception disclosure patterns..."
@@ -135,6 +140,7 @@ jobs:
           echo "  Bandit:       $(python -c "import json; d=json.load(open('bandit-report.json')); print(f'{len(d[\"results\"])} findings')" 2>/dev/null || echo "skipped")"
           echo "  pip-audit:    $(grep -c 'No known vulnerabilities' pip-audit-output.txt 2>/dev/null | xargs -I{} echo 'clean')"
           echo "  Ruff Lint:    $(python -m ruff check . --config ruff.toml --statistics 2>&1 | tail -n 2 || echo "done")"
+          echo "  Static audit: $(python scripts/audit_static.py . > /dev/null 2>&1 && echo 'clean' || echo 'FAILED')"
           echo "  Leak patterns: checked"
           echo "═══════════════════════════════════════"
           echo ""
