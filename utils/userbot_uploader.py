@@ -22,6 +22,13 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# Telethon upload chunk size in KB.  Larger chunks mean fewer upload
+# requests (Telethon caps upload parts at 512KB).  Configurable via
+# TELETHON_UPLOAD_PART_SIZE_KB.
+TELETHON_UPLOAD_PART_SIZE_KB = int(
+    os.getenv("TELETHON_UPLOAD_PART_SIZE_KB", "512")
+)
+
 
 async def _normalize_target(chat_id: int | str, client=None):
     try:
@@ -79,7 +86,11 @@ async def _send_with_telethon(
 
         await client.start(phone=_no_phone)
         target = await _normalize_target(chat_id, client)
-        kwargs = {"file": file_path, "caption": caption or ""}
+        kwargs = {
+            "file": file_path,
+            "caption": caption or "",
+            "part_size_kb": TELETHON_UPLOAD_PART_SIZE_KB,
+        }
         if thumb_path and os.path.exists(thumb_path):
             kwargs["thumb"] = thumb_path
         if progress_callback is not None:

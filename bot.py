@@ -214,6 +214,43 @@ def _make_progress_cb(task_id: str, loop: asyncio.AbstractEventLoop):
     return _cb
 
 
+def _register_progress_edit_cb(
+    bot,
+    chat_id: int,
+    task_id: str,
+    message_id: int | None,
+) -> None:
+    """Register a callback that live-edits the task's progress message.
+
+    ``update_task_progress`` fires on every download/upload chunk, but by
+    itself only updates the in-memory task + Redis — the Telegram message
+    is only edited through this callback.  Edits are throttled (>=2s apart
+    or >=2% progress jump) so the shared rate limiter is not saturated;
+    final states always push through.  The callback removes itself on the
+    final state so the tracker does not leak entries.
+    """
+    if not task_id or not message_id:
+        return
+    _state = {"last_edit": 0.0, "last_pct": -1.0}
+
+    async def _edit(task) -> None:
+        now = time.time()
+        pct = task.progress_percentage
+        is_final = task.status in ("completed", "failed", "cancelled")
+        if is_final:
+            progress_tracker.unregister_callback(task_id)
+        elif pct - _state["last_pct"] < 2 and now - _state["last_edit"] < 2.0:
+            return
+        _state["last_edit"] = now
+        _state["last_pct"] = pct
+        try:
+            await send_progress_update(chat_id, bot, task, message_id)
+        except Exception:  # nosec B110
+            pass
+
+    progress_tracker.register_callback(task_id, _edit)
+
+
 async def _send_with_upload_progress(
     bot,
     chat_id: int,
@@ -262,6 +299,9 @@ async def _send_with_upload_progress(
     if task.start_time is None:
         task.start()
     _cb = _make_progress_cb(task.task_id, loop)
+    _register_progress_edit_cb(
+        bot, chat_id, task.task_id, progress_msg_id
+    )
 
     try:
         _upload_target = (
@@ -395,6 +435,9 @@ async def _userbot_download_fallback(
         msg.chat.id, msg.get_bot(), task
     )
     _cb = _make_progress_cb(task.task_id, loop)
+    _register_progress_edit_cb(
+        msg.get_bot(), msg.chat.id, task.task_id, progress_msg_id
+    )
 
     dl_ok = False
 

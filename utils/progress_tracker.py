@@ -273,6 +273,10 @@ class ProgressTracker:
     def register_callback(self, task_id: str, callback: Callable):
         self.callbacks[task_id] = callback
 
+    def unregister_callback(self, task_id: str):
+        """Remove a registered progress callback (called on final state)."""
+        self.callbacks.pop(task_id, None)
+
     async def _notify_callbacks(self, task_id: str, task: TaskProgress):
         callback = self.callbacks.get(task_id)
         if not callback:

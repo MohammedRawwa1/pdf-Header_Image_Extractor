@@ -33,6 +33,15 @@ TELETHON_DOWNLOAD_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
 # Configurable via PYROGRAM_DOWNLOAD_TIMEOUT env var (default 600s = 10 min).
 PYROGRAM_DOWNLOAD_TIMEOUT = int(os.getenv("PYROGRAM_DOWNLOAD_TIMEOUT", "600"))
 
+# Telethon download chunk size in KB.  Telethon defaults to 128KB chunks for
+# large files, making high-latency / cross-DC downloads wait on hundreds of
+# sequential round-trips.  Larger chunks cut that overhead (512KB = 4x fewer
+# requests, the library's safe maximum).  Configurable via
+# TELETHON_DOWNLOAD_PART_SIZE_KB.
+TELETHON_DOWNLOAD_PART_SIZE_KB = int(
+    os.getenv("TELETHON_DOWNLOAD_PART_SIZE_KB", "512")
+)
+
 # Check if PyMuPDF (fitz) is available for PDF validation after download.
 # If not installed, PDF validation is skipped and all downloads are accepted
 # at the file-exists level (graceful degradation — the error will surface later
@@ -527,7 +536,10 @@ async def _download_file_by_file_id(
                 )
 
         # download_file writes directly to the file path
-        dl_kwargs = {"file": dest_path}
+        dl_kwargs = {
+            "file": dest_path,
+            "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+        }
         if progress_callback is not None:
             dl_kwargs["progress_callback"] = progress_callback
 
@@ -807,7 +819,10 @@ async def _download_with_telethon(
                         )
                         break
                     try:
-                        kwargs = {"file": dest_path}
+                        kwargs = {
+                            "file": dest_path,
+                            "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+                        }
                         if progress_callback is not None:
                             kwargs["progress_callback"] = progress_callback
                         # Wrap in asyncio.wait_for to enforce a total-download timeout
@@ -873,7 +888,10 @@ async def _download_with_telethon(
                             )
                             break
                         try:
-                            kwargs = {"file": dest_path}
+                            kwargs = {
+                                "file": dest_path,
+                                "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+                            }
                             if progress_callback is not None:
                                 kwargs["progress_callback"] = progress_callback
                             # Wrap in asyncio.wait_for to enforce total-download timeout
@@ -1575,7 +1593,10 @@ async def download_bytes_via_userbot(
                             for attempt in range(3):
                                 try:
                                     buf = io.BytesIO()
-                                    kwargs = {"file": buf}
+                                    kwargs = {
+                                        "file": buf,
+                                        "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+                                    }
                                     if progress_callback is not None:
                                         kwargs["progress_callback"] = (
                                             progress_callback

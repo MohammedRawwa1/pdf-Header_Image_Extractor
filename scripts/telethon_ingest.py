@@ -1005,7 +1005,9 @@ async def main():
             try:
                 for attempt in range(3):
                     try:
-                        await client_instance.download_media(msg, file=tmp)
+                        await client_instance.download_media(
+                            msg, file=tmp, part_size_kb=512
+                        )
                         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                             logger.info(
                                 "Downloaded incoming media to %s (attempt %d)",
