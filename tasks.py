@@ -339,6 +339,146 @@ def _tg_edit_message_text(
         return None
 
 
+# ── Transient-message auto-delete helpers ────────────────────────
+# bot.py records the "Queued your file..." confirmation message under
+# ``queued_msg:<job_id>`` when a job is enqueued.  Once the output has been
+# delivered, the worker deletes that confirmation AND the live progress
+# message so the chat only keeps the final result.
+
+QUEUED_MSG_KEY = "queued_msg:{}"
+QUEUED_MSG_TTL = 7 * 24 * 3600
+
+
+def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
+    """Delete a message via the Bot API ``deleteMessage`` endpoint (best-effort)."""
+    if not message_id:
+        return False
+    try:
+        import config as _config
+
+        bot_token = _config.BOT_TOKEN
+    except Exception:
+        bot_token = None
+    if not bot_token:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
+        r = requests.post(
+            url,
+            data={"chat_id": str(chat_id), "message_id": message_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _append_queued_message(job_id: str, message_id: int) -> None:
+    """Append a message id to a job's auto-delete record (best-effort).
+
+    Used when an RQ job hands off to the BigFilePipeline worker so the
+    pipeline's cleanup also removes the RQ worker's progress message.
+    """
+    if not job_id or not message_id:
+        return
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return
+        key = QUEUED_MSG_KEY.format(job_id)
+        raw = r.get(key)
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        if not data.get("chat_id"):
+            return  # no valid record to extend — don't create a half-baked one
+        ids = list(data.get("message_ids", []))
+        if message_id not in ids:
+            ids.append(message_id)
+        r.setex(
+            key,
+            QUEUED_MSG_TTL,
+            json.dumps({"chat_id": data.get("chat_id"), "message_ids": ids}),
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+def _delete_queued_messages(job_id: str | None) -> None:
+    """Delete the recorded "Queued..." message(s) for a job (best-effort)."""
+    if not job_id:
+        return
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return
+        key = QUEUED_MSG_KEY.format(job_id)
+        raw = r.get(key)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+            chat_id = data.get("chat_id")
+            for mid in data.get("message_ids", []):
+                _tg_delete_message(chat_id, mid)
+        finally:
+            try:
+                r.delete(key)
+            except Exception:  # nosec B110
+                pass
+    except Exception:  # nosec B110
+        pass
+
+
+def _transfer_queued_messages(
+    src_job_id: str | None, dst_job_id: str | None
+) -> None:
+    """Move the auto-delete record from one job id to another (RQ -> pipeline)."""
+    if not src_job_id or not dst_job_id or src_job_id == dst_job_id:
+        return
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if not r:
+            return
+        src_key = QUEUED_MSG_KEY.format(src_job_id)
+        raw = r.get(src_key)
+        if not raw:
+            return
+        try:
+            r.setex(QUEUED_MSG_KEY.format(dst_job_id), QUEUED_MSG_TTL, raw)
+        finally:
+            r.delete(src_key)
+    except Exception:  # nosec B110
+        pass
+
+
+def _cleanup_after_success(
+    chat_id: int,
+    job_id: str | None,
+    progress_msg_id: int | None,
+    skip_queued_delete: bool = False,
+) -> None:
+    """Delete the transient progress + "Queued..." messages after delivery.
+
+    ``skip_queued_delete`` keeps the "Queued..." confirmation (used by batch
+    items; the batch job deletes its own confirmation once all items are done).
+    """
+    try:
+        _tg_delete_message(chat_id, progress_msg_id)
+    except Exception:  # nosec B110
+        pass
+    if not skip_queued_delete:
+        _delete_queued_messages(job_id)
+
+
 # ── Progress bar helpers (HTTP-based, no PTB needed) ─────────────
 # These mirror bot.py's send_progress_update but use raw HTTP calls
 # so they work in background workers without a PTB bot instance.
@@ -775,6 +915,9 @@ def process_input_key_job(job: dict) -> dict:
                             _set_io_keys(unique_key, output_meta=out_meta)
                         except Exception:  # nosec B110
                             pass
+                        _cleanup_after_success(
+                            chat_id, job_id, _progress_msg_id
+                        )
                         return {"s3_url": url}
                 except Exception:
                     logger.exception("S3 fallback failed for job %s", job_id)
@@ -842,14 +985,9 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:  # nosec B110
             pass
 
-        _tg_send_progress(
-            chat_id,
-            filename,
-            "done",
-            detail="\u2705 Processing complete!",
-            file_size=os.path.getsize(upload_path),
-            message_id=_progress_msg_id,
-        )
+        # Auto-delete the transient messages now that the output was
+        # delivered: the progress bar and the "Queued..." confirmation.
+        _cleanup_after_success(chat_id, job_id, _progress_msg_id)
 
         try:
             if get_current_job is not None:
@@ -963,6 +1101,7 @@ def process_document_job(
     forward_info: dict | None = None,
     file_size: int | None = None,
     user_id: int | None = None,
+    _skip_queued_delete: bool = False,
 ) -> dict | None:
     """RQ job: download a Telegram file by file_id, create thumbnail, and send back the original with thumb.
 
@@ -1301,6 +1440,17 @@ def process_document_job(
                                 file_size=file_size or 0,
                                 message_id=_progress_msg_id,
                             )
+                            # Hand the queued-message record over to the
+                            # pipeline job id so the pipeline worker cleans up
+                            # the confirmation (and this progress message) once
+                            # it delivers the output.
+                            if _rq_job_id:
+                                _append_queued_message(
+                                    _rq_job_id, _progress_msg_id
+                                )
+                                _transfer_queued_messages(
+                                    _rq_job_id, _result.job_id
+                                )
                             return {"pipeline": _result.job_id}
                         else:
                             raise Exception(
@@ -1568,6 +1718,12 @@ def process_document_job(
                                 _set_io_keys(unique_key, output_meta=out_meta)
                             except Exception:  # nosec B110
                                 pass
+                            _cleanup_after_success(
+                                chat_id,
+                                _rq_job_id,
+                                _progress_msg_id,
+                                skip_queued=_skip_queued_delete,
+                            )
                             return {"s3_url": url}
                     except Exception:
                         logger.exception(
@@ -1659,14 +1815,15 @@ def process_document_job(
             except Exception:  # nosec B110
                 pass
 
-            # Update progress to done
-            _tg_send_progress(
+            # Auto-delete the transient messages now that the output was
+            # delivered: the progress bar and the "Queued your file..."
+            # confirmation.  Skipped when running inside a batch job (the
+            # batch cleans up its own confirmation after all items).
+            _cleanup_after_success(
                 chat_id,
-                filename,
-                "done",
-                detail="\u2705 Processing complete!",
-                file_size=os.path.getsize(upload_path),
-                message_id=_progress_msg_id,
+                _rq_job_id,
+                _progress_msg_id,
+                skip_queued=_skip_queued_delete,
             )
 
             try:
@@ -1835,6 +1992,12 @@ def process_document_job(
                                         )
                                     except Exception:  # nosec B110
                                         pass
+                                    _cleanup_after_success(
+                                        chat_id,
+                                        _rq_job_id,
+                                        _progress_msg_id,
+                                        skip_queued=_skip_queued_delete,
+                                    )
                                     return {"s3_url": url}
                             except Exception:
                                 logger.exception(
@@ -1901,6 +2064,14 @@ def process_document_job(
                         job.save_meta()
             except Exception:  # nosec B110
                 pass
+            # Auto-delete the transient messages now that the output was
+            # delivered (progress bar + "Queued your file..." confirmation).
+            _cleanup_after_success(
+                chat_id,
+                _rq_job_id,
+                _progress_msg_id,
+                skip_queued=_skip_queued_delete,
+            )
             return res
 
     except Exception as e:
@@ -1978,11 +2149,20 @@ def process_document_batch_job(
                 forward_info=item.get("forward_info"),
                 file_size=item.get("file_size"),
                 user_id=user_id,
+                _skip_queued_delete=True,
             )
             results.append(res)
         except Exception:
             logger.exception("Failed processing batch item %s", filename)
             results.append({"error": f"failed: {filename}"})
+    # All items delivered — delete the batch's "Queued batch..." confirmation.
+    try:
+        _batch_job = get_current_job()
+        _delete_queued_messages(
+            getattr(_batch_job, "id", None)
+        )
+    except Exception:  # nosec B110
+        pass
     _tg_send_message(
         None,
         chat_id,

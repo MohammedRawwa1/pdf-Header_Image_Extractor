@@ -77,6 +77,7 @@ from utils.error_handler import (  # noqa: E402
     get_error_handler,
     handle_bot_error,
 )
+from utils.markdown_utils import escape_markdown  # noqa: E402
 from utils.progress_tracker import (  # noqa: E402
     _format_size,
     progress_tracker,
@@ -224,6 +225,8 @@ async def _send_with_upload_progress(
     file_size: int,
     loop: asyncio.AbstractEventLoop,
     target_chat_id: int | str = None,
+    task=None,
+    progress_msg_id: int | None = None,
 ) -> bool:
     """Send a file via userbot with upload progress tracking.
 
@@ -235,17 +238,29 @@ async def _send_with_upload_progress(
     Creates a progress task, shows 'uploading' status with a progress bar,
     then calls send_file_via_userbot with a progress callback that updates
     the task in real time. On success, marks the task as completed and
-    edits the message. On failure, marks as failed and re-raises.
+    DELETES the progress message (same auto-removal as the worker flow).
+    On failure, marks as failed and re-raises.
+
+    ``task`` and ``progress_msg_id`` may be passed to REUSE an existing
+    tracker (e.g. the download tracker from ``_userbot_download_fallback``)
+    so the big-file flow shows ONE merged progress message
+    (download -> upload) instead of two separate ones.
 
     Returns True on success, raises on failure.
     """
-    task_id = uuid.uuid4().hex[:12]
-    task = progress_tracker.create_task(
-        task_id, user_id or 0, filename, file_size
-    )
+    if task is None:
+        task_id = uuid.uuid4().hex[:12]
+        task = progress_tracker.create_task(
+            task_id, user_id or 0, filename, file_size
+        )
+        progress_msg_id = await send_progress_update(chat_id, bot, task)
+    else:
+        # Reused tracker (merged download -> upload): the download phase set
+        # processed_size to 100%, so reset it so the upload bar climbs from 0.
+        task.processed_size = 0
     task.status = "uploading"
-    task.start()
-    progress_msg_id = await send_progress_update(chat_id, bot, task)
+    if task.start_time is None:
+        task.start()
     _cb = _make_progress_cb(task.task_id, loop)
 
     try:
@@ -262,10 +277,11 @@ async def _send_with_upload_progress(
         )
         if success:
             await progress_tracker.complete_task(task.task_id)
+            # Auto-remove the transient progress message after delivery.
             if progress_msg_id:
                 try:
-                    await send_progress_update(
-                        chat_id, bot, task, progress_msg_id
+                    await bot.delete_message(
+                        chat_id=chat_id, message_id=progress_msg_id
                     )
                 except Exception:  # nosec B110
                     pass
@@ -360,9 +376,12 @@ async def _userbot_download_fallback(
         file_id: Telegram Bot API ``file_id`` for direct file location download.
 
     Returns:
-        "local"    -> file downloaded to file_path, caller should thumbnail + send
-        "pipeline" -> handled async by BigFilePipeline, caller should return
-        False      -> all methods failed, user already notified
+        ("local", task, progress_msg_id)  -> file downloaded to file_path;
+            caller should thumbnail + send, REUSING the returned tracker and
+            its progress message for the upload phase (merged single message)
+        ("pipeline", None, None)          -> handled async by BigFilePipeline,
+            caller should return
+        (False, None, None)                -> all methods failed, user notified
     """
     from utils.userbot_downloader import download_forward_via_userbot
 
@@ -564,15 +583,26 @@ async def _userbot_download_fallback(
             )
             if _ingest.ok:
                 await progress_tracker.complete_task(task.task_id)
+                # Download is done and the pipeline worker takes over with its
+                # OWN progress message — remove this tracker's message now so
+                # only one live progress message exists at a time.
                 if progress_msg_id:
-                    await send_progress_update(
-                        msg.chat.id, msg.get_bot(), task, progress_msg_id
-                    )
-                await msg.reply_text(
+                    try:
+                        await msg.get_bot().delete_message(
+                            chat_id=msg.chat.id, message_id=progress_msg_id
+                        )
+                    except Exception:  # nosec B110
+                        pass
+                queued_msg = await msg.reply_text(
                     f"Large file ({file_size // (1024 * 1024)} MB) queued for processing.\n"
                     f"Job: {_ingest.job_id[:8]}... You'll receive the result when ready."
                 )
-                return "pipeline"
+                _store_queued_message(
+                    _ingest.job_id,
+                    chat_id,
+                    getattr(queued_msg, "message_id", None),
+                )
+                return ("pipeline", None, None)
             else:
                 logger.warning("BigFilePipeline failed: %s", _ingest.error)
         except Exception as pipe_err:
@@ -581,12 +611,11 @@ async def _userbot_download_fallback(
     if dl_ok:
         actual_size = os.path.getsize(file_path)
         await progress_tracker.update_task_progress(task.task_id, actual_size)
-        await progress_tracker.complete_task(task.task_id)
-        if progress_msg_id:
-            await send_progress_update(
-                msg.chat.id, msg.get_bot(), task, progress_msg_id
-            )
-        return "local"
+        # MERGED TRACKER: hand the download tracker and its progress message to
+        # the caller so the upload phase (``_send_with_upload_progress``) reuses
+        # the SAME message — one download -> upload progress message that is
+        # auto-deleted once the output is delivered.
+        return ("local", task, progress_msg_id)
     else:
         await _notify_download_failed(msg, file_size)
         if task:
@@ -600,7 +629,7 @@ async def _userbot_download_fallback(
                     )
                 except Exception:  # nosec B110
                     pass
-        return False
+        return (False, None, None)
 
 
 # ── User session tracking (Redis + MongoDB) ──────────────────
@@ -666,6 +695,29 @@ async def _track_user_session(update: Update, action: str = "message"):
 
 
 # Optional RQ enqueue helper (import only when needed)
+QUEUED_MSG_KEY = "queued_msg:{}"
+QUEUED_MSG_TTL = 7 * 24 * 3600
+
+
+def _store_queued_message(job_id, chat_id, message_id) -> None:
+    """Remember a "Queued..." confirmation message so the worker can
+    auto-delete it once the job output is delivered (see tasks.py)."""
+    if not job_id or not message_id:
+        return
+    try:
+        r = get_sync_redis()
+        if r:
+            r.setex(
+                QUEUED_MSG_KEY.format(job_id),
+                QUEUED_MSG_TTL,
+                json.dumps(
+                    {"chat_id": chat_id, "message_ids": [message_id]}
+                ),
+            )
+    except Exception:  # nosec B110
+        pass
+
+
 def enqueue_job(func_name: str, *args, **kwargs):
     """Enqueue a job on the RQ 'default' queue.
 
@@ -951,9 +1003,14 @@ async def handle_document(
                 user_id,
             )
             if ok:
-                await msg.reply_text(
+                queued_msg = await msg.reply_text(
                     "Queued your file for background processing; I'll send the result when ready.\n"
                     f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+                )
+                _store_queued_message(
+                    ok,
+                    chat_id,
+                    getattr(queued_msg, "message_id", None),
                 )
                 return
             # fall through to inline processing on enqueue failure
@@ -972,7 +1029,7 @@ async def handle_document(
 
         if use_userbot_download:
             # ── Big file download: forward source → relay → direct → pipeline ──
-            _dl_result = await _userbot_download_fallback(
+            _dl_result, _dl_task, _dl_msg_id = await _userbot_download_fallback(
                 msg,
                 file_path,
                 filename,
@@ -989,6 +1046,12 @@ async def handle_document(
                 return
             if not _dl_result:
                 return
+            # MERGED TRACKER: the download helper hands back its tracker and
+            # progress message so the upload phase below reuses the SAME
+            # message — one download -> upload progress, auto-deleted on
+            # delivery (mirrors the worker flow's auto-removal).
+            task = _dl_task
+            progress_msg_id = _dl_msg_id
         else:
             # ── Normal Bot API download ──
             file = await context.bot.get_file(doc.file_id)
@@ -1077,7 +1140,13 @@ async def handle_document(
                 file_size=_dl_size,
                 loop=_loop,
                 target_chat_id="me",
+                task=task,
+                progress_msg_id=progress_msg_id,
             )
+            # The upload helper completed the tracker and auto-deleted the
+            # merged progress message; nothing left to clean up below.
+            task = None
+            progress_msg_id = None
         else:
             with (
                 open(file_path, "rb") as f_doc,
@@ -1093,9 +1162,12 @@ async def handle_document(
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
-                await send_progress_update(
-                    msg.chat.id, context.bot, task, progress_msg_id
-                )
+                try:
+                    await context.bot.delete_message(
+                        chat_id=msg.chat.id, message_id=progress_msg_id
+                    )
+                except Exception:  # nosec B110
+                    pass
     except Exception as e:
         # Try userbot fallback if Bot API download failed
         if not _dl_success and _check_userbot_available(user_id):
@@ -1104,20 +1176,54 @@ async def handle_document(
                 filename,
             )
             try:
-                _dl_result = await _userbot_download_fallback(
-                    msg,
-                    file_path,
-                    filename,
-                    mime,
-                    file_size or 0,
-                    getattr(doc, "file_unique_id", None),
-                    user_id,
-                    chat_id,
-                    _loop,
-                    forward_info=forward_info,
-                    file_id=doc.file_id,
+                _dl_result, _dl_task, _dl_msg_id = (
+                    await _userbot_download_fallback(
+                        msg,
+                        file_path,
+                        filename,
+                        mime,
+                        file_size or 0,
+                        getattr(doc, "file_unique_id", None),
+                        user_id,
+                        chat_id,
+                        _loop,
+                        forward_info=forward_info,
+                        file_id=doc.file_id,
+                    )
                 )
+                if _dl_result == "pipeline":
+                    # Handed off to the BigFilePipeline; progress message was
+                    # already removed by the fallback helper. Clean up the
+                    # ORIGINAL Bot-API progress task/message (if any) that the
+                    # failed download left behind.
+                    if task:
+                        await progress_tracker.fail_task(
+                            task.task_id, "Superseded by userbot fallback"
+                        )
+                        if progress_msg_id:
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=progress_msg_id,
+                                )
+                            except Exception:  # nosec B110
+                                pass
+                    return
                 if _dl_result == "local":
+                    # Clean up the ORIGINAL Bot-API progress task/message (if
+                    # any) before continuing with the merged tracker below.
+                    if task:
+                        await progress_tracker.fail_task(
+                            task.task_id, "Superseded by userbot fallback"
+                        )
+                        if progress_msg_id:
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=progress_msg_id,
+                                )
+                            except Exception:  # nosec B110
+                                pass
                     # Retry thumbnail + send
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
                     if (
@@ -1150,6 +1256,8 @@ async def handle_document(
                             file_size=_fb_size,
                             loop=_loop,
                             target_chat_id="me",
+                            task=_dl_task,
+                            progress_msg_id=_dl_msg_id,
                         )
                     else:
                         with (
@@ -1163,6 +1271,20 @@ async def handle_document(
                                 thumbnail=f_thumb,
                                 caption="Here is your file (downloaded via userbot) with an auto-generated cover preview.",
                             )
+                        # Auto-remove the transient download progress message
+                        # now that the output was delivered.
+                        if _dl_task:
+                            await progress_tracker.complete_task(
+                                _dl_task.task_id
+                            )
+                            if _dl_msg_id:
+                                try:
+                                    await context.bot.delete_message(
+                                        chat_id=msg.chat.id,
+                                        message_id=_dl_msg_id,
+                                    )
+                                except Exception:  # nosec B110
+                                    pass
                     return
             except Exception as ub_err:
                 logger.exception(
@@ -1274,9 +1396,14 @@ async def handle_photo(
             user_id,
         )
         if ok:
-            await msg.reply_text(
+            queued_msg = await msg.reply_text(
                 "Queued your photo for background processing; I'll send the result when ready.\n"
                 f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+            )
+            _store_queued_message(
+                ok,
+                chat_id,
+                getattr(queued_msg, "message_id", None),
             )
             return
 
@@ -1296,23 +1423,29 @@ async def handle_photo(
 
         if photo_size > upload_limit and _check_userbot_available(user_id):
             # ── Userbot download path for large photos ──
-            _dl_result = await _userbot_download_fallback(
-                msg,
-                file_path,
-                filename,
-                "image/jpeg",
-                photo_size,
-                getattr(photo, "file_unique_id", None),
-                user_id,
-                chat_id,
-                _loop,
-                forward_info=photo_forward_info,
-                file_id=photo.file_id,
+            _dl_result, _dl_task, _dl_msg_id = (
+                await _userbot_download_fallback(
+                    msg,
+                    file_path,
+                    filename,
+                    "image/jpeg",
+                    photo_size,
+                    getattr(photo, "file_unique_id", None),
+                    user_id,
+                    chat_id,
+                    _loop,
+                    forward_info=photo_forward_info,
+                    file_id=photo.file_id,
+                )
             )
             if _dl_result == "pipeline":
                 return
             if not _dl_result:
                 return
+            # MERGED TRACKER: reuse the download tracker + progress message for
+            # the upload phase below (one message, auto-deleted on delivery).
+            task = _dl_task
+            progress_msg_id = _dl_msg_id
         else:
             # ── Normal Bot API download ──
             file = await context.bot.get_file(photo.file_id)
@@ -1359,7 +1492,13 @@ async def handle_photo(
                 file_size=_ph_size,
                 loop=_loop,
                 target_chat_id="me",
+                task=task,
+                progress_msg_id=progress_msg_id,
             )
+            # The upload helper completed the tracker and auto-deleted the
+            # merged progress message; nothing left to clean up below.
+            task = None
+            progress_msg_id = None
         else:
             with (
                 open(file_path, "rb") as f_doc,
@@ -1377,9 +1516,12 @@ async def handle_photo(
         if task:
             await progress_tracker.complete_task(task.task_id)
             if progress_msg_id:
-                await send_progress_update(
-                    msg.chat.id, context.bot, task, progress_msg_id
-                )
+                try:
+                    await context.bot.delete_message(
+                        chat_id=msg.chat.id, message_id=progress_msg_id
+                    )
+                except Exception:  # nosec B110
+                    pass
     except Exception as e:
         # If Bot API download failed but userbot is available, try fallback
         if not _dl_success and _check_userbot_available(user_id):
@@ -1387,20 +1529,54 @@ async def handle_photo(
                 "Bot API download failed for photo, falling back to userbot"
             )
             try:
-                _dl_result = await _userbot_download_fallback(
-                    msg,
-                    file_path,
-                    filename,
-                    "image/jpeg",
-                    photo_size or 0,
-                    getattr(photo, "file_unique_id", None),
-                    user_id,
-                    chat_id,
-                    _loop,
-                    forward_info=photo_forward_info,
-                    file_id=photo.file_id,
+                _dl_result, _dl_task, _dl_msg_id = (
+                    await _userbot_download_fallback(
+                        msg,
+                        file_path,
+                        filename,
+                        "image/jpeg",
+                        photo_size or 0,
+                        getattr(photo, "file_unique_id", None),
+                        user_id,
+                        chat_id,
+                        _loop,
+                        forward_info=photo_forward_info,
+                        file_id=photo.file_id,
+                    )
                 )
+                if _dl_result == "pipeline":
+                    # Handed off to the BigFilePipeline; progress message was
+                    # already removed by the fallback helper. Clean up the
+                    # ORIGINAL Bot-API progress task/message (if any) that the
+                    # failed download left behind.
+                    if task:
+                        await progress_tracker.fail_task(
+                            task.task_id, "Superseded by userbot fallback"
+                        )
+                        if progress_msg_id:
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=progress_msg_id,
+                                )
+                            except Exception:  # nosec B110
+                                pass
+                    return
                 if _dl_result == "local":
+                    # Clean up the ORIGINAL Bot-API progress task/message (if
+                    # any) before continuing with the merged tracker below.
+                    if task:
+                        await progress_tracker.fail_task(
+                            task.task_id, "Superseded by userbot fallback"
+                        )
+                        if progress_msg_id:
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=progress_msg_id,
+                                )
+                            except Exception:  # nosec B110
+                                pass
                     thumb_path = os.path.join(tmpdir, "thumb.jpg")
                     create_thumbnail_from_image(file_path, thumb_path)
                     _ph_fb_size = os.path.getsize(file_path)
@@ -1420,6 +1596,8 @@ async def handle_photo(
                             file_size=_ph_fb_size,
                             loop=_loop,
                             target_chat_id="me",
+                            task=_dl_task,
+                            progress_msg_id=_dl_msg_id,
                         )
                     else:
                         with (
@@ -1435,6 +1613,20 @@ async def handle_photo(
                                 thumbnail=f_thumb,
                                 caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail.",
                             )
+                        # Auto-remove the transient download progress message
+                        # now that the output was delivered.
+                        if _dl_task:
+                            await progress_tracker.complete_task(
+                                _dl_task.task_id
+                            )
+                            if _dl_msg_id:
+                                try:
+                                    await context.bot.delete_message(
+                                        chat_id=msg.chat.id,
+                                        message_id=_dl_msg_id,
+                                    )
+                                except Exception:  # nosec B110
+                                    pass
                     return
             except Exception as ub_err:
                 logger.exception(
@@ -1476,9 +1668,15 @@ async def cmd_start(
             "Access denied. This bot is private."
         )
         return
-    user_name = getattr(update.effective_user, "first_name", None) or "there"
+    # Prefer the Telegram username (e.g. @mohammad) over the display name
+    # so the welcome matches the name the user is known by on Telegram.
+    _eff_user = update.effective_user
+    if _eff_user and getattr(_eff_user, "username", None):
+        user_name = "@" + _eff_user.username
+    else:
+        user_name = getattr(_eff_user, "first_name", None) or "there"
     await update.effective_message.reply_text(
-        f"🎉 Welcome, {user_name}!\n\n"
+        f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
         "📄 Send me a **PDF** or **image** and I'll return a thumbnail "
         "(PDF first page used as cover).\n\n"
         "⚡ **Quick commands:**\n"
@@ -1749,9 +1947,14 @@ async def cmd_endbatch(
         )
         if ok:
             await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
-            await update.effective_message.reply_text(
+            queued_msg = await update.effective_message.reply_text(
                 f"Queued batch with {len(items)} items for processing.\n"
                 f"Job ID: `{ok}` — use /canceljob {ok} to cancel it."
+            )
+            _store_queued_message(
+                ok,
+                chat_id,
+                getattr(queued_msg, "message_id", None),
             )
             return
         # fall through to inline execution on failure
@@ -2324,6 +2527,9 @@ def _wipe_job_redis_keys(job_id: str) -> None:
     Covers BOTH background pipes for consistency:
       - shared bookkeeping keys (progress/io/cancel)
       - BigFile pipeline keys (pdf:job:<id> hash, pdf:progress:<id>)
+      - the queued_msg:<id> record (the Telegram "Queued..." message is
+        deleted separately by the caller before this runs, so the record is
+        still readable when the message ids are fetched)
     (RQ job hashes/registries are handled by ``_cancel_rq_job`` itself.)
     """
     try:
@@ -2337,6 +2543,7 @@ def _wipe_job_redis_keys(job_id: str) -> None:
             f"cancel:{job_id}",
             f"pdf:job:{job_id}",
             f"pdf:progress:{job_id}",
+            f"queued_msg:{job_id}",
         ):
             try:
                 r.delete(key)
@@ -2501,6 +2708,15 @@ async def cmd_canceljob(
         actions.append(f"pipeline job `{job_id}`")
 
     if owned:
+        # Auto-delete the "Queued..." confirmation(s) for this job BEFORE
+        # wiping keys (the wipe would remove the queued_msg:<id> record that
+        # _delete_queued_messages needs to read the message ids).
+        try:
+            import tasks
+
+            tasks._delete_queued_messages(job_id)
+        except Exception:  # nosec B110
+            pass
         # Ownership verified: wipe Redis keys + set the in-flight abort flag
         _wipe_job_redis_keys(job_id)
         try:
