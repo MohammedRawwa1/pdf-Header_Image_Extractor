@@ -1459,35 +1459,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Access denied. This bot is private."
         )
         return
+
     text = (
-        "📚 **Help — all commands**\n\n"
-        "**📄 Core**\n"
+        "📚 Help — all commands\n\n"
+        "📄 Core\n"
         "• /start — welcome & quick start\n"
         "• /help — this help\n"
         "• /status — bot status\n\n"
-        "**🔐 Your sessions (per-user)**\n"
-        "• /login [phone] — connect **your** Telethon account\n"
-        "• /loginpyro [phone] — connect **your** Pyrogram account\n"
-        "• /loginstatus — check **your** session health\n"
-        "• /logout — disconnect **your** Telethon session\n"
-        "• /logoutpyro — disconnect **your** Pyrogram session\n"
+        "🔐 Your sessions (per-user)\n"
+        "• /login [phone] — connect your Telethon account\n"
+        "• /loginpyro [phone] — connect your Pyrogram account\n"
+        "• /loginstatus — check your session health\n"
+        "• /logout — disconnect your Telethon session\n"
+        "• /logoutpyro — disconnect your Pyrogram session\n"
         "• /clearflood — reset a stuck login flow\n"
         "• /cancel — cancel an active login flow\n\n"
-        "**📦 Jobs**\n"
+        "📦 Jobs\n"
         "• /canceljob <id> — cancel a queued/in-flight job\n\n"
-        "**🗂 Batch**\n"
+        "🗂 Batch\n"
         "• /startbatch — start collecting forwarded files\n"
         "• /endbatch — process the collected batch\n"
         "• /cancelbatch — discard the collected batch\n\n"
-        "**⚙️ Admin / owner**\n"
+        "⚙️ Admin / owner\n"
         "• /admin add|remove|list <user_id> — manage allowed users\n"
         "• /sessionstatus — userbot session health (owner)\n"
         "• /setwebhook <url> — set webhook (owner)\n"
         "• /delwebhook — delete webhook (owner)\n"
         "• /setcommands — push this list to Telegram (owner)\n\n"
-        "_Send a PDF or image any time to get its thumbnail._"
+        "Send a PDF or image any time to get its thumbnail."
     )
-    await update.effective_message.reply_text(text, parse_mode="Markdown")
+    await update.effective_message.reply_text(text)
 
 
 async def cmd_status(
