@@ -5,9 +5,12 @@ Runs as a background asyncio task that wakes every hour and cleans:
   1. Old temp / input / output files from storage directories
   2. Old S3 objects via storage.purge_objects_older_than
   3. Stale io:in / io:out keys from Redis
+  4. Stale ``processed:*`` records (cached re-send results whose Telegram
+     file_id has likely expired — see utils/processed_cache.py)
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -18,6 +21,11 @@ try:
     import config
 except Exception:
     config = None
+
+try:
+    from utils.processed_cache import PROCESSED_TTL as _DEFAULT_PROCESSED_TTL
+except Exception:  # nosec B110 - fall back to 30 days
+    _DEFAULT_PROCESSED_TTL = 30 * 24 * 3600
 
 
 class CleanupManager:
@@ -35,17 +43,28 @@ class CleanupManager:
         )  # 1 hour
         self.s3_ttl = int(os.getenv("CLEANUP_S3_TTL", "86400"))  # 24 hours
         self.io_ttl = int(os.getenv("CLEANUP_IO_TTL", "604800"))  # 7 days
+        # Cached re-send records (utils/processed_cache.py) are actively
+        # pruned once their last write is older than this, instead of only
+        # relying on Redis TTL expiry — a record that old is keeping a
+        # Telegram file_id that is likely expired, so it would only produce
+        # failed re-sends.  Defaults to the cache's own TTL so both stay in
+        # sync from one place.
+        self.processed_ttl = int(
+            os.getenv("CLEANUP_PROCESSED_TTL", str(_DEFAULT_PROCESSED_TTL))
+        )
         self.is_running = False
 
     async def start(self):
         """Start periodic cleanup loop."""
         self.is_running = True
         logger.info(
-            "CleanupManager started (interval=%ds, file_age=%ds, temp_age=%ds, s3_ttl=%ds)",
+            "CleanupManager started (interval=%ds, file_age=%ds, temp_age=%ds, "
+            "s3_ttl=%ds, processed_ttl=%ds)",
             self.cleanup_interval,
             self.max_file_age,
             self.max_temp_age,
             self.s3_ttl,
+            self.processed_ttl,
         )
 
         while self.is_running:
@@ -89,6 +108,7 @@ class CleanupManager:
             ),
             "s3_objects": await self._cleanup_s3(),
             "redis_io_keys": await self._cleanup_redis_io_keys(),
+            "redis_processed_keys": await self._cleanup_redis_processed_keys(),
         }
 
         total = sum(results.values())
@@ -163,7 +183,6 @@ class CleanupManager:
             import redis as _redis
 
             r = _redis.from_url(config.REDIS_URL)
-            time.time()
             removed = 0
 
             for pattern in ("io:in:*", "io:out:*"):
@@ -180,6 +199,59 @@ class CleanupManager:
                         pass
 
             return removed
+        except Exception:
+            return 0
+
+    async def _cleanup_redis_processed_keys(self) -> int:
+        """Prune stale ``processed:*`` cached re-send records from Redis.
+
+        Each record (see utils/processed_cache.py) stores a delivered copy's
+        Telegram file_id.  Records whose last write (``meta.at``) is older
+        than ``self.processed_ttl`` are deleted outright — the stored file_id
+        is long past its useful life, so a cached re-send would only fail.
+        Younger records that somehow lack a Redis TTL get one as a safety
+        net.  Returns the number of keys removed or TTL-fixed.
+        """
+        try:
+            from utils.redis_client import get_sync_redis
+
+            r = get_sync_redis()
+            if not r:
+                return 0
+
+            now = time.time()
+            handled = 0
+            keys = r.keys("processed:*")
+            for key in keys:
+                try:
+                    ttl = r.ttl(key)
+                    if ttl == -2:  # Already gone
+                        continue
+                    # Last-write timestamp recorded by upsert_processed_record.
+                    _at = None
+                    _raw = r.hget(key, "meta")
+                    if _raw:
+                        try:
+                            _meta = json.loads(_raw)
+                            _at = (
+                                _meta.get("at") if isinstance(_meta, dict) else None
+                            )
+                        except Exception:  # nosec B110 - unreadable meta
+                            _at = None
+                    if _at is not None and now - float(_at) > self.processed_ttl:
+                        # Stale: prune even if it still has a TTL left.
+                        r.delete(key)
+                        handled += 1
+                        logger.debug(
+                            "Cleanup: pruned stale processed record %s", key
+                        )
+                    elif ttl == -1:  # Young but no expiry — set one
+                        r.expire(key, self.processed_ttl)
+                        handled += 1
+                except Exception:  # nosec B110 - best-effort per key
+                    pass
+
+            return handled
         except Exception:
             return 0
 

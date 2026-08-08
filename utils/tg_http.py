@@ -181,15 +181,6 @@ def _tg_send_document(
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-    attach_compress = bool(
-        compress_user_id and filename and filename.lower().endswith(".pdf")
-    )
-    attach_convert = bool(
-        convert_user_id and filename and not filename.lower().endswith(".pdf")
-    )
-    attach_ocr = bool(
-        ocr_user_id and is_ocr_source(filename) and ocr_enabled()
-    )
     # Retry on transient 429/5xx (Telegram flood control) with backoff — the
     # worker shares the bot token with the web process, so sends must tolerate
     # global-rate-limit responses instead of failing the job.
@@ -234,49 +225,14 @@ def _tg_send_document(
             # tap -> compress_pdf_job).  Uses the DELIVERED file_id so the
             # user compresses exactly what they received.
             if _res and _res.get("ok"):
-                try:
-                    _result = _res.get("result") or {}
-                    _msg_id = _result.get("message_id")
-                    _doc = _result.get("document") or {}
-                    _actions: list[tuple[str, str, str]] = []
-                    if attach_compress:
-                        # 🗜 Compress on delivered PDFs (thumb/convert/compress
-                        # results — one tap -> compress_pdf_job).
-                        _actions.append(
-                            (
-                                COMPRESS_PDF_ACTION[0],
-                                COMPRESS_PDF_ACTION[1],
-                                COMPRESS_PDF_ACTION[2],
-                            )
-                        )
-                    if attach_convert:
-                        # 🔁 Convert on delivered e-books (its own interface —
-                        # never mixed with the thumbnail flow).
-                        _actions.append(
-                            (
-                                BOOK_CONVERT_ACTION[0],
-                                BOOK_CONVERT_ACTION[1],
-                                BOOK_CONVERT_ACTION[2],
-                            )
-                        )
-                    if attach_ocr:
-                        # 🔎 OCR on delivered PDFs/images (scanned text).
-                        _actions.append(
-                            (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
-                        )
-                    if _actions:
-                        _attach_pending_buttons(
-                            chat_id,
-                            _msg_id,
-                            _doc.get("file_id"),
-                            _doc.get("file_unique_id"),
-                            filename,
-                            compress_user_id or convert_user_id or ocr_user_id,
-                            _doc.get("file_size"),
-                            tuple(_actions),
-                        )
-                except Exception:  # nosec B110 - best-effort button
-                    pass
+                _attach_send_buttons(
+                    chat_id,
+                    _res,
+                    filename,
+                    compress_user_id,
+                    convert_user_id,
+                    ocr_user_id,
+                )
             return _res
         except (
             requests.exceptions.ConnectionError,
@@ -293,6 +249,143 @@ def _tg_send_document(
                 time.sleep(2**attempt)
                 continue
     raise last_exc or RuntimeError(f"Failed to send document {filename}")
+
+
+def _attach_send_buttons(
+    chat_id: int,
+    res: dict,
+    filename: str,
+    compress_user_id: int | None = None,
+    convert_user_id: int | None = None,
+    ocr_user_id: int | None = None,
+) -> None:
+    """Attach one-tap follow-up buttons to a delivered document (best-effort).
+
+    Shared by the upload path (``_tg_send_document``) and the cached re-send
+    path (``_tg_send_document_by_id``) so both land the same Compress /
+    Convert / OCR buttons on the delivered copy.  ``res`` is the sendDocument
+    response dict.  Uses the DELIVERED file_id so one-tap actions operate on
+    exactly what the user received.
+    """
+    if not res or not res.get("ok"):
+        return
+    try:
+        _result = res.get("result") or {}
+        _msg_id = _result.get("message_id")
+        _doc = _result.get("document") or {}
+        _actions: list[tuple[str, str, str]] = []
+        if compress_user_id and filename and filename.lower().endswith(".pdf"):
+            # 🗜 Compress on delivered PDFs (thumb/convert/compress results —
+            # one tap -> compress_pdf_job).
+            _actions.append(
+                (
+                    COMPRESS_PDF_ACTION[0],
+                    COMPRESS_PDF_ACTION[1],
+                    COMPRESS_PDF_ACTION[2],
+                )
+            )
+        if convert_user_id and filename and not filename.lower().endswith(".pdf"):
+            # 🔁 Convert on delivered e-books (its own interface — never
+            # mixed with the thumbnail flow).
+            _actions.append(
+                (
+                    BOOK_CONVERT_ACTION[0],
+                    BOOK_CONVERT_ACTION[1],
+                    BOOK_CONVERT_ACTION[2],
+                )
+            )
+        if ocr_user_id and is_ocr_source(filename) and ocr_enabled():
+            # 🔎 OCR on delivered PDFs/images (scanned text).
+            _actions.append((OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2]))
+        if _actions:
+            _attach_pending_buttons(
+                chat_id,
+                _msg_id,
+                _doc.get("file_id"),
+                _doc.get("file_unique_id"),
+                filename,
+                compress_user_id or convert_user_id or ocr_user_id,
+                _doc.get("file_size"),
+                tuple(_actions),
+            )
+    except Exception:  # nosec B110 - best-effort button
+        pass
+
+
+def _tg_send_document_by_id(
+    bot_token: str | None,
+    chat_id: int,
+    document_file_id: str,
+    filename: str,
+    caption: str | None = None,
+    compress_user_id: int | None = None,
+    convert_user_id: int | None = None,
+    ocr_user_id: int | None = None,
+) -> dict:
+    """Re-send a previously delivered document by its cached Bot API file_id.
+
+    Zero upload: Telegram restores the file (and its stored thumbnail) from
+    the file_id, so a cached result can be re-delivered WITHOUT re-processing
+    — even after the user deleted the bot's earlier messages.  Returns the
+    Bot API response dict; raises after 3 attempts on persistent errors.
+    """
+    bot_token = _get_bot_token(bot_token)
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    data: dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "document": document_file_id,
+    }
+    if caption:
+        data["caption"] = caption
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            r = _SESSION.post(url, data=data, timeout=60)
+            if r.status_code in (429,) or r.status_code >= 500:
+                last_exc = requests.exceptions.HTTPError(
+                    f"Telegram sendDocument-by-id failed: status={r.status_code}"
+                )
+                logger.warning(
+                    "_tg_send_document_by_id: HTTP %s on attempt %d",
+                    r.status_code,
+                    attempt + 1,
+                )
+                try:
+                    r.close()
+                except Exception:  # nosec B110 - best-effort cleanup
+                    pass
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
+                raise last_exc
+            r.raise_for_status()
+            _res = r.json()
+            if _res and _res.get("ok"):
+                _attach_send_buttons(
+                    chat_id,
+                    _res,
+                    filename,
+                    compress_user_id,
+                    convert_user_id,
+                    ocr_user_id,
+                )
+            return _res
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            last_exc = e
+            logger.warning(
+                "_tg_send_document_by_id: transient error %s on attempt %d",
+                type(e).__name__,
+                attempt + 1,
+            )
+            if attempt < 2:
+                time.sleep(2**attempt)
+                continue
+    raise last_exc or RuntimeError(
+        f"Failed to re-send document by file_id {document_file_id}"
+    )
 
 
 def _tg_send_message(

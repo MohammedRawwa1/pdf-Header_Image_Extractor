@@ -98,6 +98,11 @@ from utils.ocr import (  # noqa: E402
     ocr_enabled,
     ocr_pdf_available,
 )
+from utils.processed_cache import (  # noqa: E402
+    _get_pdf_checks,
+    get_processed_by_file_unique_id,
+    get_processed_op,
+)
 from utils.progress_tracker import (  # noqa: E402
     _format_size,
     progress_tracker,
@@ -120,6 +125,7 @@ from utils.tg_http import (  # noqa: E402
     _attach_pending_buttons,
     _tg_forward_message,
     _tg_send_document,
+    _tg_send_document_by_id,
     _tg_send_pending_prompt,
 )
 from utils.url_validation import _validate_url_safe  # noqa: E402
@@ -964,6 +970,93 @@ def _store_queued_message(job_id, chat_id, message_id) -> None:
         pass
 
 
+def _resend_cached_result(
+    chat_id: int,
+    file_unique_id: str | None,
+    filename: str,
+    op: str,
+    user_id: int,
+    caption: str,
+    target: str | None = None,
+) -> bool:
+    """Re-send a previously delivered result by its cached Bot API file_id.
+
+    Returns True when a cached ``done`` copy existed and was re-sent; False
+    when there is nothing cacheable/usable (callers fall back to a fresh
+    job).  Re-sends reuse Telegram's stored copy — Bot API deliveries by
+    file_id (keeps the thumbnail), userbot deliveries (big files) by
+    forwarding the delivered message via the userbot (server-side media
+    copy) — so it works even after the user deleted the bot's earlier
+    messages.
+
+    Resolution goes through the file's Telegram ``file_unique_id`` (the
+    worker bound it to the content hash in the pdfcheck record) — the web
+    process never has the file bytes, so the dedup record is keyed by the
+    CONTENT hash, never name+size.
+
+    ``target`` (book conversion) selects the per-target op entry
+    (``ops:convert:pdf`` etc) — each format keeps its own cached copy, so
+    converting the same book to a second format never evicts the first.
+    """
+    rec = get_processed_by_file_unique_id(file_unique_id)
+    if not rec:
+        return False
+    entry = get_processed_op(rec, op, target)
+    if not entry or entry.get("status") != "done":
+        return False
+    if entry.get("delivery") == "userbot":
+        # Big-file results have no Bot API file_id — forward the delivered
+        # copy via the userbot (server-side media copy, no re-upload).
+        # Try the re-send chat first (correct for groups, where ids match
+        # between the bot and the userbot), then fall back to the bot's DM /
+        # Saved Messages (the original big-file delivery target).
+        if not (entry.get("src_chat_id") and entry.get("src_message_id")):
+            return False
+        try:
+            import asyncio as _asyncio
+
+            from utils.userbot_downloader import _get_bot_user_id
+            from utils.userbot_uploader import forward_message_via_userbot
+
+            _targets: list[int | str] = [chat_id]
+            _targets.append(_get_bot_user_id() or "me")
+            for _t in _targets:
+                _ok = _asyncio.run(
+                    forward_message_via_userbot(
+                        _t,
+                        entry["src_chat_id"],
+                        int(entry["src_message_id"]),
+                        user_id=user_id,
+                    )
+                )
+                if _ok:
+                    return True
+            return False
+        except Exception:
+            logger.warning(
+                "Failed to re-send cached %s result for %s", op, filename
+            )
+            return False
+    if not entry.get("file_id"):
+        return False
+    try:
+        _res = _tg_send_document_by_id(
+            None,
+            chat_id,
+            entry["file_id"],
+            rec.get("filename") or filename,
+            caption=caption,
+            compress_user_id=user_id,
+            ocr_user_id=user_id,
+        )
+        return bool(_res and _res.get("ok"))
+    except Exception:
+        logger.warning(
+            "Failed to re-send cached %s result for %s", op, filename
+        )
+        return False
+
+
 def enqueue_job(
     func_name: str,
     *args,
@@ -1256,6 +1349,33 @@ async def handle_document(
                 await msg.reply_text(
                     "\u274c Couldn't detect what this file is. Try sending "
                     "a PDF, image, or e-book."
+                )
+            except Exception:  # nosec B110
+                pass
+            return
+
+        # ── Cached-result re-send (already processed) ───────────────────
+        # The same file (name+size) was already delivered with a thumbnail:
+        # re-send the cached copy instead of starting a new job — even if the
+        # user deleted the bot's earlier messages (Telegram keeps the file
+        # behind the file_id).  Only the PRIMARY thumbnail deliverable is
+        # auto-resent here (other operations like OCR stay behind the menu so
+        # the user can still pick a different action).  Falls through to the
+        # menu when nothing is cached or the cached copy expired.
+        if await asyncio.to_thread(
+            _resend_cached_result,
+            chat_id,
+            getattr(doc, "file_unique_id", None),
+            filename,
+            "thumb",
+            user_id,
+            "\U0001f5bc\ufe0f Here is your file (cached result — "
+            "already processed).",
+        ):
+            try:
+                await msg.reply_text(
+                    "\u267b\ufe0f Already processed this file before — "
+                    "re-sent the cached result, no new job was started.",
                 )
             except Exception:  # nosec B110
                 pass
@@ -4604,6 +4724,63 @@ async def handle_ctx_thumb_callback(
             "This action is invalid. Send the file again.", show_alert=True
         )
         return
+    # ── Already-thumbed / already-processed gate (skip the job entirely) ──
+    # Cached validator: a PDF that ships an embedded thumbnail needs nothing
+    # re-added.  Cached record: the same CONTENT (resolved via the file's
+    # Telegram file_unique_id) was already delivered — re-send the cached copy
+    # instead of queueing a new job (even if the user deleted the bot's
+    # earlier messages).
+    if rec.get("file_unique_id"):
+        _fchecks = _get_pdf_checks(rec.get("file_unique_id"))
+        if _fchecks is not None and _fchecks.get("has_thumb") is True:
+            _msg = "\u2705 This PDF already has a thumbnail — nothing to add."
+            try:
+                await query.answer(_msg)
+            except Exception:  # nosec B110
+                pass
+            await _replace_tapped_text(query, _msg, InlineKeyboardMarkup([]))
+            return
+        _rec = get_processed_by_file_unique_id(rec.get("file_unique_id"))
+        if _rec:
+            _entry = (_rec.get("ops") or {}).get("thumb")
+            if _entry is not None:
+                if _entry.get("status") == "skipped":
+                    _msg = (
+                        "\u2705 This PDF already has a thumbnail — "
+                        "nothing to add."
+                    )
+                    try:
+                        await query.answer(_msg)
+                    except Exception:  # nosec B110
+                        pass
+                    await _replace_tapped_text(
+                        query, _msg, InlineKeyboardMarkup([])
+                    )
+                    return
+                if await asyncio.to_thread(
+                    _resend_cached_result,
+                    chat_id,
+                    rec.get("file_unique_id"),
+                    filename,
+                    "thumb",
+                    armer,
+                    "\U0001f5bc\ufe0f Here is your file (cached result — "
+                    "already processed).",
+                ):
+                    _msg = (
+                        "\u267b\ufe0f Already processed — re-sent the cached "
+                        "result. No new job was started."
+                    )
+                    try:
+                        await query.answer(_msg)
+                    except Exception:  # nosec B110
+                        pass
+                    await _replace_tapped_text(
+                        query, _msg, InlineKeyboardMarkup([])
+                    )
+                    return
+                # Cached copy expired (Telegram dropped the file): fall
+                # through and process fresh so the user still gets the file.
     # job_timeout > RQ's 180s default: a large file's userbot download +
     # thumbnail pass can legitimately outlive the death penalty.
     ok = await asyncio.to_thread(
@@ -4691,42 +4868,105 @@ async def handle_ctx_thumb_ocr_callback(
             "This action is invalid. Send the file again.", show_alert=True
         )
         return
+    # ── Already-processed gate: queue only the parts not yet done ──
+    # Re-sends of the same CONTENT (resolved via the file's Telegram
+    # file_unique_id) skip the parts already delivered (cached file_id
+    # re-sent instead of a new job) and the parts the PDF validator already
+    # proved pointless (embedded thumb / text layer).
+    _fchecks = _get_pdf_checks(rec.get("file_unique_id"))
+    _f_thumb = _fchecks.get("has_thumb") if _fchecks is not None else None
+    _f_ocr = (
+        _fchecks.get("has_text_layer") if _fchecks is not None else None
+    )
+    _rec = (
+        get_processed_by_file_unique_id(rec.get("file_unique_id"))
+        if rec.get("file_unique_id")
+        else None
+    )
+    _ops = (_rec or {}).get("ops") or {}
+    _thumb_entry = _ops.get("thumb")
+    _ocr_entry = _ops.get("ocr")
+    _thumb_handled = _thumb_entry is not None or _f_thumb is True
+    _ocr_handled = _ocr_entry is not None or _f_ocr is True
+    if _thumb_handled and _ocr_handled:
+        # Both parts are already done: re-send one cached copy if available.
+        _resent = False
+        if _thumb_entry and _thumb_entry.get("status") == "done":
+            _resent = await asyncio.to_thread(
+                _resend_cached_result,
+                chat_id,
+                rec.get("file_unique_id"),
+                filename,
+                "thumb",
+                armer,
+                "\U0001f5bc\ufe0f Here is your file (cached result — "
+                "already processed).",
+            )
+        if not _resent and _ocr_entry and _ocr_entry.get("status") == "done":
+            _resent = await asyncio.to_thread(
+                _resend_cached_result,
+                chat_id,
+                rec.get("file_unique_id"),
+                filename,
+                "ocr",
+                armer,
+                "\U0001f50e Here is the cached OCR result (already "
+                "processed).",
+            )
+        _msg = (
+            "\u267b\ufe0f Already processed — re-sent the cached result, "
+            "no new job."
+            if _resent
+            else "\u2705 Already processed — nothing new to add."
+        )
+        try:
+            await query.answer(_msg)
+        except Exception:  # nosec B110
+            pass
+        await _replace_tapped_text(query, _msg, InlineKeyboardMarkup([]))
+        return
+    _want_thumb = not _thumb_handled
+    _want_ocr = not _ocr_handled
     # OCR target: honor the user's pinned default, else searchable PDF when
     # the engine is available, else plain text.
     _target = (get_user_setting(armer, "ocr_target", "") or "").lower()
     if _target not in ("pdf", "txt"):
         _target = "pdf" if ocr_pdf_available() else "txt"
-    ok_thumb = await asyncio.to_thread(
-        enqueue_job,
-        "process_document_job",
-        chat_id,
-        rec.get("file_id"),
-        filename,
-        rec.get("mime", ""),
-        rec.get("file_unique_id"),
-        rec.get("message_id"),
-        rec.get("forward_info"),
-        rec.get("file_size"),
-        armer,
-        owner_user_id=armer,
-        job_timeout=1800,
-    )
-    ok_ocr = await asyncio.to_thread(
-        enqueue_job,
-        "ocr_job",
-        chat_id,
-        rec.get("file_id"),
-        filename,
-        armer,
-        rec.get("file_unique_id"),
-        rec.get("message_id"),
-        None,  # forward_info is not stored in the pending record
-        rec.get("file_size"),
-        owner_user_id=armer,
-        source_chat_id=rec.get("source_chat_id"),
-        target=_target,
-        job_timeout=7200,
-    )
+    ok_thumb = None
+    if _want_thumb:
+        ok_thumb = await asyncio.to_thread(
+            enqueue_job,
+            "process_document_job",
+            chat_id,
+            rec.get("file_id"),
+            filename,
+            rec.get("mime", ""),
+            rec.get("file_unique_id"),
+            rec.get("message_id"),
+            rec.get("forward_info"),
+            rec.get("file_size"),
+            armer,
+            owner_user_id=armer,
+            job_timeout=1800,
+        )
+    ok_ocr = None
+    if _want_ocr:
+        ok_ocr = await asyncio.to_thread(
+            enqueue_job,
+            "ocr_job",
+            chat_id,
+            rec.get("file_id"),
+            filename,
+            armer,
+            rec.get("file_unique_id"),
+            rec.get("message_id"),
+            None,  # forward_info is not stored in the pending record
+            rec.get("file_size"),
+            owner_user_id=armer,
+            source_chat_id=rec.get("source_chat_id"),
+            target=_target,
+            job_timeout=7200,
+        )
     if ok_thumb or ok_ocr:
         _queued_parts = []
         _kb_rows: list[list[InlineKeyboardButton]] = []
@@ -4740,14 +4980,26 @@ async def handle_ctx_thumb_ocr_callback(
             _kb_o = _queued_cancel_kb(armer, ok_ocr)
             if _kb_o:
                 _kb_rows.extend(_kb_o.inline_keyboard)
-        _partial = ok_thumb != ok_ocr and (ok_thumb is None or ok_ocr is None)
+        _skipped_parts = []
+        if not _want_thumb:
+            _skipped_parts.append("\U0001f5bc\ufe0f thumbnail already done")
+        if not _want_ocr:
+            _skipped_parts.append("\U0001f50e OCR already done")
+        _failed_part = (ok_thumb is None and _want_thumb) or (
+            ok_ocr is None and _want_ocr
+        )
         _msg = (
             f"\U0001f50e\U0001f5bc\ufe0f Building thumbnail + OCR for "
             f"`{safe_code_span(filename)}`...\n"
             + "\n".join(_queued_parts)
             + (
+                f"\n_skipping: {', '.join(_skipped_parts)}._"
+                if _skipped_parts
+                else ""
+            )
+            + (
                 "\n\u26a0\ufe0f One of the jobs failed to queue — try again."
-                if _partial
+                if _failed_part
                 else ""
             )
         )
@@ -4958,6 +5210,38 @@ async def handle_book_compress_callback(
             "This action is invalid. Send the book again.", show_alert=True
         )
         return
+    # ── Already-converted gate (compress = convert-to-PDF + shrink) ──
+    # Same content re-sent: re-send the cached compressed copy (target
+    # "pdf:compress") instead of re-running Calibre + Ghostscript.
+    _fuid = rec.get("file_unique_id")
+    if _fuid:
+        _rec = get_processed_by_file_unique_id(_fuid)
+        _conv = get_processed_op(_rec, "convert", "pdf:compress")
+        if (
+            _conv
+            and _conv.get("status") == "done"
+            and await asyncio.to_thread(
+                _resend_cached_result,
+                chat_id,
+                _fuid,
+                filename,
+                "convert",
+                armer,
+                "\U0001f5dc\ufe0f Here is your compressed book (cached "
+                "result — already processed).",
+                "pdf:compress",
+            )
+        ):
+            _msg = (
+                "\u267b\ufe0f Already compressed — re-sent the cached "
+                "result. No new job was started."
+            )
+            try:
+                await query.answer(_msg)
+            except Exception:  # nosec B110
+                pass
+            await _replace_tapped_text(query, _msg, InlineKeyboardMarkup([]))
+            return
     # job_timeout covers the full convert-to-PDF + compress + deliver chain.
     _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
     ok = await asyncio.to_thread(
@@ -5045,6 +5329,40 @@ async def handle_book_convert_callback(
     await _track_user_session(update, "book_convert")
     chat_id = pending.get("chat_id")
     filename = pending.get("filename") or "file"
+    # ── Already-converted gate (same target format only) ──
+    # A re-send of the same book resolves the cached convert record via its
+    # Telegram file_unique_id and re-sends the cached copy (Bot API file_id
+    # or a userbot forward for big results) instead of queueing a fresh
+    # Calibre job.  Only when the cached TARGET matches — converting to a
+    # different format must run fresh.
+    _fuid = pending.get("file_unique_id")
+    if _fuid:
+        _rec = get_processed_by_file_unique_id(_fuid)
+        _conv = get_processed_op(_rec, "convert", target)
+        if (
+            _conv
+            and _conv.get("status") == "done"
+            and await asyncio.to_thread(
+                _resend_cached_result,
+                chat_id,
+                _fuid,
+                filename,
+                "convert",
+                armer,
+                "\U0001f4da Here is your converted book (cached result — "
+                "already processed).",
+                target,
+            )
+        ):
+            try:
+                await query.edit_message_text(
+                    "\u267b\ufe0f Already converted to this format — re-sent "
+                    "the cached result. No new job was started.",
+                    reply_markup=InlineKeyboardMarkup([]),
+                )
+            except Exception:  # nosec B110
+                pass
+            return
     # job_timeout caps the ENTIRE RQ job — download + convert + deliver — so
     # it must exceed RQ's 180s default AND cover a slow userbot re-download
     # of a large book on top of the Calibre conversion window.
@@ -5137,6 +5455,48 @@ async def handle_compress_callback(
             show_alert=True,
         )
         return
+    # ── Already-processed gate (skip the job entirely) ──
+    if rec.get("file_unique_id"):
+        _rec = get_processed_by_file_unique_id(rec.get("file_unique_id"))
+        if _rec:
+            _entry = (_rec.get("ops") or {}).get("compress")
+            if _entry is not None:
+                if _entry.get("status") == "skipped":
+                    _msg = (
+                        "\u2705 Already processed — this PDF was already "
+                        "well-compressed (kept the original)."
+                    )
+                    try:
+                        await query.answer(_msg)
+                    except Exception:  # nosec B110
+                        pass
+                    await _replace_tapped_text(
+                        query, _msg, InlineKeyboardMarkup([])
+                    )
+                    return
+                if await asyncio.to_thread(
+                    _resend_cached_result,
+                    chat_id,
+                    rec.get("file_unique_id"),
+                    filename,
+                    "compress",
+                    armer,
+                    "\U0001f5dc\ufe0f Here is the cached compressed result "
+                    "(already processed).",
+                ):
+                    _msg = (
+                        "\u267b\ufe0f Already processed — re-sent the "
+                        "cached result. No new job was started."
+                    )
+                    try:
+                        await query.answer(_msg)
+                    except Exception:  # nosec B110
+                        pass
+                    await _replace_tapped_text(
+                        query, _msg, InlineKeyboardMarkup([])
+                    )
+                    return
+                # Cached copy expired: fall through and compress fresh.
     # job_timeout > RQ's 180s default: gs compression of a large PDF can
     # legitimately outlive the death penalty (mirrors convert_book_job).
     ok = await asyncio.to_thread(

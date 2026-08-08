@@ -64,7 +64,8 @@ def _mark_pipeline_hash_status(job_id: str | None, status: str) -> None:
     Kept in sync as jobs finish/cancel so /canceljob's existence checks can
     tell live jobs apart from completed ones (the hash survives up to
     JOB_METADATA_TTL after completion).  Terminal statuses are ``done``,
-    ``s3_fallback``, ``too_large``, ``cancelled``, ``failed``, ``error``.
+    ``s3_fallback``, ``too_large``, ``cancelled``, ``failed``, ``error``,
+    ``already_processed``.
     """
     if not job_id:
         return
@@ -471,6 +472,7 @@ from utils.tg_http import (  # noqa: E402
     _tg_forward_message,
     _tg_get_file_path,
     _tg_send_document,
+    _tg_send_document_by_id,
     _tg_send_message,
     _tg_send_pending_prompt,
     _tg_send_progress,
@@ -656,6 +658,9 @@ def process_input_key_job(job: dict) -> dict:
     """Process a job dict produced by telethon_ingest._upload_and_enqueue.
 
     Expected keys: 'job_id', 'input_key' (S3 key), 'original_filename', 'size', 'chat_id', 'message_id', 'cleanup_input'
+    Optional: 'file_unique_id' (carried by the bot's BigFilePipeline path; when
+    present it is bound to the content hash so re-sends can be resolved at
+    enqueue time — telethon_ingest jobs without it still dedup in-worker).
     This will download the object to a temp dir and run the disk-mode flow (thumbnail, compress, send).
     Returns the Telegram send response or an error dict.
     """
@@ -827,6 +832,49 @@ def process_input_key_job(job: dict) -> dict:
             message_id=_progress_msg_id,
         )
 
+        # ── Content-hash dedup: same bytes already thumbed/delivered ──────
+        # SHA-256 of the DOWNLOADED bytes (never name+size): a re-sent copy of
+        # the same content re-sends the cached result instead of re-running
+        # the whole pipeline.  Keys on the INPUT bytes — a re-upload of the
+        # original matches even though the delivered file may be compressed.
+        _content_hash = None
+        try:
+            _content_hash = content_sha256_file(dest_path)
+        except Exception:  # nosec B110 - dedup unavailable; run normally
+            logger.debug("Failed to hash %s", dest_path)
+        _bind_fuid_content(job.get("file_unique_id"), _content_hash)
+        _dedup_src = (
+            _shortcircuit_if_processed(
+                _content_hash,
+                "thumb",
+                chat_id,
+                filename=filename,
+                user_id=user_id,
+                note=(
+                    "\u267b\ufe0f Already processed this file before — "
+                    "re-sent the cached result, no new job was started."
+                ),
+            )
+            if _content_hash
+            else None
+        )
+        if _dedup_src:
+            out_meta.setdefault("status", "already_processed")
+            # Observability: how the re-send happened (bot file_id /
+            # userbot forward / skipped) for io:out inspection.
+            out_meta.setdefault("resend_source", _dedup_src)
+            out_meta.setdefault("skipped", True)
+            out_meta.setdefault("timestamps", {})["finished"] = int(
+                time.time()
+            )
+            try:
+                _set_io_keys(unique_key, output_meta=out_meta)
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
+            _mark_pipeline_hash_status(job_id, "already_processed")
+            return {"status": "already_processed", "skipped": True}
+
         # Now reuse disk-mode flow: thumbnail, compress, s3-fallback if needed, send
         _progress_msg_id = _tg_send_progress(
             chat_id,
@@ -839,9 +887,29 @@ def process_input_key_job(job: dict) -> dict:
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         if filename.lower().endswith(".pdf"):
             # Validator: reuse the PDF's embedded thumbnail when it has one
-            # (skips the 2x first-page render entirely).
-            if not extract_pdf_embedded_thumbnail(dest_path, thumb_path):
-                create_thumbnail_from_pdf(dest_path, thumb_path)
+            # (skips the 2x first-page render entirely).  A PDF that already
+            # ships a cover preview needs nothing re-added — short-circuit,
+            # mirroring the main process_document_job flow.
+            _has_thumb = extract_pdf_embedded_thumbnail(dest_path, thumb_path)
+            if _has_thumb:
+                _skip_already_thumbed(
+                    _content_hash,
+                    filename,
+                    job.get("size") or job.get("file_size"),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+                _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
+                out_meta.setdefault("status", "already_thumbed")
+                out_meta.setdefault("timestamps", {})["finished"] = int(
+                    time.time()
+                )
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+                return {"status": "already_thumbed", "skipped": True}
+            create_thumbnail_from_pdf(dest_path, thumb_path)
         else:
             create_thumbnail_from_image(dest_path, thumb_path)
 
@@ -987,6 +1055,16 @@ def process_input_key_job(job: dict) -> dict:
                     _src_chat,
                     getattr(_sent, "id", None),
                 )
+                _cache_userbot_delivered_copy(
+                    _content_hash,
+                    filename,
+                    job.get("size") or job.get("file_size"),
+                    "thumb",
+                    _src_chat,
+                    getattr(_sent, "id", None),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
                 try:
                     out_meta.setdefault("status", "done")
                     out_meta.setdefault("delivery", "userbot")
@@ -1110,6 +1188,15 @@ def process_input_key_job(job: dict) -> dict:
                 compress_user_id=user_id,
                 ocr_user_id=user_id,
             )
+        _cache_delivered_copy(
+            _content_hash,
+            filename,
+            job.get("size") or job.get("file_size"),
+            "thumb",
+            res,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
         send_elapsed = time.time() - send_start
         out_meta.setdefault("durations", {})["tg_send_ms"] = int(
             send_elapsed * 1000
@@ -1185,6 +1272,15 @@ IO_TTL = 7 * 24 * 3600
 
 
 from utils.db import COL_JOBS, get_sync_db, sync_query  # noqa: E402
+from utils.processed_cache import (  # noqa: E402
+    _get_pdf_checks,
+    _store_pdf_checks,
+    content_sha256,
+    content_sha256_file,
+    get_processed_op,
+    get_processed_record,
+    upsert_processed_record,
+)
 from utils.redis_client import get_sync_redis  # noqa: E402
 from utils.url_validation import _validate_url_safe  # noqa: E402
 
@@ -1237,78 +1333,344 @@ def _set_io_keys(
     return redis_ok
 
 
-# Shared validator-result cache.  Keyed by Telegram's ``file_unique_id``
-# (an immutable property of the file's content), NOT the RQ job id, so the
-# two jobs enqueued by the OCR & Thumbnail button can share results even
-# though each writes its own ``io:in:<job_id>`` key.  Safe to reuse because
-# the embedded-thumbnail / text-layer status of a given file never changes.
-# Stored as a Redis HASH (``pdfcheck:<file_unique_id>`` with ``has_thumb`` /
-# ``has_text_layer`` fields) so each job's write is atomic per field — no
-# lost-update races between the thumbnail and OCR jobs.
-PDF_CHECK_PREFIX = "pdfcheck:"
-PDF_CHECK_TTL = 7 * 24 * 3600  # 7 days - bounds storage; content is immutable
+# Shared validator-result cache (``pdfcheck:<file_unique_id>``) and the
+# processed-result cache (``processed:<fingerprint>``) live in
+# utils/processed_cache.py — shared with bot.py so enqueue-time short-circuits
+# ("already thumbed" / re-send dedup) see what the worker recorded.
 
 
-def _get_pdf_checks(file_unique_id: str | None) -> dict | None:
-    """Read cached validator results for a Telegram file (by file_unique_id).
-
-    Returns ``{"has_thumb": bool|None, "has_text_layer": bool|None}`` or None
-    when nothing is cached yet.  A field is None when it has never been
-    computed (caller should run the check); True/False are real cached
-    results — distinguishing "absent" from a cached False is what lets the
-    OCR job backfill missing fields without re-running on legit False values.
-    """
-    if not file_unique_id:
-        return None
-    try:
-        r = get_sync_redis()
-        if not r:
-            return None
-        _raw = r.hgetall(f"{PDF_CHECK_PREFIX}{file_unique_id}")
-        if not _raw:
-            return None
-
-        def _b(v: object) -> bool | None:
-            if v is None:
-                return None
-            return str(v) in ("1", "true", "True")
-
-        return {
-            "has_thumb": _b(_raw.get("has_thumb")),
-            "has_text_layer": _b(_raw.get("has_text_layer")),
-        }
-    except Exception:
-        logger.debug("Failed to read pdf check cache for %s", file_unique_id)
-        return None
-
-
-def _store_pdf_checks(
-    file_unique_id: str | None,
-    has_thumb: bool | None = None,
-    has_text_layer: bool | None = None,
+def _cache_delivered_copy(
+    content_hash: str | None,
+    filename: str | None,
+    file_size: int | None,
+    op: str,
+    res: dict | None,
+    *,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    target: str | None = None,
 ) -> None:
-    """Cache validator results (best-effort) under ``pdfcheck:<file_unique_id>``.
+    """Best-effort: cache a delivered copy's reusable file_id for re-send dedup.
 
-    Writes only the fields explicitly given (hash fields are atomic per
-    field), so the thumbnail job (has_thumb) and the OCR job (has_text_layer)
-    can publish independently without clobbering each other.
+    ``res`` is the sendDocument response; the delivered copy's file_id lets a
+    later re-send of the same CONTENT (keyed by its sha256) be re-sent
+    WITHOUT a new job — even after the user deleted the bot's messages (see
+    utils/processed_cache.py).
     """
-    if not file_unique_id:
+    if not res or not res.get("ok"):
         return
     try:
-        r = get_sync_redis()
-        if not r:
-            return
-        _map = {}
-        if has_thumb is not None:
-            _map["has_thumb"] = "1" if has_thumb else "0"
-        if has_text_layer is not None:
-            _map["has_text_layer"] = "1" if has_text_layer else "0"
-        if _map:
-            r.hset(f"{PDF_CHECK_PREFIX}{file_unique_id}", mapping=_map)
-            r.expire(f"{PDF_CHECK_PREFIX}{file_unique_id}", PDF_CHECK_TTL)
+        _doc = (res.get("result") or {}).get("document") or {}
+        upsert_processed_record(
+            content_hash,
+            op,
+            "done",
+            filename=filename,
+            file_size=file_size,
+            file_id=_doc.get("file_id"),
+            thumb_file_id=(_doc.get("thumbnail") or {}).get("file_id"),
+            user_id=user_id,
+            chat_id=chat_id,
+            target=target,
+        )
+    except Exception:  # nosec B110 - cache is best-effort
+        pass
+
+
+def _cache_userbot_delivered_copy(
+    content_hash: str | None,
+    filename: str | None,
+    file_size: int | None,
+    op: str,
+    src_chat_id: int | str | None,
+    src_message_id: int | None,
+    *,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    target: str | None = None,
+) -> None:
+    """Best-effort: cache a USERBOT-delivered copy for re-send dedup.
+
+    Big files delivered through the userbot have NO Bot API file_id to re-send
+    from.  The record instead stores the delivered copy's location
+    (``src_chat_id``/``src_message_id`` as the userbot sees it — the bot's DM
+    or ``'me'``/Saved Messages); re-sends FORWARD that message via the
+    userbot (server-side media copy, no re-upload).  See
+    utils/processed_cache.py.
+    """
+    if not content_hash or not src_chat_id or not src_message_id:
+        return
+    try:
+        upsert_processed_record(
+            content_hash,
+            op,
+            "done",
+            filename=filename,
+            file_size=file_size,
+            delivery="userbot",
+            src_chat_id=src_chat_id,
+            src_message_id=src_message_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            target=target,
+        )
+    except Exception:  # nosec B110 - cache is best-effort
+        pass
+
+
+def _forward_userbot_cached(
+    src_chat_id: int | str,
+    src_message_id: int,
+    user_id: int | None,
+    preferred_chat_id: int | str | None = None,
+) -> bool:
+    """Re-deliver a userbot-cached copy by forwarding its delivered message.
+
+    Tries ``preferred_chat_id`` first (the chat where the user re-sent the
+    file — correct for GROUPS, where chat ids are identical for the bot and
+    the userbot), then falls back to the bot's DM / Saved Messages (where
+    big-file results are originally delivered; private-chat ids differ
+    between the two accounts, so the DM is the reliable target there).  A
+    server-side media copy — no re-upload.
+    """
+    import asyncio as _asyncio
+
+    try:
+        from utils.userbot_downloader import _get_bot_user_id
+        from utils.userbot_uploader import forward_message_via_userbot
+
+        _targets: list[int | str] = []
+        if preferred_chat_id:
+            _targets.append(preferred_chat_id)
+        _targets.append(_get_bot_user_id() or "me")
+        for _t in _targets:
+            if _asyncio.run(
+                forward_message_via_userbot(
+                    _t, src_chat_id, src_message_id, user_id=user_id
+                )
+            ):
+                return True
     except Exception:
-        logger.debug("Failed to cache pdf checks for %s", file_unique_id)
+        logger.warning(
+            "Failed to forward cached userbot result %s/%s",
+            src_chat_id,
+            src_message_id,
+        )
+        return False
+    return False
+
+
+def _skip_already_thumbed(
+    content_hash: str | None,
+    filename: str | None,
+    file_size: int | None,
+    *,
+    user_id: int | None,
+    chat_id: int | None,
+) -> None:
+    """Record the thumb-skip and notify the user (already-thumbed PDF).
+
+    Best-effort: the ``processed:<content_hash>`` record lets re-sends of the
+    same CONTENT short-circuit at ENQUEUE time (bot.py) instead of queueing a
+    fresh job.
+    """
+    upsert_processed_record(
+        content_hash,
+        "thumb",
+        "skipped",
+        filename=filename,
+        file_size=file_size,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    try:
+        _tg_send_message(
+            None,
+            chat_id,
+            "✅ This PDF already has a thumbnail — nothing to add.",
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+def _bind_fuid_content(
+    file_unique_id: str | None, content_hash: str | None
+) -> None:
+    """Best-effort: bind ``file_unique_id -> content_hash`` for bot.py.
+
+    The web process only has the fuid at enqueue time (never the bytes), so
+    the worker records the mapping inside the pdfcheck record — that lets
+    bot.py resolve ``processed:<hash>`` and re-send the cached copy WITHOUT
+    downloading.  Best-effort: a failed bind just means re-sends queue a job
+    and the worker's own content-hash dedup handles them.
+    """
+    if not file_unique_id or not content_hash:
+        return
+    try:
+        _store_pdf_checks(file_unique_id, content_hash=content_hash)
+    except Exception:  # nosec B110 - best-effort
+        pass
+
+
+# Per-op re-send captions for worker-side dedup short-circuits.
+_OP_DONE_CAPTIONS = {
+    "thumb": (
+        "\U0001f5bc\ufe0f Here is your file (cached result — "
+        "already processed)."
+    ),
+    "ocr": (
+        "\U0001f50e Here is the cached OCR result (already processed)."
+    ),
+    "compress": (
+        "\U0001f5dc\ufe0f Here is the cached compressed result "
+        "(already processed)."
+    ),
+    "convert": (
+        "\U0001f4da Here is your converted book (cached result — "
+        "already processed)."
+    ),
+}
+
+_OP_SKIPPED_MSGS = {
+    "thumb": "✅ This PDF already has a thumbnail — nothing to add.",
+    "ocr": (
+        "✅ This PDF already has a searchable text layer — no OCR needed "
+        "(nothing to add)."
+    ),
+    "compress": (
+        "✅ This PDF is already well-compressed — kept the original "
+        "(nothing to add)."
+    ),
+    "convert": "✅ This book was already converted — nothing to add.",
+}
+
+
+def _resend_cached_processed(
+    content_hash: str | None,
+    op: str,
+    chat_id: int,
+    *,
+    filename: str | None = None,
+    user_id: int | None = None,
+    expected_target: str | None = None,
+) -> str | None:
+    """Worker-side dedup: re-send a cached copy when ``op`` already finished.
+
+    Called right after download (the content hash is known): if the record
+    says the op was delivered before, re-send the cached copy and return the
+    delivery SOURCE — ``"bot"`` (Bot API file_id re-send) or ``"userbot"``
+    (forward of the userbot-delivered copy); if it was short-circuited
+    before, return ``"skipped"`` (the caller posts the per-op "already ..."
+    note).  Returns None when nothing is recorded or the cached copy failed
+    to send — the caller then processes the job normally.  The returned
+    source is what callers log into ``io:out`` for observability.
+
+    ``expected_target`` (book conversion): when set, a cached record whose
+    ``target`` differs (e.g. the book was converted to PDF but the user now
+    asks for TXT) is NOT a re-send of this deliverable — return None so the
+    job runs fresh.
+    """
+    if not content_hash:
+        return None
+    _rec = get_processed_record(content_hash)
+    if not _rec:
+        return None
+    _entry = get_processed_op(_rec, op, expected_target)
+    if not _entry:
+        return None
+    if _entry.get("status") == "skipped":
+        return "skipped"
+    if _entry.get("status") != "done":
+        return None
+    if expected_target and (_entry.get("target") or "") != expected_target:
+        # Defense-in-depth: get_processed_op already matched the target (via
+        # the per-target field or the legacy fallback), so this only fires on
+        # inconsistent hand-written records — never re-send a DIFFERENT
+        # format's deliverable.
+        return None
+    if _entry.get("delivery") == "userbot":
+        # Big-file results have no Bot API file_id — forward the delivered
+        # copy via the userbot (server-side media copy, no re-upload).
+        if not (_entry.get("src_chat_id") and _entry.get("src_message_id")):
+            return None
+        try:
+            return (
+                "userbot"
+                if _forward_userbot_cached(
+                    _entry["src_chat_id"],
+                    int(_entry["src_message_id"]),
+                    user_id,
+                    preferred_chat_id=chat_id,
+                )
+                else None
+            )
+        except Exception:  # nosec B110 - forward failed; process fresh
+            return None
+    if _entry.get("file_id"):
+        try:
+            _res = _tg_send_document_by_id(
+                None,
+                chat_id,
+                _entry["file_id"],
+                _rec.get("filename") or filename or "file",
+                caption=_OP_DONE_CAPTIONS.get(
+                    op, "♻️ Cached result (already processed)."
+                ),
+                compress_user_id=user_id,
+                ocr_user_id=user_id,
+            )
+            return "bot" if _res and _res.get("ok") else None
+        except Exception:  # nosec B110 - cached copy failed; process fresh
+            logger.warning(
+                "Failed to re-send cached %s result for %s", op, filename
+            )
+            return None
+    return None
+
+
+def _shortcircuit_if_processed(
+    content_hash: str | None,
+    op: str,
+    chat_id: int,
+    *,
+    filename: str | None = None,
+    user_id: int | None = None,
+    note: str | None = None,
+    expected_target: str | None = None,
+) -> str | None:
+    """Worker-side dedup: short-circuit the job and report how.
+
+    Re-sends the cached copy when the op was already delivered (and posts
+    ``note``), or posts the per-op "already ..." note when it was previously
+    short-circuited.  Returns the dedup OUTCOME — ``"bot"`` (Bot API file_id
+    re-send), ``"userbot"`` (userbot forward) or ``"skipped"`` (no copy;
+    the per-op note was posted) — or None when the job should run normally.
+    Callers log the outcome into ``io:out`` (``resend_source``) for
+    observability, mark out_meta, clean up transient messages and return.
+
+    ``expected_target`` (book conversion) is forwarded to the record check so
+    a cached result of a DIFFERENT target format is never re-sent.
+    """
+    if not content_hash:
+        return None
+    _dedup = _resend_cached_processed(
+        content_hash,
+        op,
+        chat_id,
+        filename=filename,
+        user_id=user_id,
+        expected_target=expected_target,
+    )
+    if _dedup is None:
+        return None
+    try:
+        if _dedup == "skipped":
+            _tg_send_message(None, chat_id, _OP_SKIPPED_MSGS.get(op, ""))
+        elif note:
+            _tg_send_message(None, chat_id, note)
+    except Exception:  # nosec B110 - best-effort note
+        pass
+    return _dedup
 
 
 def _attach_job_user_meta(user_id: int | None) -> str | None:
@@ -1944,6 +2306,53 @@ def process_document_job(
                 message_id=_progress_msg_id,
             )
 
+            # ── Content-hash dedup: same bytes already processed ──────────
+            # SHA-256 of the DOWNLOADED bytes — two files that merely share a
+            # name and exact byte size can no longer collide.  A re-upload of
+            # the same content (even one Telegram gives a fresh fuid) re-sends
+            # the cached copy instead of re-rendering + re-uploading.
+            _content_hash = None
+            try:
+                _content_hash = content_sha256_file(file_path)
+            except Exception:  # nosec B110 - dedup unavailable; run normally
+                logger.debug("Failed to hash %s", file_path)
+            _bind_fuid_content(file_unique_id, _content_hash)
+            _dedup_src = (
+                _shortcircuit_if_processed(
+                    _content_hash,
+                    "thumb",
+                    chat_id,
+                    filename=filename,
+                    user_id=user_id,
+                    note=(
+                        "\u267b\ufe0f Already processed this file before — "
+                        "re-sent the cached result, no new job was started."
+                    ),
+                )
+                if _content_hash
+                else None
+            )
+            if _dedup_src:
+                out_meta.setdefault("status", "already_processed")
+                # Observability: how the re-send happened (bot file_id /
+                # userbot forward / skipped) for io:out inspection.
+                out_meta.setdefault("resend_source", _dedup_src)
+                out_meta.setdefault("skipped", True)
+                out_meta.setdefault("timestamps", {})["finished"] = int(
+                    time.time()
+                )
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+                _cleanup_after_failure(
+                    chat_id,
+                    _rq_job_id,
+                    _progress_msg_id,
+                    skip_queued_delete=_skip_queued_delete,
+                )
+                return {"status": "already_processed", "skipped": True}
+
             # thumbnail
             _progress_msg_id = _tg_send_progress(
                 chat_id,
@@ -1964,19 +2373,18 @@ def process_document_job(
                 # Thumbnail button's FIFO queue, so ocr_job can reuse them
                 # instead of re-running the text-layer pass on its own download.
                 _checks = _get_pdf_checks(file_unique_id)
-                _has_thumb = extract_pdf_embedded_thumbnail(
-                    file_path, thumb_path
-                )
-                if not _has_thumb:
-                    create_thumbnail_from_pdf(file_path, thumb_path)
                 _cached_layer = (
                     _checks["has_text_layer"]
                     if _checks is not None
                     else None
                 )
+                _has_thumb = extract_pdf_embedded_thumbnail(
+                    file_path, thumb_path
+                )
                 _store_pdf_checks(
                     file_unique_id,
                     has_thumb=_has_thumb,
+                    content_hash=_content_hash,
                     has_text_layer=(
                         _cached_layer
                         if _cached_layer is not None
@@ -1991,6 +2399,35 @@ def process_document_job(
                         )
                     ),
                 )
+                # ── Validator: "already has a thumbnail" — short-circuit ──
+                # The PDF ships a cover preview embedded in its page dict, so
+                # re-adding one (and re-uploading the file) adds nothing.
+                # Reply and stop, mirroring the already_ocr /
+                # already_compressed short-circuits.
+                if _has_thumb:
+                    _skip_already_thumbed(
+                        _content_hash,
+                        filename,
+                        file_size,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
+                    out_meta.setdefault("status", "already_thumbed")
+                    out_meta.setdefault("timestamps", {})["finished"] = int(
+                        time.time()
+                    )
+                    try:
+                        _set_io_keys(unique_key, output_meta=out_meta)
+                    except Exception:  # nosec B110
+                        pass
+                    _cleanup_after_failure(
+                        chat_id,
+                        _rq_job_id,
+                        _progress_msg_id,
+                        skip_queued_delete=_skip_queued_delete,
+                    )
+                    return {"status": "already_thumbed", "skipped": True}
+                create_thumbnail_from_pdf(file_path, thumb_path)
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
 
@@ -2134,6 +2571,16 @@ def process_document_job(
                         _src_chat,
                         getattr(_sent, "id", None),
                     )
+                    _cache_userbot_delivered_copy(
+                        _content_hash,
+                        filename,
+                        file_size,
+                        "thumb",
+                        _src_chat,
+                        getattr(_sent, "id", None),
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
                     try:
                         out_meta.setdefault("status", "done")
                         out_meta.setdefault("delivery", "userbot")
@@ -2260,6 +2707,15 @@ def process_document_job(
                     compress_user_id=user_id,
                     ocr_user_id=user_id,
                 )
+            _cache_delivered_copy(
+                _content_hash,
+                filename,
+                file_size,
+                "thumb",
+                res,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
                 send_elapsed * 1000
@@ -2335,14 +2791,84 @@ def process_document_job(
             except Exception:  # nosec B110
                 pass
 
+            # ── Content-hash dedup: same bytes already processed ──────────
+            # See the disk-path block above — same short-circuit, keyed on the
+            # bytes' sha256 so different files can never collide on the key.
+            _content_hash = None
+            try:
+                _content_hash = content_sha256(file_bytes)
+            except Exception:  # nosec B110 - dedup unavailable; run normally
+                logger.debug("Failed to hash in-memory file")
+            _bind_fuid_content(file_unique_id, _content_hash)
+            _dedup_src = (
+                _shortcircuit_if_processed(
+                    _content_hash,
+                    "thumb",
+                    chat_id,
+                    filename=filename,
+                    user_id=user_id,
+                    note=(
+                        "\u267b\ufe0f Already processed this file before — "
+                        "re-sent the cached result, no new job was started."
+                    ),
+                )
+                if _content_hash
+                else None
+            )
+            if _dedup_src:
+                out_meta.setdefault("status", "already_processed")
+                # Observability: how the re-send happened (bot file_id /
+                # userbot forward / skipped) for io:out inspection.
+                out_meta.setdefault("resend_source", _dedup_src)
+                out_meta.setdefault("skipped", True)
+                out_meta.setdefault("timestamps", {})["finished"] = int(
+                    time.time()
+                )
+                try:
+                    _set_io_keys(unique_key, output_meta=out_meta)
+                except Exception:  # nosec B110
+                    pass
+                _cleanup_after_failure(
+                    chat_id,
+                    _rq_job_id,
+                    _progress_msg_id,
+                    skip_queued_delete=_skip_queued_delete,
+                )
+                return {"status": "already_processed", "skipped": True}
+
             if (
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
             ):
-                thumb_bytes = (
-                    extract_pdf_embedded_thumbnail_bytes(file_bytes)
-                    or create_thumbnail_from_pdf_bytes(file_bytes)
+                # Validator: "already has a thumbnail" — short-circuit instead
+                # of re-adding one to a PDF that already ships a cover preview.
+                _embedded_thumb = extract_pdf_embedded_thumbnail_bytes(
+                    file_bytes
                 )
+                if _embedded_thumb is not None:
+                    _skip_already_thumbed(
+                        _content_hash,
+                        filename,
+                        file_size,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
+                    out_meta.setdefault("status", "already_thumbed")
+                    out_meta.setdefault("timestamps", {})["finished"] = int(
+                        time.time()
+                    )
+                    try:
+                        _set_io_keys(unique_key, output_meta=out_meta)
+                    except Exception:  # nosec B110
+                        pass
+                    _cleanup_after_failure(
+                        chat_id,
+                        _rq_job_id,
+                        _progress_msg_id,
+                        skip_queued_delete=_skip_queued_delete,
+                    )
+                    return {"status": "already_thumbed", "skipped": True}
+                thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
             else:
                 thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
 
@@ -2451,6 +2977,16 @@ def process_document_job(
                                 user_id,
                                 _src_chat,
                                 getattr(_sent, "id", None),
+                            )
+                            _cache_userbot_delivered_copy(
+                                _content_hash,
+                                filename,
+                                file_size,
+                                "thumb",
+                                _src_chat,
+                                getattr(_sent, "id", None),
+                                user_id=user_id,
+                                chat_id=chat_id,
                             )
                             try:
                                 out_meta.setdefault("status", "done")
@@ -2569,6 +3105,15 @@ def process_document_job(
                 caption="Here is your file with an auto-generated cover preview.",
                 compress_user_id=user_id,
                 ocr_user_id=user_id,
+            )
+            _cache_delivered_copy(
+                _content_hash,
+                filename,
+                file_size,
+                "thumb",
+                res,
+                user_id=user_id,
+                chat_id=chat_id,
             )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -3028,8 +3573,14 @@ def _deliver_converted_file(
     progress_msg_id: int | None = None,
     convert_user_id: int | None = None,
     ocr_user_id: int | None = None,
-) -> None:
+) -> dict | None:
     """Send a converted/compressed result with live progress + cancel respect.
+
+    Returns the sendDocument response dict when the result was delivered via
+    the Bot API, or ``{"ok": False, "delivery": "userbot", "src_chat_id": ...,
+    "src_message_id": ...}`` when delivered via the userbot (big files) — so
+    callers can cache the delivered copy (file_id, or the userbot copy's
+    location for forward-based re-sends) for re-send dedup.
 
     Streams the file via ``_tg_send_document`` (with the Compress-PDF button
     for PDF outputs and the 🔁 Convert button for e-books when
@@ -3040,6 +3591,7 @@ def _deliver_converted_file(
     Raises when delivery fails entirely so callers can notify the user.
     """
     _cb_state = {"last_pct": -1, "last_t": 0.0}
+    _send_res = None
 
     def _live_cb(recv: int, total: int) -> None:
         if not total:
@@ -3085,7 +3637,7 @@ def _deliver_converted_file(
             if thumb_path and os.path.exists(thumb_path):
                 _thumb = open(thumb_path, "rb")
             with open(file_path, "rb") as _doc:
-                _tg_send_document(
+                _send_res = _tg_send_document(
                     None,
                     chat_id,
                     _doc,
@@ -3112,13 +3664,13 @@ def _deliver_converted_file(
             if not _res:
                 raise
             _sent, _src_chat = _res
+            _sent_id = getattr(_sent, "id", None)
             try:
                 _dl_size = 0
                 try:
                     _dl_size = os.path.getsize(file_path)
                 except Exception:  # nosec B110
                     pass
-                _sent_id = getattr(_sent, "id", None)
                 _name = filename or ""
                 _is_pdf = _name.lower().endswith(".pdf")
                 if _is_pdf:
@@ -3162,6 +3714,14 @@ def _deliver_converted_file(
                     "_deliver_converted_file: failed to attach prompt for %s",
                     filename,
                 )
+            # Surface the userbot copy's location so callers can cache it for
+            # forward-based re-sends (no Bot API file_id exists for it).
+            _send_res = {
+                "ok": False,
+                "delivery": "userbot",
+                "src_chat_id": _src_chat,
+                "src_message_id": _sent_id,
+            }
         # Delivery done: remove the transient progress bar (mirrors
         # _cleanup_after_success in the other worker flows).
         try:
@@ -3174,6 +3734,7 @@ def _deliver_converted_file(
                 _thumb.close()
         except Exception:  # nosec B110
             pass
+    return _send_res
 
 
 def _deliver_book_echo(
@@ -3513,6 +4074,55 @@ def convert_book_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
 
+        # ── Content-hash dedup: this exact book already converted ─────────
+        # Keyed on the INPUT e-book's sha256 — a re-send of the same book
+        # (even with a fresh fuid) re-sends the cached converted copy instead
+        # of re-running Calibre.  The deliverable depends on the target
+        # (``pdf:compress`` = convert-to-PDF + shrink), so a record for a
+        # DIFFERENT target is never re-sent — the job converts fresh.  NOTE:
+        # convert records are PER-TARGET (``ops:convert:pdf`` etc) —
+        # converting the same book to a different format keeps BOTH formats'
+        # cached copies, so alternating formats never re-run Calibre.
+        _content_hash = None
+        try:
+            _content_hash = content_sha256_file(_src)
+        except Exception:  # nosec B110 - dedup unavailable; run normally
+            logger.debug("Failed to hash %s", _src)
+        _bind_fuid_content(file_unique_id, _content_hash)
+        _convert_target_key = f"{target_fmt}:compress" if compress else target_fmt
+        _dedup_src = (
+            _shortcircuit_if_processed(
+                _content_hash,
+                "convert",
+                chat_id,
+                filename=filename,
+                user_id=user_id,
+                expected_target=_convert_target_key,
+                note=(
+                    "\u267b\ufe0f Already converted to this format — re-sent "
+                    "the cached result. No new job was started."
+                ),
+            )
+            if _content_hash
+            else None
+        )
+        if _dedup_src:
+            try:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "already_processed",
+                        "resend_source": _dedup_src,
+                        "target_fmt": target_fmt,
+                        "skipped": True,
+                        "timestamps": {"finished": int(time.time())},
+                    },
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "already_processed", "skipped": True}
+
         _tg_send_progress(
             chat_id, filename, "compressing",
             detail=f"\u2699\ufe0f Converting to {target_fmt.upper()}...",
@@ -3592,10 +4202,43 @@ def convert_book_job(
                     "delivering converted PDF only",
                     filename,
                 )
-        _deliver_converted_file(
+        _conv_res = _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
         )
+        # Cache the delivered converted copy for re-send dedup (both delivery
+        # modes: Bot API file_id, or the userbot copy's location to forward).
+        if _conv_res and _conv_res.get("ok"):
+            try:
+                _doc = (_conv_res.get("result") or {}).get("document") or {}
+                upsert_processed_record(
+                    _content_hash,
+                    "convert",
+                    "done",
+                    filename=filename,
+                    file_size=file_size,
+                    target=_convert_target_key,
+                    file_id=_doc.get("file_id"),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
+                        "file_id"
+                    ),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+            except Exception:  # nosec B110 - cache is best-effort
+                pass
+        elif _conv_res and _conv_res.get("delivery") == "userbot":
+            _cache_userbot_delivered_copy(
+                _content_hash,
+                filename,
+                file_size,
+                "convert",
+                _conv_res.get("src_chat_id"),
+                _conv_res.get("src_message_id"),
+                user_id=user_id,
+                chat_id=chat_id,
+                target=_convert_target_key,
+            )
         out_meta = {
             "status": "done",
             "filename": _out_name,
@@ -3738,6 +4381,49 @@ def compress_pdf_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
 
+        # ── Content-hash dedup: this exact PDF already compressed ─────────
+        # Keyed on the INPUT bytes' sha256 — re-sends of the same PDF (even
+        # with a fresh fuid) re-send the cached compressed copy instead of
+        # re-running Ghostscript.  Different files never collide on the key.
+        _content_hash = None
+        try:
+            _content_hash = content_sha256_file(_src)
+        except Exception:  # nosec B110 - dedup unavailable; run normally
+            logger.debug("Failed to hash %s", _src)
+        _bind_fuid_content(file_unique_id, _content_hash)
+        _dedup_src = (
+            _shortcircuit_if_processed(
+                _content_hash,
+                "compress",
+                chat_id,
+                filename=filename,
+                user_id=user_id,
+                note=(
+                    "\u267b\ufe0f Already processed — re-sent the cached "
+                    "result. No new job was started."
+                ),
+            )
+            if _content_hash
+            else None
+        )
+        if _dedup_src:
+            try:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "already_processed",
+                        "resend_source": _dedup_src,
+                        "skipped": True,
+                        "timestamps": {"finished": int(time.time())},
+                    },
+                )
+            except Exception:  # nosec B110
+                pass
+            # Remove the transient download-progress + "Queued..." messages
+            # (the re-sent cached copy is the only feedback the user needs).
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "already_processed", "skipped": True}
+
         _progress_msg_id = _tg_send_progress(
             chat_id, filename, "compressing",
             detail="\U0001f5dc\ufe0f Compressing PDF...",
@@ -3786,6 +4472,15 @@ def compress_pdf_job(
             getattr(config, "COMPRESS_MIN_GAIN_BYTES", 100_000) or 100_000
         )
         if _orig and _saved < _min_gain_pct and max(0, _orig - _comp) < _min_gain_bytes:
+            upsert_processed_record(
+                _content_hash,
+                "compress",
+                "skipped",
+                filename=filename,
+                file_size=file_size,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
             _tg_send_message(
                 None,
                 chat_id,
@@ -3817,10 +4512,39 @@ def compress_pdf_job(
             _thumb_path = None
 
         _caption = f"Here is your compressed PDF ({_saved}% smaller)."
-        _deliver_converted_file(
+        _comp_res = _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
         )
+        if _comp_res and _comp_res.get("ok"):
+            try:
+                _doc = (_comp_res.get("result") or {}).get("document") or {}
+                upsert_processed_record(
+                    _content_hash,
+                    "compress",
+                    "done",
+                    filename=filename,
+                    file_size=file_size,
+                    file_id=_doc.get("file_id"),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
+                        "file_id"
+                    ),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+            except Exception:  # nosec B110 - cache is best-effort
+                pass
+        elif _comp_res and _comp_res.get("delivery") == "userbot":
+            _cache_userbot_delivered_copy(
+                _content_hash,
+                filename,
+                file_size,
+                "compress",
+                _comp_res.get("src_chat_id"),
+                _comp_res.get("src_message_id"),
+                user_id=user_id,
+                chat_id=chat_id,
+            )
         try:
             _set_io_keys(
                 _rq_job_id,
@@ -3894,6 +4618,10 @@ def ocr_job(
         "ocr_job: start chat_id=%s user_id=%s file=%s size=%s",
         chat_id, user_id, filename, file_size,
     )
+    # E-books get converted to PDF mid-job (filename is reassigned below);
+    # the processed-record key must stay the ORIGINAL filename so a re-send
+    # of the original e-book matches the cached OCR result.
+    _orig_filename = filename
     if _rq_job_id:
         try:
             _set_io_keys(
@@ -3972,6 +4700,50 @@ def ocr_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
 
+        # ── Content-hash dedup: this exact content already OCR'd ──────────
+        # Hash the ORIGINAL downloaded bytes (before any book->PDF conversion
+        # reassigns _src) so a re-send of the original matches the record.
+        # Two different files sharing a name+size can never collide on the
+        # sha256 key.
+        _content_hash = None
+        try:
+            _content_hash = content_sha256_file(_src)
+        except Exception:  # nosec B110 - dedup unavailable; run normally
+            logger.debug("Failed to hash %s", _src)
+        _bind_fuid_content(file_unique_id, _content_hash)
+        _dedup_src = (
+            _shortcircuit_if_processed(
+                _content_hash,
+                "ocr",
+                chat_id,
+                filename=filename,
+                user_id=user_id,
+                note=(
+                    "\u267b\ufe0f Already processed — re-sent the cached "
+                    "result. No new job was started."
+                ),
+            )
+            if _content_hash
+            else None
+        )
+        if _dedup_src:
+            try:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "already_processed",
+                        "resend_source": _dedup_src,
+                        "skipped": True,
+                        "timestamps": {"finished": int(time.time())},
+                    },
+                )
+            except Exception:  # nosec B110
+                pass
+            # Remove the transient download-progress + "Queued..." messages
+            # (the re-sent cached copy is the only feedback the user needs).
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "already_processed", "skipped": True}
+
         # PDF outputs carry a cover preview — the user-facing thumbnail rule:
         # ebook→PDF results get the extracted cover/first page, everything else
         # (txt, other converted formats) ships as a plain document.
@@ -4042,9 +4814,21 @@ def ocr_job(
             _already_ocr = _src_is_pdf and pdf_has_text_layer(_src)
             if _src_is_pdf:
                 _store_pdf_checks(
-                    file_unique_id, has_text_layer=_already_ocr
+                    file_unique_id,
+                    has_text_layer=_already_ocr,
+                    content_hash=_content_hash,
                 )
         if _already_ocr and _is_pdf_out:
+            upsert_processed_record(
+                _content_hash,
+                "ocr",
+                "skipped",
+                filename=_orig_filename,
+                file_size=file_size,
+                user_id=user_id,
+                chat_id=chat_id,
+                target=target,
+            )
             _tg_send_message(
                 None,
                 chat_id,
@@ -4195,10 +4979,41 @@ def ocr_job(
             with open(_out, "w", encoding="utf-8") as _fh:
                 _fh.write(text)
             _caption = "\U0001f50e Here is the extracted text."
-        _deliver_converted_file(
+        _ocr_res = _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
         )
+        if _ocr_res and _ocr_res.get("ok"):
+            try:
+                _doc = (_ocr_res.get("result") or {}).get("document") or {}
+                upsert_processed_record(
+                    _content_hash,
+                    "ocr",
+                    "done",
+                    filename=_orig_filename,
+                    file_size=file_size,
+                    file_id=_doc.get("file_id"),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
+                        "file_id"
+                    ),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    target=target,
+                )
+            except Exception:  # nosec B110 - cache is best-effort
+                pass
+        elif _ocr_res and _ocr_res.get("delivery") == "userbot":
+            _cache_userbot_delivered_copy(
+                _content_hash,
+                _orig_filename,
+                file_size,
+                "ocr",
+                _ocr_res.get("src_chat_id"),
+                _ocr_res.get("src_message_id"),
+                user_id=user_id,
+                chat_id=chat_id,
+                target=target,
+            )
         out_meta = {
             "status": "done",
             "filename": _out_name,
