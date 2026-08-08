@@ -1274,6 +1274,7 @@ IO_TTL = 7 * 24 * 3600
 from utils.db import COL_JOBS, get_sync_db, sync_query  # noqa: E402
 from utils.processed_cache import (  # noqa: E402
     _get_pdf_checks,
+    _store_fuid_binding,
     _store_pdf_checks,
     content_sha256,
     content_sha256_file,
@@ -1499,17 +1500,19 @@ def _bind_fuid_content(
     """Best-effort: bind ``file_unique_id -> content_hash`` for bot.py.
 
     The web process only has the fuid at enqueue time (never the bytes), so
-    the worker records the mapping inside the pdfcheck record — that lets
-    bot.py resolve ``processed:<hash>`` and re-send the cached copy WITHOUT
-    downloading.  Best-effort: a failed bind just means re-sends queue a job
-    and the worker's own content-hash dedup handles them.
+    the worker records the mapping in TWO places — the durable ``pfuid:<fuid>``
+    index (30-day TTL, matching the processed record) and the pdfcheck
+    record (legacy/7-day) — letting bot.py resolve ``processed:<hash>`` and
+    re-send the cached copy at the SURFACE, before any download.  The
+    durable index keeps the fast path alive for the record's full 30-day
+    lifetime.  Best-effort: a failed bind just means re-sends queue a job
+    and the worker's own content-hash dedup handles them (after download).
     """
     if not file_unique_id or not content_hash:
         return
-    try:
-        _store_pdf_checks(file_unique_id, content_hash=content_hash)
-    except Exception:  # nosec B110 - best-effort
-        pass
+    # Both helpers swallow their own errors — best-effort by design.
+    _store_fuid_binding(file_unique_id, content_hash)
+    _store_pdf_checks(file_unique_id, content_hash=content_hash)
 
 
 # Per-op re-send captions for worker-side dedup short-circuits.

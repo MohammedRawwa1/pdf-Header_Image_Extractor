@@ -100,6 +100,7 @@ from utils.ocr import (  # noqa: E402
 )
 from utils.processed_cache import (  # noqa: E402
     _get_pdf_checks,
+    _store_fuid_binding,
     get_processed_by_file_unique_id,
     get_processed_op,
 )
@@ -968,6 +969,26 @@ def _store_queued_message(job_id, chat_id, message_id) -> None:
             )
     except Exception:  # nosec B110
         pass
+
+
+def _warm_fuid_binding(file_unique_id: str | None) -> None:
+    """Best-effort: refresh the durable ``pfuid:<fuid> -> content_hash`` index.
+
+    bot.py never has the file bytes, so it cannot COMPUTE the content hash
+    itself — but the pdfcheck record (written by the worker) already carries
+    the ``content_hash`` binding.  Re-writing the durable index from it at
+    ENQUEUE time keeps the surface fast-path warm even before the worker
+    runs: it heals any transient pfuid write failure and re-arms the 30-day
+    TTL whenever the file is re-sent while the pdfcheck binding is alive.
+    """
+    if not file_unique_id:
+        return
+    _checks = _get_pdf_checks(file_unique_id)
+    if not _checks:
+        return
+    _ch = _checks.get("content_hash")
+    if _ch:
+        _store_fuid_binding(file_unique_id, _ch)
 
 
 def _resend_cached_result(
@@ -4781,6 +4802,10 @@ async def handle_ctx_thumb_callback(
                     return
                 # Cached copy expired (Telegram dropped the file): fall
                 # through and process fresh so the user still gets the file.
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before this job's
+    # worker run (heals transient pfuid write failures).
+    _warm_fuid_binding(rec.get("file_unique_id"))
     # job_timeout > RQ's 180s default: a large file's userbot download +
     # thumbnail pass can legitimately outlive the death penalty.
     ok = await asyncio.to_thread(
@@ -4932,6 +4957,10 @@ async def handle_ctx_thumb_ocr_callback(
     _target = (get_user_setting(armer, "ocr_target", "") or "").lower()
     if _target not in ("pdf", "txt"):
         _target = "pdf" if ocr_pdf_available() else "txt"
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before the worker
+    # runs (heals transient pfuid write failures).
+    _warm_fuid_binding(rec.get("file_unique_id"))
     ok_thumb = None
     if _want_thumb:
         ok_thumb = await asyncio.to_thread(
@@ -5242,6 +5271,10 @@ async def handle_book_compress_callback(
                 pass
             await _replace_tapped_text(query, _msg, InlineKeyboardMarkup([]))
             return
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before this job's
+    # worker run (heals transient pfuid write failures).
+    _warm_fuid_binding(rec.get("file_unique_id"))
     # job_timeout covers the full convert-to-PDF + compress + deliver chain.
     _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
     ok = await asyncio.to_thread(
@@ -5363,6 +5396,10 @@ async def handle_book_convert_callback(
             except Exception:  # nosec B110
                 pass
             return
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before this job's
+    # worker run (heals transient pfuid write failures).
+    _warm_fuid_binding(pending.get("file_unique_id"))
     # job_timeout caps the ENTIRE RQ job — download + convert + deliver — so
     # it must exceed RQ's 180s default AND cover a slow userbot re-download
     # of a large book on top of the Calibre conversion window.
@@ -5497,6 +5534,10 @@ async def handle_compress_callback(
                     )
                     return
                 # Cached copy expired: fall through and compress fresh.
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before this job's
+    # worker run (heals transient pfuid write failures).
+    _warm_fuid_binding(rec.get("file_unique_id"))
     # job_timeout > RQ's 180s default: gs compression of a large PDF can
     # legitimately outlive the death penalty (mirrors convert_book_job).
     ok = await asyncio.to_thread(
@@ -5909,6 +5950,10 @@ async def _enqueue_ocr_job(
         except Exception:  # nosec B110
             pass
         return False
+    # Warm the durable fuid->content_hash index from the worker's pdfcheck
+    # binding so the SURFACE fast-path stays alive even before this job's
+    # worker run (heals transient pfuid write failures).
+    _warm_fuid_binding(rec.get("file_unique_id"))
     # job_timeout > RQ's 180s default: OCR of a multi-page PDF at 200-300 DPI
     # (and ocrmypdf's text-layer pass) can legitimately outlive the death
     # penalty (mirrors convert_book_job).

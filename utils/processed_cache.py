@@ -70,11 +70,12 @@ def content_sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
 #
 # ``content_hash`` is the worker's binding of this fuid to the content hash
 # it computed — the ONLY way the web process can resolve a processed record
-# at enqueue time without downloading the file.  NOTE: this binding carries
-# the pdfcheck TTL (7 days) while the processed record itself lives 30 days,
-# so the enqueue-time fast path is a 7-day window; after that, re-sends queue
-# a job and the worker's own content-hash dedup (which reads the 30-day
-# record) re-sends the cached copy — correct, just with a download.
+# at enqueue time without downloading the file.  The binding is ALSO written
+# to the durable ``pfuid:<fuid>`` index (same 30-day TTL as the processed
+# record), so the enqueue-time fast path covers the record's FULL lifetime;
+# the pdfcheck copy (7-day) is kept for legacy reads.  After 30 days, a
+# re-send queues a job and the worker's own content-hash dedup re-sends the
+# cached copy — correct, just with a download.
 PDF_CHECK_PREFIX = "pdfcheck:"
 PDF_CHECK_TTL = 7 * 24 * 3600  # 7 days - bounds storage; content is immutable
 
@@ -159,6 +160,50 @@ def _store_pdf_checks(
 PROCESSED_PREFIX = "processed:"
 PROCESSED_TTL = 30 * 24 * 3600  # 30 days - bounds storage; Telegram may drop
 # stale file_ids earlier, and resend then falls back to a fresh job.
+
+# fuid -> content_hash durable index: ``pfuid:<file_unique_id>`` carries the
+# SAME 30-day TTL as the processed record, so the WEB process can resolve
+# ``processed:<hash>`` from a Telegram file_unique_id for the record's FULL
+# lifetime.  The binding used to live only inside the 7-day pdfcheck record;
+# after day 7 a re-send would enqueue a job and the worker's hash dedup would
+# re-send the cached copy only AFTER downloading the file.  This index closes
+# that gap: re-sends within 30 days are caught at the surface with zero
+# download.
+PFUID_PREFIX = "pfuid:"
+
+
+def _store_fuid_binding(file_unique_id: str | None, content_hash: str | None) -> None:
+    """Best-effort: persist ``file_unique_id -> content_hash`` (30-day TTL).
+
+    Written by the worker whenever it computes a content hash (alongside the
+    pdfcheck binding), so the web process can short-circuit re-sends at the
+    surface WITHOUT downloading.  The 30-day TTL matches the processed
+    record's, keeping the fast path alive for the record's full lifetime.
+    """
+    if not file_unique_id or not content_hash:
+        return
+    try:
+        r = get_sync_redis()
+        if not r:
+            return
+        r.setex(f"{PFUID_PREFIX}{file_unique_id}", PROCESSED_TTL, content_hash)
+    except Exception:
+        logger.debug("Failed to bind fuid %s", file_unique_id)
+
+
+def _get_fuid_binding(file_unique_id: str | None) -> str | None:
+    """Read the durable ``file_unique_id -> content_hash`` index, or None."""
+    if not file_unique_id:
+        return None
+    try:
+        r = get_sync_redis()
+        if not r:
+            return None
+        _v = r.get(f"{PFUID_PREFIX}{file_unique_id}")
+        return str(_v) if _v else None
+    except Exception:
+        logger.debug("Failed to read fuid binding for %s", file_unique_id)
+        return None
 
 # Per-operation record fields:
 #   ops: { "thumb": {"status": "done"|"skipped", "file_id": ..., "thumb_file_id": ...},
@@ -264,15 +309,25 @@ def get_processed_record(content_hash: str | None) -> dict | None:
 def get_processed_by_file_unique_id(file_unique_id: str | None) -> dict | None:
     """Resolve a file's processed record via its Telegram ``file_unique_id``.
 
-    The worker binds ``file_unique_id -> content_hash`` into the pdfcheck
-    record (see ``_store_pdf_checks``), which lets the WEB process (which
-    only has the fuid, never the bytes) look up ``processed:<hash>`` at
-    enqueue time.  Returns None when the binding is unknown — callers then
-    fall back to enqueueing, and the worker's own content-hash dedup catches
-    the re-send.
+    The worker binds ``file_unique_id -> content_hash`` — BOTH in the durable
+    ``pfuid:<fuid>`` index (30-day TTL, the primary path) and inside the
+    pdfcheck record (legacy/7-day) — letting the WEB process (which only has
+    the fuid, never the bytes) look up ``processed:<hash>`` at enqueue time
+    WITHOUT downloading.  The durable index covers the record's full 30-day
+    lifetime, so re-sends are caught at the surface (zero download) even
+    after the 7-day pdfcheck binding expires.  Returns None when the binding
+    is unknown — callers then fall back to enqueueing, and the worker's own
+    content-hash dedup catches the re-send after download.
     """
     if not file_unique_id:
         return None
+    # Primary: durable 30-day index (survives the 7-day pdfcheck TTL).
+    _content_hash = _get_fuid_binding(file_unique_id)
+    if _content_hash:
+        _rec = get_processed_record(_content_hash)
+        if _rec:
+            return _rec
+    # Legacy fallback: content_hash stored inside the pdfcheck record.
     _checks = _get_pdf_checks(file_unique_id)
     if not _checks:
         return None

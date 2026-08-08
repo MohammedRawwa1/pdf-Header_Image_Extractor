@@ -221,11 +221,22 @@ class CleanupManager:
 
             now = time.time()
             handled = 0
-            keys = r.keys("processed:*")
+            keys = r.keys("processed:*") + r.keys("pfuid:*")
             for key in keys:
                 try:
                     ttl = r.ttl(key)
                     if ttl == -2:  # Already gone
+                        continue
+                    if key.startswith("pfuid:"):
+                        # Simple string index (fuid -> content_hash) with its
+                        # own TTL — just enforce the safety net.  A pfuid
+                        # pointer may briefly outlive its record (pruned by
+                        # the meta.at check below); resolution then falls
+                        # back to pdfcheck -> None -> fresh job, so an
+                        # orphaned pointer is harmless.
+                        if ttl == -1:
+                            r.expire(key, self.processed_ttl)
+                            handled += 1
                         continue
                     # Last-write timestamp recorded by upsert_processed_record.
                     _at = None
