@@ -18,3 +18,4 @@ pytesseract>=0.3.10
 ocrmypdf>=16.0.0
 weasyprint>=61.0
 defusedxml>=0.7.1
+tinyhtml5>=1.0

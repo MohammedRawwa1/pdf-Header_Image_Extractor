@@ -10,14 +10,23 @@ rendering handles dense images far better.
 Design rules:
 - Every entry point is a *fallback chain*: WeasyPrint is used only when it is
   installed, enabled (``EPUB_FAST_CONVERT_ENABLED``), and the EPUB is
-  heuristically text-heavy.  ANY failure (parse error, render exception,
-  timeout, cancel) drops back to the Calibre path so the fast path can never
-  regress a conversion Calibre would have completed.
+  heuristically text-heavy.  ANY failure — parse error, empty merge, blank
+  render, render exception, timeout, cancel — drops back to the Calibre path
+  so the fast path can never regress a conversion Calibre would have
+  completed.
 - A /canceljob that fires while WeasyPrint renders raises
   :class:`ConversionCancelledError` (mirroring Calibre's abort), so a
   cancelled fast path never triggers a fresh Calibre conversion.
-- The pure-EPUB parts (image-weight heuristic, spine parsing, HTML merging)
-  are importable and testable without WeasyPrint installed.
+- Chapters are parsed with the SAME HTML5 engine WeasyPrint renders with
+  (tinyhtml5 → html5lib).  Real-world EPUB chapters are frequently NOT
+  well-formed XML (unclosed tags, ``&nbsp;``-style named entities, unquoted
+  attributes); a strict XML parser silently drops them, which would merge
+  into an empty document and produce a blank PDF.
+- The rendered output is VALIDATED before delivery: a tiny single-page PDF
+  with no text and no images is treated as a blank render and re-run through
+  Calibre.  A silent empty PDF must never reach the user.
+- The pure-EPUB parts (image-weight heuristic, spine parsing, HTML merging,
+  blank checks) are importable and testable without WeasyPrint installed.
 """
 
 import logging
@@ -45,16 +54,11 @@ logger = logging.getLogger(__name__)
 # doctype (even benign ones) to block entity-expansion attacks; the declaration
 # carries no layout value for the body/style merge, so it is stripped before
 # parsing.  Without a doctype there is nothing an entity attack can hang on,
-# and defusedxml remains the parser of record for untrusted EPUB content.
+# and defusedxml remains the parser of record for untrusted EPUB metadata.
 _DOCTYPE_RE = re.compile(
     rb"<!DOCTYPE(?:\s+[^>\[\]]*)?(?:\[[^\]]*\])?[^>]*>",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _safe_xml_parse(raw: bytes) -> ET.Element:
-    """Parse untrusted EPUB XML with defusedxml (DOCTYPE already stripped)."""
-    return ElementTree.fromstring(_DOCTYPE_RE.sub(b"", raw))
 
 # Content media types accepted in the spine.  EPUB3 XHTML carries
 # ``application/xhtml+xml``; older books may use ``text/html``.
@@ -64,6 +68,97 @@ _IMAGE_EXTS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
     ".svg", ".avif",
 )
+# A merged document with less than this much text AND no images is blank.
+_MIN_MERGE_TEXT_CHARS = 20
+# A rendered PDF under this size is immediately suspect (a real book embeds
+# fonts and produces a larger file than a single empty page).
+_MIN_PDF_BYTES = 8 * 1024
+# A page needs at least this much extractable text to count as real content.
+_MIN_PDF_TEXT_CHARS = 40
+# XML prolog encoding declaration (``<?xml ... encoding="..."?>``) — honored
+# for decoding before the HTML5 parser runs.
+_XML_ENCODING_RE = re.compile(
+    rb"<\?xml[^>]*encoding=[\"']([A-Za-z0-9._-]+)[\"']", re.IGNORECASE
+)
+
+
+def _safe_xml_parse(raw: bytes) -> ET.Element:
+    """Parse untrusted EPUB XML with defusedxml (DOCTYPE already stripped)."""
+    return ElementTree.fromstring(_DOCTYPE_RE.sub(b"", raw))
+
+
+# Cached HTML5 parser: a callable(raw) -> root Element, ``False`` once we know
+# no lenient parser is installed, ``None`` before first use.
+_HTML_PARSER: Callable[[bytes], ET.Element] | bool | None = None
+
+
+def _get_lenient_parser() -> Callable[[bytes], ET.Element] | None:
+    """Return an HTML5 parser (tinyhtml5 → html5lib) or None.
+
+    WeasyPrint renders HTML with an HTML5 parser, so chapters are parsed the
+    same way here.  Returns None only when neither library is installed; the
+    callers then fall back to strict defusedxml parsing.
+    """
+    global _HTML_PARSER
+    if _HTML_PARSER is not None:
+        return _HTML_PARSER if _HTML_PARSER is not False else None
+    try:
+        import tinyhtml5
+
+        def _parse_tiny(raw: bytes) -> ET.Element:
+            return tinyhtml5.parse(
+                raw, treebuilder="etree", namespaceHTMLElements=True
+            )
+
+        _HTML_PARSER = _parse_tiny
+    except Exception:
+        try:
+            import html5lib
+
+            def _parse_h5lib(raw: bytes) -> ET.Element:
+                return html5lib.parse(
+                    raw, treebuilder="etree", namespaceHTMLElements=True
+                )
+
+            _HTML_PARSER = _parse_h5lib
+        except Exception:
+            _HTML_PARSER = False
+    return _HTML_PARSER if _HTML_PARSER is not False else None
+
+
+def _decode_chapter(raw: bytes) -> bytes | str:
+    """Decode chapter bytes honoring the XML prolog's declared encoding.
+
+    The HTML5 tokenizer treats ``<?xml encoding="..."?>`` as a bogus comment
+    and defaults to UTF-8 for byte input, so non-UTF-8 chapters (common in
+    older EPUBs: windows-1252 / latin-1) would otherwise render as mojibake
+    — a silent wrong-success.  Returns ``str`` when the declared encoding
+    decodes cleanly, else the raw bytes (parser sniffs BOM/UTF-8 as usual).
+    """
+    match = _XML_ENCODING_RE.search(raw)
+    if not match:
+        return raw
+    try:
+        return raw.decode(match.group(1).decode("ascii"))
+    except (LookupError, UnicodeDecodeError):
+        return raw
+
+
+def _parse_content_html(raw: bytes) -> ET.Element | None:
+    """Parse a chapter's content, preferring the lenient HTML5 parser.
+
+    Returns the parsed root element (namespaced), or None when unparseable.
+    """
+    parser = _get_lenient_parser()
+    if parser is None:
+        try:
+            return _safe_xml_parse(raw)
+        except Exception:  # nosec B110 - unparseable chapter
+            return None
+    try:
+        return parser(_decode_chapter(raw))
+    except Exception:  # nosec B110 - unparseable chapter
+        return None
 
 
 def weasyprint_available() -> bool:
@@ -170,9 +265,8 @@ def _parse_epub_spine(epub_path: str) -> tuple[str, list[str], str]:
                 raw = zf.read(content_path)
             except KeyError:
                 continue
-            try:
-                ctree = _safe_xml_parse(raw)
-            except Exception:  # nosec B110 - skip unparseable chapter
+            ctree = _parse_content_html(raw)
+            if ctree is None:
                 continue
             for style in ctree.findall(".//{*}style"):
                 if style.text and style.text.strip():
@@ -180,16 +274,20 @@ def _parse_epub_spine(epub_path: str) -> tuple[str, list[str], str]:
     return opf_dir, spine, "\n".join(styles)
 
 
-def _strip_ns(elem: ET.Element) -> ET.Element:
+def _strip_ns(elem: ET.Element) -> ET.Element | None:
     """Namespace-free copy of an element subtree (XHTML → plain HTML).
 
     ElementTree serializes default-namespace XHTML with ``ns0:`` prefixes,
     which bloats the merged document and breaks selectors; stripping
-    namespaces yields clean markup WeasyPrint (html5lib) parses correctly.
-    Namespaced attributes (e.g. ``xlink:href``) collapse to their local name.
+    namespaces yields clean markup WeasyPrint (an HTML5 parser) handles
+    correctly.  Namespaced attributes (e.g. ``xlink:href``) collapse to their
+    local name.  Comment/processing nodes (non-string tags, produced by HTML5
+    parsers) are dropped.
     """
+    if not isinstance(elem.tag, str):
+        return None
     tag = elem.tag
-    if isinstance(tag, str) and "}" in tag:
+    if "}" in tag:
         tag = tag.split("}", 1)[-1]
     new = ET.Element(tag)
     for key, value in elem.attrib.items():
@@ -199,7 +297,9 @@ def _strip_ns(elem: ET.Element) -> ET.Element:
     new.text = elem.text
     new.tail = elem.tail
     for child in elem:
-        new.append(_strip_ns(child))
+        stripped = _strip_ns(child)
+        if stripped is not None:
+            new.append(stripped)
     return new
 
 
@@ -242,7 +342,8 @@ def _build_merged_html(
     into the output head) so pagination flows continuously through the book
     instead of restarting per chapter.  Image refs are rebased to the OPF
     directory (``opf_dir``).  Chapters whose body can't be parsed are skipped;
-    a completely empty result is an empty document (caller falls back).
+    a completely empty result is an empty document (callers detect this with
+    :func:`_merged_html_is_blank` and fall back to Calibre).
     """
     bodies: list[str] = []
     with zipfile.ZipFile(epub_path) as zf:
@@ -251,15 +352,16 @@ def _build_merged_html(
                 raw = zf.read(content_path)
             except KeyError:
                 continue
-            try:
-                ctree = _safe_xml_parse(raw)
-            except Exception:  # nosec B110 - skip unparseable chapter
+            ctree = _parse_content_html(raw)
+            if ctree is None:
                 continue
             body = ctree.find(".//{*}body")
             if body is None:
                 continue
             chapter_dir = posixpath.dirname(content_path)
             clean = _strip_ns(body)
+            if clean is None:
+                continue
             for elem in clean.iter():
                 tag = elem.tag
                 if tag in ("img", "source"):
@@ -279,6 +381,24 @@ def _build_merged_html(
     return (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         f"{style_block}</head><body>{''.join(bodies)}</body></html>"
+    )
+
+
+def _merged_html_is_blank(html: str) -> bool:
+    """True when the merged document has no meaningful content.
+
+    Chapters that fail to parse are skipped during the merge; a book whose
+    chapters are ALL unparseable yields an empty body — WeasyPrint would
+    render a single blank page (a silent wrong-success).  Detected BEFORE
+    rendering so the caller falls back to Calibre instead of delivering an
+    empty PDF.
+    """
+    text = re.sub(r"<[^>]+>", "", html).strip()
+    if len(text) >= _MIN_MERGE_TEXT_CHARS:
+        return False
+    lowered = html.lower()
+    return not (
+        "<img" in lowered or "<image" in lowered or "<svg" in lowered
     )
 
 
@@ -351,6 +471,37 @@ def _render_weasyprint(
     return True
 
 
+def _pdf_is_degenerate(pdf_path: str) -> bool:
+    """True when a rendered PDF is an empty/blank deliverable.
+
+    A real book PDF embeds fonts and exceeds the size gate; a degenerate
+    fast-path output is a tiny PDF (all pages combined) with no extractable
+    text and no images — exactly what WeasyPrint emits when the merged
+    document was empty (the silent wrong-success seen in production).  All
+    pages are inspected (a blank merge whose CSS forces page breaks can span
+    several empty pages).  Unreadable/unavailable files are never judged
+    degenerate (we keep the PDF rather than re-convert).
+    """
+    try:
+        if os.path.getsize(pdf_path) > _MIN_PDF_BYTES:
+            return False
+        import fitz
+
+        doc = fitz.open(pdf_path)
+        try:
+            text_len = sum(
+                len(page.get_text().strip()) for page in doc
+            )
+            image_count = sum(
+                len(page.get_images(full=True)) for page in doc
+            )
+            return text_len < _MIN_PDF_TEXT_CHARS and image_count == 0
+        finally:
+            doc.close()
+    except Exception:  # nosec B110 - can't judge; keep the PDF
+        return False
+
+
 def _calibre_fallback(
     input_path: str,
     pdf_path: str,
@@ -377,9 +528,10 @@ def convert_epub_to_pdf_fast(
     """Convert an EPUB to PDF, preferring the fast WeasyPrint path.
 
     WeasyPrint is used only when: installed, enabled (``EPUB_FAST_CONVERT_ENABLED``)
-    and the EPUB is heuristically text-heavy.  Any failure anywhere falls back
-    to the Calibre path, so this function can only ever be as good as the
-    status quo — never worse.  Thumbnail behavior mirrors
+    and the EPUB is heuristically text-heavy.  Any failure anywhere — an empty
+    merge, a blank rendered PDF, a parse error, a timeout — falls back to the
+    Calibre path, so this function can only ever be as good as the status quo,
+    never worse.  Thumbnail behavior mirrors
     ``convert_book_to_pdf_with_thumbnail`` (cover via ``ebook-meta``, else a
     preview of the produced PDF's first page).
     """
@@ -426,21 +578,43 @@ def convert_epub_to_pdf_fast(
         _extract_epub(input_path, tmp)
         html = _build_merged_html(input_path, spine_paths, styles, opf_dir)
         base_url = os.path.join(tmp, opf_dir)
-        if _render_weasyprint(html, base_url, pdf_path, timeout, cancel_check):
-            # finalize_cover_thumbnail swallows its own errors (best-effort).
-            finalize_cover_thumbnail(input_path, pdf_path, thumb_path)
-            return True
-        if cancel_check is not None and cancel_check():
-            # User cancelled mid-render — never start a Calibre conversion.
-            raise ConversionCancelledError(
-                f"conversion cancelled: {input_path}"
+        if _merged_html_is_blank(html):
+            # All chapters were unparseable → WeasyPrint would emit a blank
+            # PDF.  Fall back to Calibre (which has a tolerant parser).
+            logger.warning(
+                "weasyprint: merged content for %s is empty; using Calibre",
+                os.path.basename(input_path),
             )
-        logger.warning(
-            "weasyprint: render failed/timed out after %ss for %s; "
-            "using Calibre",
-            int(time.monotonic() - _render_start),
-            os.path.basename(input_path),
-        )
+        elif _render_weasyprint(
+            html, base_url, pdf_path, timeout, cancel_check
+        ):
+            if _pdf_is_degenerate(pdf_path):
+                logger.warning(
+                    "weasyprint: rendered a blank %s-byte PDF for %s; "
+                    "using Calibre",
+                    os.path.getsize(pdf_path),
+                    os.path.basename(input_path),
+                )
+                try:
+                    os.remove(pdf_path)
+                except OSError:  # nosec B110 - already gone is fine
+                    pass
+            else:
+                # finalize_cover_thumbnail swallows its own errors.
+                finalize_cover_thumbnail(input_path, pdf_path, thumb_path)
+                return True
+        else:
+            if cancel_check is not None and cancel_check():
+                # User cancelled mid-render — never start a Calibre conversion.
+                raise ConversionCancelledError(
+                    f"conversion cancelled: {input_path}"
+                )
+            logger.warning(
+                "weasyprint: render failed/timed out after %ss for %s; "
+                "using Calibre",
+                int(time.monotonic() - _render_start),
+                os.path.basename(input_path),
+            )
     except ConversionCancelledError:
         raise
     except Exception as exc:  # nosec B110 - any failure falls back
