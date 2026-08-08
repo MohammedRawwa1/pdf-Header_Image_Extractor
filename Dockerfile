@@ -39,11 +39,16 @@ RUN if [ "$INSTALL_OCR" = "1" ]; then \
 			&& rm -rf /var/lib/apt/lists/* && \
 		# Fail the build fast if the binaries cannot run instead of deploying an
 		# image where every OCR job fails.  ocrmypdf (pip, installed above)
-		# needs tesseract + ghostscript to build searchable PDFs.
-		tesseract --version >/dev/null 2>&1 || \
-			(echo "ERROR: tesseract failed to run" && exit 1); \
-		ocrmypdf --version >/dev/null 2>&1 || \
-			(echo "ERROR: ocrmypdf failed to run" && exit 1); \
+		# needs tesseract + ghostscript to build searchable PDFs.  Stderr is
+		# surfaced (NOT /dev/null) so the real cause shows up in build logs.
+		if ! tesseract --version >/tmp/tesseract.log 2>&1; then \
+			cat /tmp/tesseract.log; \
+			echo "ERROR: tesseract failed to run" && exit 1; \
+		fi; \
+		if ! ocrmypdf --version >/tmp/ocrmypdf.log 2>&1; then \
+			cat /tmp/ocrmypdf.log; \
+			echo "ERROR: ocrmypdf failed to run" && exit 1; \
+		fi; \
 	fi
 
 # Install Calibre (ebook-convert / ebook-meta) for the book-conversion feature.
@@ -61,13 +66,26 @@ RUN if [ "$INSTALL_CALIBRE" = "1" ]; then \
 		wget -q -O /tmp/calibre-installer.sh https://download.calibre-ebook.com/linux-installer.sh && \
 		sh /tmp/calibre-installer.sh install_dir=/opt/calibre && \
 		rm -f /tmp/calibre-installer.sh && \
-		echo 'export PATH="/opt/calibre:$PATH"' >> /etc/profile.d/calibre.sh && \
-		# Fail the build fast if ebook-convert cannot run (missing shared libs)
-		# instead of deploying an image where every conversion crashes.
-		/opt/calibre/ebook-convert --version >/dev/null 2>&1 || \
-			(echo "ERROR: calibre ebook-convert failed to run (missing shared libraries)" && exit 1); \
+		# The installer extracts the binaries into <install_dir>/calibre/
+		# (destdir joins install_dir + 'calibre') and then symlinks them into
+		# /usr/bin — <install_dir>/ebook-convert itself does NOT exist.  The
+		# symlinks are what shutil.which() resolves at runtime, so sanity-check
+		# `ebook-convert` (via PATH) with QT_QPA_PLATFORM=offscreen so the
+		# bundled Qt never tries the xcb platform plugin headless.
+		echo 'export PATH="/opt/calibre/calibre:$PATH"' >> /etc/profile.d/calibre.sh && \
+		# Fail the build fast if ebook-convert/ebook-meta cannot run instead of
+		# deploying an image where every conversion crashes.  Stderr is surfaced
+		# (NOT /dev/null) so the real cause shows up in build logs.
+		if ! QT_QPA_PLATFORM=offscreen ebook-convert --version >/tmp/calibre-convert.log 2>&1; then \
+			cat /tmp/calibre-convert.log; \
+			echo "ERROR: calibre ebook-convert failed to run" && exit 1; \
+		fi; \
+		if ! QT_QPA_PLATFORM=offscreen ebook-meta --version >/tmp/calibre-meta.log 2>&1; then \
+			cat /tmp/calibre-meta.log; \
+			echo "ERROR: calibre ebook-meta failed to run" && exit 1; \
+		fi; \
 	fi
-ENV PATH="/opt/calibre:${PATH}"
+ENV PATH="/opt/calibre/calibre:${PATH}"
 
 COPY . .
 
