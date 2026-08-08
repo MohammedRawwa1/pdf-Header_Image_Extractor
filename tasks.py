@@ -319,6 +319,27 @@ def _deliver_result_via_userbot(
     return (_sent, _src)
 
 
+def _safe_local_filename(filename: str) -> str:
+    """Filesystem-safe local name for a user-supplied filename.
+
+    Defense-in-depth on top of the bot-side ``_sanitize_filename`` (which
+    already strips separators and ``..``): a filename such as ``../x.epub``
+    or ``a/b.epub`` must never escape the job's private tmpdir when joined.
+    Basenames the name, drops control characters, rejects dots-only names,
+    and caps the length (preserving the extension) so every worker download
+    stays inside its own temp dir.
+    """
+    name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = "".join(c for c in name if c >= " ")
+    if not name or set(name) <= {"."}:
+        return "file"
+    if len(name) > 200:
+        _base, _ext = os.path.splitext(name)
+        _ext = _ext[:20]
+        name = (_base[: 200 - len(_ext)] or "file") + _ext
+    return name
+
+
 def _cleanup_after_success(
     chat_id: int,
     job_id: str | None,
@@ -407,7 +428,7 @@ from utils.ebook_converter import (  # noqa: E402
     ConversionCancelledError,
     calibre_available,
     convert_book_to_pdf_with_thumbnail,
-    convert_ebook,
+    convert_ebook_robust,
     is_book_format,
     safe_target_name,
 )
@@ -700,7 +721,7 @@ def process_input_key_job(job: dict) -> dict:
     _progress_msg_id = None
     try:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
-        dest_path = os.path.join(tmpdir, filename)
+        dest_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
         # Send initial progress
         _progress_msg_id = _tg_send_progress(
@@ -1768,7 +1789,7 @@ def process_document_job(
         if config.TMP_DIR:
             # disk-mode
             tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
-            file_path = os.path.join(tmpdir, filename)
+            file_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
             # download file (via Bot API or userbot fallback)
             dl_start = time.time()
@@ -2931,6 +2952,20 @@ def _deliver_converted_file(
     _thumb = None
     try:
         try:
+            # Pre-gate uploads by size: a result above the sendDocument cap
+            # would only be rejected (400) by the Bot API.  Raise INSIDE this
+            # try so the except below routes straight to the userbot pipe
+            # (mirroring the download-side getFile gate) instead of burning a
+            # doomed Bot API upload attempt on every oversized result.
+            _ul_limit = getattr(config, "BOT_API_UPLOAD_LIMIT_BYTES", 0)
+            if _ul_limit and os.path.getsize(file_path) > _ul_limit:
+                logger.info(
+                    "_deliver_converted_file: %s exceeds Bot API upload cap "
+                    "(%s), routing to the userbot pipe",
+                    filename,
+                    _format_size(_ul_limit),
+                )
+                raise ValueError("result exceeds Bot API upload cap")
             if thumb_path and os.path.exists(thumb_path):
                 _thumb = open(thumb_path, "rb")
             with open(file_path, "rb") as _doc:
@@ -3138,7 +3173,7 @@ def deliver_book_job(
             detail="\U0001f4e5 Downloading book...",
             file_size=file_size or 0,
         )
-        _src = os.path.join(tmpdir, filename)
+        _src = os.path.join(tmpdir, _safe_local_filename(filename))
         _dl_state: dict[str, float] = {
             "msg_id": float(_progress_msg_id or 0),
             "last_pct": -1.0,
@@ -3259,6 +3294,7 @@ def convert_book_job(
     forward_info: dict | None = None,
     file_size: int | None = None,
     source_chat_id: int | str | None = None,
+    compress: bool = False,
 ) -> dict:
     """RQ job: convert an e-book to ``target_fmt`` and deliver it.
 
@@ -3268,7 +3304,10 @@ def convert_book_job(
     PDF carries a one-tap Compress button.  ``source_chat_id`` overrides the
     chat used for the download when the book was delivered elsewhere (e.g. a
     large book re-downloaded from the userbot's DM/Saved Messages copy);
-    delivery still targets ``chat_id``.  Returns a result dict.
+    delivery still targets ``chat_id``.  ``compress=True`` (the 🗜 Compress
+    PDF menu button) additionally shrinks a PDF target with ``compress_pdf``
+    before delivery, so a book is converted-to-PDF-then-compressed in one
+    job.  Returns a result dict.
     """
     _rq_job_id = _attach_job_user_meta(user_id)
     logger.info(
@@ -3311,7 +3350,7 @@ def convert_book_job(
             detail="\U0001f4e5 Downloading...",
             file_size=file_size or 0,
         )
-        _src = os.path.join(tmpdir, filename)
+        _src = os.path.join(tmpdir, _safe_local_filename(filename))
         _dl_state: dict[str, float] = {
             "msg_id": float(_progress_msg_id or 0),
             "last_pct": -1.0,
@@ -3377,7 +3416,7 @@ def convert_book_job(
                 )
                 _thumb_path = os.path.join(tmpdir, "thumb.jpg")
             else:
-                _conv_ok = convert_ebook(
+                _conv_ok = convert_ebook_robust(
                     _src, _out, timeout=_timeout,
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
@@ -3392,11 +3431,15 @@ def convert_book_job(
                 chat_id, filename, "failed",
                 detail=(
                     f"\u274c Conversion to {target_fmt.upper()} failed. "
-                    "The file may be DRM-protected or corrupt."
+                    "The file may be DRM-protected or corrupt — check the "
+                    "server logs for the converter's error output."
                 ),
                 message_id=_progress_msg_id,
             )
-            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            # Keep the failed progress message VISIBLE: it is the user's only
+            # feedback when a conversion dies mid-run.  Only drop the
+            # transient "Queued..." confirmation.
+            _delete_queued_messages(_rq_job_id)
             return {"error": "conversion_failed"}
 
         if _job_cancelled(_cancel_check_id):
@@ -3404,6 +3447,35 @@ def convert_book_job(
             return {"status": "cancelled"}
 
         _caption = f"Here is your file converted to {target_fmt.upper()}."
+        # 🗜 Compress for a book = convert-to-PDF then shrink (the menu's
+        # Compress PDF button): run compress_pdf on the converted output and
+        # deliver the smaller copy.  Best-effort — a failed compression still
+        # delivers the converted PDF with the original caption.
+        if compress and target_fmt.lower() == "pdf":
+            _comp_path = os.path.join(tmpdir, "compressed_" + _out_name)
+            _gs = getattr(config, "PDF_COMPRESS_QUALITY", "/ebook")
+            try:
+                if compress_pdf(_out, _comp_path, gs_quality=_gs) and (
+                    os.path.exists(_comp_path)
+                    and os.path.getsize(_comp_path)
+                ):
+                    _out = _comp_path
+                    _caption = (
+                        "Here is your book converted to PDF and compressed."
+                    )
+                    # Refresh the thumbnail from the compressed PDF (best
+                    # effort — falls back to the pre-compression cover).
+                    try:
+                        if _thumb_path:
+                            create_thumbnail_from_pdf(_out, _thumb_path)
+                    except Exception:  # nosec B110
+                        pass
+            except Exception:  # nosec B110 - compression best-effort
+                logger.warning(
+                    "convert_book_job: compression failed for %s, "
+                    "delivering converted PDF only",
+                    filename,
+                )
         _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
@@ -3502,7 +3574,7 @@ def compress_pdf_job(
             chat_id, filename, "downloading",
             detail="\U0001f4e5 Downloading PDF...",
         )
-        _src = os.path.join(tmpdir, filename)
+        _src = os.path.join(tmpdir, _safe_local_filename(filename))
         _dl_state: dict[str, float] = {
             "msg_id": float(_progress_msg_id or 0),
             "last_pct": -1.0,
@@ -3704,7 +3776,7 @@ def ocr_job(
             detail="\U0001f4e5 Downloading file...",
             file_size=file_size or 0,
         )
-        _src = os.path.join(tmpdir, filename)
+        _src = os.path.join(tmpdir, _safe_local_filename(filename))
         _dl_state: dict[str, float] = {
             "msg_id": float(_progress_msg_id or 0),
             "last_pct": -1.0,
@@ -3749,6 +3821,10 @@ def ocr_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
 
+        # PDF outputs carry a cover preview — the user-facing thumbnail rule:
+        # ebook→PDF results get the extracted cover/first page, everything else
+        # (txt, other converted formats) ships as a plain document.
+        _thumb_path = None
         # E-books aren't OCR-able directly — convert to PDF with Calibre first,
         # then OCR the PDF (both searchable-PDF and text extraction work on it).
         if is_book_format(filename) and not filename.lower().endswith(".pdf"):
@@ -3786,12 +3862,29 @@ def ocr_job(
                 return {"error": "conversion_failed"}
             _src = _pdf_src
             filename = _pdf_name
+            # The intermediate conversion already extracted the book's cover
+            # (or first page) into thumb.jpg — reuse it ONLY for a PDF output;
+            # a txt extraction stays a plain document (the user-facing rule:
+            # PDF results carry a preview, other formats ship bare).
+            if target == "pdf":
+                _thumb_path = os.path.join(tmpdir, "thumb.jpg")
 
         if _job_cancelled(_cancel_check_id):
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
 
         _is_pdf_out = target == "pdf"
+        if _is_pdf_out and _thumb_path is None:
+            # Direct PDF or image source: build a first-page preview for the
+            # OCR'd PDF (best-effort — a missing preview never fails the job).
+            _thumb_path = os.path.join(tmpdir, "thumb.jpg")
+            try:
+                if filename.lower().endswith(".pdf"):
+                    create_thumbnail_from_pdf(_src, _thumb_path)
+                else:
+                    create_thumbnail_from_image(_src, _thumb_path)
+            except Exception:  # nosec B110 - preview is best-effort
+                _thumb_path = None
         _progress_msg_id = _tg_send_progress(
             chat_id, filename, "ocr",
             detail=(
@@ -3881,13 +3974,15 @@ def ocr_job(
                     ),
                     message_id=_progress_msg_id,
                 )
-                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                # Keep the failed progress message visible — it's the only
+                # feedback the user gets (same as convert_book_job).
+                _delete_queued_messages(_rq_job_id)
                 return {"error": "no_text_found"}
             with open(_out, "w", encoding="utf-8") as _fh:
                 _fh.write(text)
             _caption = "\U0001f50e Here is the extracted text."
         _deliver_converted_file(
-            chat_id, _out, _out_name, None, _caption, user_id,
+            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
         )
         out_meta = {
@@ -4000,7 +4095,7 @@ def process_url_job(
     _progress_msg_id = None
     try:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None) or None)
-        file_path = os.path.join(tmpdir, filename)
+        file_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
         # Live download progress (throttled edits on the same message).
         _progress_msg_id = _tg_send_progress(

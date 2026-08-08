@@ -913,6 +913,7 @@ _PROGRESS_STAGES = {
     "compressing": 80,
     "sending": 90,
     "done": 100,
+    "failed": 0,
 }
 
 
@@ -959,6 +960,7 @@ def _tg_send_progress(
         "compressing": "\U0001f5dc\ufe0f",
         "sending": "\U0001f4e4",
         "done": "\u2705",
+        "failed": "\u274c",
     }
     emoji = emojis.get(stage, "\u2753")
 

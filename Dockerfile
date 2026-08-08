@@ -84,12 +84,44 @@ RUN if [ "$INSTALL_CALIBRE" = "1" ]; then \
 			cat /tmp/calibre-meta.log; \
 			echo "ERROR: calibre ebook-meta failed to run" && exit 1; \
 		fi; \
+		# --version never exercises Qt WebEngine, but real EPUB->PDF renders
+		# through it (the exact crash seen in production: QRhiGles2/
+		# QVulkanInstance + credentials.cc Permission denied).  Smoke-convert
+		# a minimal EPUB with the headless env so this build can't ship a
+		# Calibre whose renderer dies at runtime.
+		mkdir -p /tmp/calibre-smoke/epub/META-INF /tmp/calibre-smoke/epub/OEBPS && \
+		printf 'application/epub+zip' > /tmp/calibre-smoke/epub/mimetype && \
+		printf '%s' '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>' > /tmp/calibre-smoke/epub/META-INF/container.xml && \
+		printf '%s' '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">smoke</dc:identifier><dc:title>Smoke</dc:title><dc:language>en</dc:language></metadata><manifest><item id="c1" href="content.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>' > /tmp/calibre-smoke/epub/OEBPS/content.opf && \
+		printf '%s' '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Smoke</title></head><body><p>Smoke</p></body></html>' > /tmp/calibre-smoke/epub/OEBPS/content.xhtml && \
+		cd /tmp/calibre-smoke && \
+		if ! env QT_QPA_PLATFORM=offscreen QTWEBENGINE_DISABLE_SANDBOX=1 \
+			QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \
+			QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 HOME=/tmp/calibre-smoke \
+			ebook-convert epub smoke.pdf >/tmp/calibre-smoke.log 2>&1; then \
+			cat /tmp/calibre-smoke.log; \
+			echo "ERROR: calibre EPUB->PDF smoke conversion failed" && exit 1; \
+		fi; \
+		if [ ! -s /tmp/calibre-smoke/smoke.pdf ]; then \
+			cat /tmp/calibre-smoke.log; \
+			echo "ERROR: calibre smoke PDF not produced" && exit 1; \
+		fi; \
+		cd /tmp && rm -rf /tmp/calibre-smoke /tmp/calibre-smoke.log; \
 	fi
-ENV PATH="/opt/calibre/calibre:${PATH}"
+ENV PATH="/opt/calibre/calibre:${PATH}" \
+	QT_QPA_PLATFORM=offscreen \
+	QTWEBENGINE_DISABLE_SANDBOX=1 \
+	QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \
+	QT_QUICK_BACKEND=software \
+	LIBGL_ALWAYS_SOFTWARE=1
 
 COPY . .
 
 RUN useradd -m botuser && chown -R botuser /app
+# Calibre's Qt WebEngine needs a writable HOME (Chromium credential
+# store); Docker defaults HOME to /root, which botuser cannot write —
+# that is the credentials.cc Permission denied crash.
+ENV HOME=/home/botuser
 USER botuser
 
 EXPOSE 8000

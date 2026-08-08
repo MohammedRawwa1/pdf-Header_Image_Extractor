@@ -9,6 +9,9 @@ Key entry points:
 - :func:`is_book_format` — is a filename a convertible book/PDF format?
 - :func:`conversion_targets_for` — valid target formats for a source format.
 - :func:`convert_ebook` — run ``ebook-convert`` with a timeout.
+- :func:`convert_ebook_robust` — direct conversion with an EPUB-intermediate
+  fallback for sources that can't convert directly (self-cleaning, invisible
+  to the user — a pure blackbox).
 - :func:`extract_cover_thumbnail` — best-effort cover image via ``ebook-meta``.
 """
 
@@ -16,6 +19,7 @@ import logging
 import os
 import shutil
 import subprocess  # nosec B404 - intentional, needed for Calibre conversions
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -108,9 +112,29 @@ def _calibre_env() -> dict:
     ``ebook-meta`` from trying to initialize the xcb Qt platform plugin
     (which is not reliably present in slim containers) — conversions run
     without any display or windowing stack.
+
+    EPUB→PDF rendering goes through **Qt WebEngine** (Chromium).  In a
+    container that means: the Chromium sandbox must be off
+    (``QTWEBENGINE_DISABLE_SANDBOX``), GPU/EGL/GLES2/Vulkan must be disabled
+    so the renderer falls back to software drawing, and ``HOME`` must point
+    at a *writable* directory — Chromium's credential store dies with
+    ``credentials.cc ... Permission denied`` when HOME isn't writable (the
+    container runs as ``botuser`` whose HOME defaults to ``/root``).
     """
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    env.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--no-sandbox --disable-gpu --disable-dev-shm-usage",
+    )
+    env.setdefault("QT_QUICK_BACKEND", "software")
+    env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+    # Chromium needs a writable HOME for its credential store; fall back to a
+    # temp dir when the inherited HOME is missing or not writable.
+    _home = env.get("HOME") or ""
+    if not _home or not os.path.isdir(_home) or not os.access(_home, os.W_OK):
+        env["HOME"] = tempfile.gettempdir()
     return env
 
 
@@ -226,6 +250,70 @@ def convert_ebook(
             proc.wait()
 
 
+def convert_ebook_robust(
+    input_path: str,
+    output_path: str,
+    timeout: int = 600,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
+    """Convert ``input_path`` → ``output_path`` with a two-step EPUB fallback.
+
+    Most sources convert directly to the requested target, but some formats
+    (or mildly nonstandard files — a MOBI with odd metadata, an HTML file
+    with relative resource links, a DOCX with exotic styles) fail on the
+    direct leg while succeeding when pivoted through **EPUB**, Calibre's
+    canonical interchange format.
+
+    When the direct conversion fails and neither end is already EPUB, this
+    retries as ``source → intermediate.epub → target``.  The intermediate
+    lives beside the output (inside the job's private temp dir) and is
+    deleted in ``finally`` — the two-step is fully virtual: no temp file
+    leaks, no user-visible stage change, exactly one progress bar.  Returns
+    True when ``output_path`` exists.
+    """
+    if convert_ebook(
+        input_path, output_path, timeout=timeout, cancel_check=cancel_check
+    ):
+        return True
+    src_ext = _normalize_ext(os.path.splitext(input_path)[1])
+    dst_ext = _normalize_ext(os.path.splitext(output_path)[1])
+    if src_ext == "epub" or dst_ext == "epub":
+        # Already a direct-to-EPUB (or EPUB-source) attempt — pivoting through
+        # EPUB would be the same conversion; nothing gained.
+        return False
+    _dir = os.path.dirname(output_path)
+    _own_dir = False
+    if not _dir or not os.path.isdir(_dir) or not os.access(_dir, os.W_OK):
+        _dir = tempfile.mkdtemp()
+        _own_dir = True
+    inter = os.path.join(
+        _dir, f"_intermediate_{os.getpid()}_{int(time.time() * 1000)}.epub"
+    )
+    try:
+        logger.info(
+            "convert_ebook_robust: direct %s->%s failed for %s; "
+            "retrying via EPUB intermediate",
+            src_ext or "?",
+            dst_ext or "?",
+            os.path.basename(input_path),
+        )
+        if not convert_ebook(
+            input_path, inter, timeout=timeout, cancel_check=cancel_check
+        ):
+            return False
+        return convert_ebook(
+            inter, output_path, timeout=timeout, cancel_check=cancel_check
+        )
+    finally:
+        try:
+            if os.path.exists(inter):
+                os.remove(inter)
+        except Exception:  # nosec B110 - best-effort intermediate cleanup
+            pass
+        if _own_dir:
+            shutil.rmtree(_dir, ignore_errors=True)
+
+
 def extract_cover_thumbnail(input_path: str, thumb_path: str) -> bool:
     """Extract a book's embedded cover to ``thumb_path`` via ``ebook-meta``.
 
@@ -294,7 +382,7 @@ def convert_book_to_pdf_with_thumbnail(
     mid-conversion.  Returns True when the PDF was produced; thumbnail may be
     absent.
     """
-    if not convert_ebook(
+    if not convert_ebook_robust(
         input_path, pdf_path, timeout=timeout, cancel_check=cancel_check
     ):
         return False

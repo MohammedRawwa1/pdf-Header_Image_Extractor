@@ -76,6 +76,7 @@ from tools import (  # noqa: E402
     create_thumbnail_from_image,
     create_thumbnail_from_pdf,
     extract_pdf_metadata,
+    infer_extension,
     is_supported_format,
     is_valid_pdf,
 )
@@ -1147,6 +1148,11 @@ async def handle_document(
     chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
     filename = _sanitize_filename(doc.file_name, f"file_{doc.file_id}")
     mime = getattr(doc, "mime_type", "") or ""
+    # Telegram documents may arrive WITHOUT a filename (only ``file_<id>``).
+    # Book formats are detected by extension, so derive one from the MIME
+    # type before validation/classification — a nameless EPUB must not be
+    # rejected just because it lacks the extension it needs to convert.
+    filename = infer_extension(filename, mime)
 
     # ── Early format validation: check → validate → compare → process ──
     # Reject unsupported formats (video files like MKV, AVI, etc.) BEFORE any
@@ -2002,10 +2008,9 @@ async def cmd_start(
         f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
         "📄 Send a **PDF**, **image**, or **e-book** and I'll show you an "
         "**action menu** — tap what you want and I process only that:\n"
-        "• 🖼 **Thumbnail** — cover preview (PDF page / image / book cover)\n"
-        "• 🗜 **Compress PDF** — shrink PDFs before sending\n"
-        "• 🔎 **OCR** — **searchable PDF** (selectable text, same look) or plain text\n"
-        "• 🔁 **Convert** — re-format e-books (EPUB → PDF, MOBI, FB2, …)\n\n"
+        "• **PDF**: 🖼 **Thumbnail** · 🔎🖼 **OCR & Thumbnail** (all-in-one) · 🗜🖼 **Compress & Thumbnail**\n"
+        "• **Images**: 🖼 **Thumbnail** · 🔎 **OCR**\n"
+        "• **E-books**: 🔁 **Convert** · 🗜 **Compress PDF** · 🔎 **OCR PDF**\n\n"
         "⚡ **Quick commands:**\n"
         "• /help — all commands\n"
         "• /login — connect **your** Telethon account (large files)\n"
@@ -2057,11 +2062,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📖 Media → action menu\n"
         "• Send a PDF / image / e-book → I detect it and show an **action "
         "menu**; nothing is processed until you tap an option\n"
-        "• 🖼 **Thumbnail** — cover preview (PDF first page / image / book cover)\n"
-        "• 🗜 **Compress PDF** — shrink PDFs\n"
-        "• 🔎 **OCR** — **Searchable PDF** (invisible text layer, same look) "
-        "or plain text (.txt); e-books are converted to PDF first\n"
-        "• 🔁 **Convert** — re-format e-books (PDF, EPUB, MOBI, FB2, …)\n"
+        "• **PDF**: 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail (all-in-one) · "
+        "🗜🖼 Compress & Thumbnail\n"
+        "• **Image**: 🖼 Thumbnail · 🔎 OCR\n"
+        "• **E-book**: 🔁 Convert · 🗜 Compress PDF (convert→PDF, then "
+        "shrink) · 🔎 OCR PDF (converted to PDF first)\n"
         "• /ocr [pdf|txt|picker] — pin your OCR output so the picker is skipped\n"
         "\n"
         "Send any supported file to get its action menu."
@@ -2270,6 +2275,15 @@ def _book_conv_kb(
         ]
         for i in range(0, len(targets), 3)
     ]
+    # ✖ Cancel: closes the format picker without queuing a conversion.
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\u2716\ufe0f Cancel",
+                callback_data=f"bookcancel:{uid}:{token}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -2391,7 +2405,10 @@ def _ctx_menu_kb(
     callers then reply with a clear message instead of a dead menu.
     """
     rows: list[list[InlineKeyboardButton]] = []
-    if kind in ("pdf", "image"):
+    if kind == "pdf":
+        # PDFs get a dedicated menu-interface: 🖼 Thumbnail, 🔎+🖼 OCR &
+        # Thumbnail (all-in-one — no standalone OCR), and 🗜+🖼 Compress &
+        # Thumbnail (compress_pdf_job already delivers a cover thumbnail).
         rows.append(
             [
                 InlineKeyboardButton(
@@ -2400,15 +2417,32 @@ def _ctx_menu_kb(
                 )
             ]
         )
-        if kind == "pdf":
+        if is_ocr_source(filename) and ocr_enabled():
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f5dc\ufe0f Compress PDF",
-                        callback_data=f"compresspdf:{uid}:{token}",
+                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
+                        callback_data=f"ctxthumbocr:{uid}:{token}",
                     )
                 ]
             )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f5dc\ufe0f\U0001f5bc\ufe0f Compress & Thumbnail",
+                    callback_data=f"compresspdf:{uid}:{token}",
+                )
+            ]
+        )
+    elif kind == "image":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f5bc\ufe0f Thumbnail",
+                    callback_data=f"ctxthumb:{uid}:{token}",
+                )
+            ]
+        )
         if is_ocr_source(filename) and ocr_enabled():
             rows.append(
                 [
@@ -2428,6 +2462,16 @@ def _ctx_menu_kb(
                     )
                 ]
             )
+        # 🗜 Compress for a book = convert-to-PDF then shrink (needs Calibre).
+        if getattr(config, "ENABLE_BOOK_CONVERSION", False) and calibre_available():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f5dc\ufe0f Compress PDF",
+                        callback_data=f"bookcomp:{uid}:{token}",
+                    )
+                ]
+            )
         # Books aren't OCR-able directly — ocr_job converts them to PDF first
         # (needs Calibre), so the button is gated on Calibre being present.
         if ocr_enabled() and calibre_available():
@@ -2439,6 +2483,17 @@ def _ctx_menu_kb(
                     )
                 ]
             )
+    # ✖ Close on every input context menu: discard the pending record and
+    # clear the menu without queuing anything.
+    if rows:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\u2716\ufe0f Close",
+                    callback_data=f"ctxclose:{uid}:{token}",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -4495,28 +4550,17 @@ async def handle_ctx_thumb_callback(
             await query.answer("\U0001f5bc\ufe0f Thumbnail queued")
         except Exception:  # nosec B110
             pass
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([])
-            )
-        except Exception:  # nosec B110
-            pass
-        _queued_msg = None
-        try:
-            _queued_msg = await query.message.reply_text(
-                f"\U0001f5bc\ufe0f Building the thumbnail for "
-                f"`{safe_code_span(filename)}`...\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
-                reply_markup=_queued_cancel_kb(armer, ok),
-                parse_mode="Markdown",
-            )
-        except Exception:  # nosec B110
-            pass
-        _store_queued_message(
-            ok,
-            chat_id,
-            getattr(_queued_msg, "message_id", None),
+        # Replace the tapped message in place when it's a text message (input
+        # context menu -> no leftover prompt); media-message buttons fall back
+        # inside the helper to clear-button + new text message.
+        _qid = await _replace_tapped_text(
+            query,
+            f"\U0001f5bc\ufe0f Building the thumbnail for "
+            f"`{safe_code_span(filename)}`...\n"
+            f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+            _queued_cancel_kb(armer, ok),
         )
+        _store_queued_message(ok, chat_id, _qid)
     else:
         try:
             await query.answer(
@@ -4525,6 +4569,186 @@ async def handle_ctx_thumb_callback(
             )
         except Exception:  # nosec B110
             pass
+
+
+async def handle_ctx_thumb_ocr_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🔎+🖼 OCR & Thumbnail button on the input context menu: ``ctxthumbocr:<uid>:<token>``.
+
+    All-in-one for PDFs: consumes the pending record atomically
+    (``ctxfile:<token>``) and enqueues BOTH ``process_document_job`` (cover
+    thumbnail) and ``ocr_job`` (searchable PDF / plain text) in one tap — so
+    there is no standalone OCR button for PDFs.  Same-user bound.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "ctxthumbocr":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who sent the file can process it.",
+            show_alert=True,
+        )
+        return
+    rec = _load_pending_token(token, True, "ctxfile")
+    if not rec:
+        await query.answer(
+            "This menu has expired. Send the file again.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "ctx_thumb_ocr")
+    chat_id = rec.get("chat_id")
+    filename = rec.get("filename") or "file"
+    if not chat_id:
+        await query.answer(
+            "This action is invalid. Send the file again.", show_alert=True
+        )
+        return
+    # OCR target: honor the user's pinned default, else searchable PDF when
+    # the engine is available, else plain text.
+    _target = (get_user_setting(armer, "ocr_target", "") or "").lower()
+    if _target not in ("pdf", "txt"):
+        _target = "pdf" if ocr_pdf_available() else "txt"
+    ok_thumb = await asyncio.to_thread(
+        enqueue_job,
+        "process_document_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        rec.get("mime", ""),
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        rec.get("forward_info"),
+        rec.get("file_size"),
+        armer,
+        job_timeout=1800,
+    )
+    ok_ocr = await asyncio.to_thread(
+        enqueue_job,
+        "ocr_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        armer,
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        None,  # forward_info is not stored in the pending record
+        rec.get("file_size"),
+        source_chat_id=rec.get("source_chat_id"),
+        target=_target,
+        job_timeout=7200,
+    )
+    if ok_thumb or ok_ocr:
+        _queued_parts = []
+        _kb_rows: list[list[InlineKeyboardButton]] = []
+        if ok_thumb:
+            _queued_parts.append(f"🖼 Thumbnail — `{ok_thumb}`")
+            _kb_t = _queued_cancel_kb(armer, ok_thumb)
+            if _kb_t:
+                _kb_rows.extend(_kb_t.inline_keyboard)
+        if ok_ocr:
+            _queued_parts.append(f"🔎 OCR — `{ok_ocr}`")
+            _kb_o = _queued_cancel_kb(armer, ok_ocr)
+            if _kb_o:
+                _kb_rows.extend(_kb_o.inline_keyboard)
+        _partial = ok_thumb != ok_ocr and (ok_thumb is None or ok_ocr is None)
+        _msg = (
+            f"\U0001f50e\U0001f5bc\ufe0f Building thumbnail + OCR for "
+            f"`{safe_code_span(filename)}`...\n"
+            + "\n".join(_queued_parts)
+            + (
+                "\n\u26a0\ufe0f One of the jobs failed to queue — try again."
+                if _partial
+                else ""
+            )
+        )
+        try:
+            await query.answer(
+                "\U0001f50e\U0001f5bc\ufe0f Thumbnail + OCR queued"
+            )
+        except Exception:  # nosec B110
+            pass
+        # Explicit empty keyboard (not None) when no cancel rows exist so the
+        # tapped menu's buttons are fully removed either way (PTB omits the
+        # reply_markup field for None, leaving the old row stuck).
+        _qid = await _replace_tapped_text(
+            query,
+            _msg,
+            InlineKeyboardMarkup(_kb_rows) if _kb_rows else InlineKeyboardMarkup([]),
+        )
+        # Store the confirmation under the LONGER-running job (OCR) so it is
+        # not deleted when the thumbnail finishes first; the second job's
+        # _delete_queued_messages is then a no-op on the missing record.
+        if ok_ocr:
+            _store_queued_message(ok_ocr, chat_id, _qid)
+        elif ok_thumb:
+            _store_queued_message(ok_thumb, chat_id, _qid)
+    else:
+        try:
+            await query.answer(
+                "\u274c Couldn't queue the jobs. Try again in a moment.",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+
+
+async def _replace_tapped_text(
+    query, text: str, reply_markup
+) -> int | None:
+    """Replace a tapped callback message's text in place when possible.
+
+    Input context menus are plain TEXT messages, so the action confirmation
+    or picker replaces the menu text directly — no leftover "what would you
+    like to do?" prompt.  Buttons on DELIVERED files sit on MEDIA messages
+    that Telegram cannot text-edit (400), so for those the helper clears the
+    button and posts a fresh text message instead.  Returns the message_id
+    that now shows ``text`` (or None when nothing could be sent).
+
+    ``reply_markup`` is the keyboard to show; ``None`` is treated as "clear
+    the whole context builder" (explicit ``InlineKeyboardMarkup([])``).  PTB
+    omits the reply_markup field entirely when it's None, which would leave
+    the old button row stuck on the edited message — so None can never be
+    passed through as-is.
+    """
+    # Centralized guard: None would be omitted by PTB and leave stale buttons.
+    if reply_markup is None:
+        reply_markup = InlineKeyboardMarkup([])
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return getattr(query.message, "message_id", None)
+    except Exception:  # nosec B110 - media message: fall back below
+        pass
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([])
+        )
+    except Exception:  # nosec B110
+        pass
+    try:
+        _sent = await query.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+        return getattr(_sent, "message_id", None)
+    except Exception:  # nosec B110
+        return None
 
 
 async def handle_book_convert_button_callback(
@@ -4566,12 +4790,16 @@ async def handle_book_convert_button_callback(
             )
         except Exception:  # nosec B110
             pass
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([])
-            )
-        except Exception:  # nosec B110
-            pass
+        # Replace the leftover menu text too (not just clear the buttons) so
+        # the input menu doesn't keep asking "what would you like to do?".
+        # An explicit empty keyboard (not None) is required: PTB omits the
+        # reply_markup field when it's None, which would leave the whole
+        # context-builder button row stuck on the message.
+        await _replace_tapped_text(
+            query,
+            "⏰ This choice expired. Send the book again.",
+            InlineKeyboardMarkup([]),
+        )
         return
     await _track_user_session(update, "book_convert")
     filename = rec.get("filename") or "file"
@@ -4584,33 +4812,116 @@ async def handle_book_convert_button_callback(
             )
         except Exception:  # nosec B110
             pass
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([])
-            )
-        except Exception:  # nosec B110
-            pass
+        # Same as above: replace the menu text instead of leaving a dead prompt
+        # (explicit empty keyboard so the button row is fully removed).
+        await _replace_tapped_text(
+            query,
+            f"\u274c No convertible target formats for "
+            f"`{safe_code_span(filename)}`.",
+            InlineKeyboardMarkup([]),
+        )
         return
     try:
         await query.answer()
     except Exception:  # nosec B110 - stale/redelivered query
         pass
+    # Replace the tapped message in place when it's a text message (input
+    # context menu -> no leftover "what would you like to do?" prompt);
+    # delivered-book buttons sit on media messages, which fall back inside the
+    # helper to clear-button + new text message.
+    await _replace_tapped_text(
+        query,
+        f"\U0001f501 Convert `{safe_code_span(filename)}` to:",
+        kb,
+    )
+
+
+async def handle_book_compress_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🗜 Compress PDF button on the book input menu: ``bookcomp:<uid>:<token>``.
+
+    Compress for a book = convert-to-PDF then shrink: enqueues
+    ``convert_book_job`` with ``target_fmt="pdf"`` and ``compress=True`` so
+    the delivered PDF is already compressed.  Consumes the pending record
+    atomically.  Same-user bound.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "bookcomp":
+        await query.answer("Invalid action", show_alert=True)
+        return
     try:
-        # The Convert button sits on the delivered BOOK message (a document),
-        # which Telegram cannot text-edit (400 "no text in the message to
-        # edit").  Clear the button on the media message and present the
-        # format picker as a NEW text message instead, so the final format tap
-        # (handle_book_convert_callback) can edit that text message in place.
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([])
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who sent the book can compress it.",
+            show_alert=True,
         )
-        await query.message.reply_text(
-            f"\U0001f501 Convert `{safe_code_span(filename)}` to:",
-            reply_markup=kb,
-            parse_mode="Markdown",
+        return
+    rec = _load_pending_token(token, True, "bookconvert", "ctxfile")
+    if not rec:
+        await query.answer(
+            "This menu has expired. Send the book again.", show_alert=True
         )
-    except Exception:  # nosec B110
-        pass
+        return
+    await _track_user_session(update, "book_compress")
+    chat_id = rec.get("chat_id")
+    filename = rec.get("filename") or "file"
+    if not chat_id:
+        await query.answer(
+            "This action is invalid. Send the book again.", show_alert=True
+        )
+        return
+    # job_timeout covers the full convert-to-PDF + compress + deliver chain.
+    _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
+    ok = await asyncio.to_thread(
+        enqueue_job,
+        "convert_book_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        rec.get("mime", ""),
+        "pdf",  # compress target is always PDF
+        armer,
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        rec.get("forward_info"),
+        rec.get("file_size"),
+        rec.get("source_chat_id"),
+        compress=True,
+        # Two-leg conversions (direct + EPUB pivot) can each use the full
+        # BOOK_CONVERT_TIMEOUT_SECONDS; give the death penalty headroom.
+        job_timeout=2 * int(_conv_timeout) + 300,
+    )
+    if ok:
+        try:
+            await query.answer("\U0001f5dc\ufe0f Compress queued")
+        except Exception:  # nosec B110
+            pass
+        _qid = await _replace_tapped_text(
+            query,
+            f"\U0001f5dc\ufe0f Converting `{safe_code_span(filename)}` to "
+            f"PDF and compressing...\n"
+            f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+            _queued_cancel_kb(armer, ok),
+        )
+        _store_queued_message(ok, chat_id, _qid)
+    else:
+        try:
+            await query.answer(
+                "\u274c Couldn't queue the compression. Try again in a moment.",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
 
 
 async def handle_book_convert_callback(
@@ -4673,7 +4984,10 @@ async def handle_book_convert_callback(
         pending.get("forward_info"),
         pending.get("file_size"),
         pending.get("source_chat_id"),
-        job_timeout=int(_conv_timeout) + 600,
+        # Two-leg conversions (direct + EPUB pivot) can each use the full
+        # BOOK_CONVERT_TIMEOUT_SECONDS — give the death penalty headroom
+        # (matches handle_book_compress_callback).
+        job_timeout=2 * int(_conv_timeout) + 300,
     )
     if ok:
         try:
@@ -4763,25 +5077,16 @@ async def handle_compress_callback(
             await query.answer("\U0001f5dc\ufe0f Compression queued")
         except Exception:  # nosec B110
             pass
-        try:
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
-        except Exception:  # nosec B110
-            pass
-        _queued_msg = None
-        try:
-            _queued_msg = await query.message.reply_text(
-                f"\U0001f5dc\ufe0f Compressing `{safe_code_span(filename)}`...\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
-                reply_markup=_queued_cancel_kb(armer, ok),
-                parse_mode="Markdown",
-            )
-        except Exception:  # nosec B110
-            pass
-        _store_queued_message(
-            ok,
-            chat_id,
-            getattr(_queued_msg, "message_id", None),
+        # Replace the tapped message in place when it's a text message (input
+        # context menu -> no leftover prompt); media-message buttons fall back
+        # inside the helper to clear-button + new text message.
+        _qid = await _replace_tapped_text(
+            query,
+            f"\U0001f5dc\ufe0f Compressing `{safe_code_span(filename)}`...\n"
+            f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+            _queued_cancel_kb(armer, ok),
         )
+        _store_queued_message(ok, chat_id, _qid)
     else:
         try:
             await query.answer(
@@ -4816,6 +5121,15 @@ def _ocr_pick_kb(uid: int, token: str) -> InlineKeyboardMarkup:
             )
         ]
     )
+    # ✖ Cancel: closes the picker without queuing anything.
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\u2716\ufe0f Cancel",
+                callback_data=f"ocrcancel:{uid}:{token}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -4846,6 +5160,14 @@ def _ocr_settings_kb(uid: int) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\u2716\ufe0f Close",
+                callback_data=f"ocrset:{uid}:close",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -4937,6 +5259,21 @@ async def handle_ocr_set_callback(
         await query.answer(
             "Only you can change your OCR default.", show_alert=True
         )
+        return
+    if _arg == "close":
+        # ✖ Close on the /ocr settings menu: dismiss without changing anything.
+        try:
+            await query.answer("Closed")
+        except Exception:  # nosec B110
+            pass
+        await _track_user_session(update, "ocr_settings_close")
+        try:
+            await query.edit_message_text(
+                "\u2705 Settings closed.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:  # nosec B110
+            pass
         return
     if _arg not in ("pdf", "txt", "picker"):
         await query.answer("Invalid action", show_alert=True)
@@ -5036,21 +5373,17 @@ async def handle_ocr_callback(
         await query.answer()
     except Exception:  # nosec B110 - stale/redelivered query
         pass
-    try:
-        # The 🔎 OCR button sits on a delivered PDF/image (a document), which
-        # Telegram cannot text-edit (400 "no text in the message to edit").
-        # Clear the button on the media message and reveal the picker as a NEW
-        # text message instead, so the final pick (handle_ocr_pick_callback)
-        # can edit that text message in place.
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([])
-        )
-        await query.message.reply_text(
-            f"\U0001f50e OCR `{safe_code_span(filename)}` as:",
-            reply_markup=_ocr_pick_kb(armer, token),
-            parse_mode="Markdown",
-        )
-    except Exception:  # nosec B110 - reveal failed (expired/edited elsewhere)
+    # Replace the tapped message in place when it's a text message (input
+    # context menu -> no leftover prompt); media-message buttons fall back
+    # inside the helper to clear-button + new text message.  A None return
+    # means even the fallback failed (message deleted elsewhere) — tell the
+    # user the reveal didn't stick.
+    _revealed = await _replace_tapped_text(
+        query,
+        f"\U0001f50e OCR `{safe_code_span(filename)}` as:",
+        _ocr_pick_kb(armer, token),
+    )
+    if _revealed is None:
         try:
             await query.answer(
                 "This OCR link has expired. Send the file again.",
@@ -5162,31 +5495,22 @@ async def _enqueue_ocr_job(
             await query.answer("\U0001f50e OCR queued")
         except Exception:  # nosec B110
             pass
-        try:
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
-        except Exception:  # nosec B110
-            pass
-        _queued_msg = None
-        try:
-            _label = (
-                "building the searchable PDF"
-                if target == "pdf"
-                else "extracting the text"
-            )
-            _queued_msg = await query.message.reply_text(
-                f"\U0001f50e OCR started — {_label} on "
-                f"`{safe_code_span(filename)}`...\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
-                reply_markup=_queued_cancel_kb(uid, ok),
-                parse_mode="Markdown",
-            )
-        except Exception:  # nosec B110
-            pass
-        _store_queued_message(
-            ok,
-            chat_id,
-            getattr(_queued_msg, "message_id", None),
+        _label = (
+            "building the searchable PDF"
+            if target == "pdf"
+            else "extracting the text"
         )
+        # Replace the tapped message in place when it's a text message (input
+        # context menu -> no leftover prompt); media-message buttons fall back
+        # inside the helper to clear-button + new text message.
+        _qid = await _replace_tapped_text(
+            query,
+            f"\U0001f50e OCR started — {_label} on "
+            f"`{safe_code_span(filename)}`...\n"
+            f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+            _queued_cancel_kb(uid, ok),
+        )
+        _store_queued_message(ok, chat_id, _qid)
     else:
         try:
             await query.answer(
@@ -5195,6 +5519,61 @@ async def _enqueue_ocr_job(
         except Exception:  # nosec B110
             pass
     return bool(ok)
+
+
+async def handle_menu_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """✖ Cancel/Close on a context menu or format picker.
+
+    Handles ``ocrcancel:<uid>:<token>`` (OCR output picker),
+    ``bookcancel:<uid>:<token>`` (Convert format picker) and
+    ``ctxclose:<uid>:<token>`` (input context menu): consumes the pending
+    record atomically (so every option on the menu becomes inert — a stale
+    format tap can never enqueue a job afterwards) and replaces the menu
+    with a short "cancelled" note.  Same-user bound like every other action.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        parts = str(query.data).split(":", 2)
+        armer = int(parts[1])
+        token = parts[2]
+    except Exception:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    if parts[0] not in ("ctxclose", "ocrcancel", "bookcancel"):
+        await query.answer("Invalid action", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who opened this menu can close it.",
+            show_alert=True,
+        )
+        return
+    try:
+        await query.answer("Cancelled")
+    except Exception:  # nosec B110
+        pass
+    await _track_user_session(update, "ctx_menu_close")
+    # Consume the record from whichever store holds it (input menu vs
+    # delivered-file buttons) so no option can re-fire afterwards.
+    _load_pending_token(
+        token, True, "bookconvert", "bookcompress", "bookocr", "ctxfile"
+    )
+    # Close the context builder FULLY: an explicit empty keyboard (not None)
+    # is required — PTB omits reply_markup when it's None, so the old buttons
+    # would stay glued to the "Cancelled" message instead of disappearing.
+    await _replace_tapped_text(
+        query,
+        "\u2716\ufe0f Cancelled — nothing was queued.",
+        InlineKeyboardMarkup([]),
+    )
 
 
 # ── Register per-user login + auth commands ────────────────────
@@ -5283,13 +5662,46 @@ application.add_handler(
 application.add_handler(
     CallbackQueryHandler(
         handle_ocr_set_callback,
-        pattern=r"^ocrset:\d+:(pdf|txt|picker)$",
+        pattern=r"^ocrset:\d+:(pdf|txt|picker|close)$",
     )
 )
 application.add_handler(
     CallbackQueryHandler(
         handle_ctx_thumb_callback,
         pattern=r"^ctxthumb:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_ctx_thumb_ocr_callback,
+        pattern=r"^ctxthumbocr:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_book_compress_callback,
+        pattern=r"^bookcomp:\d+:\S+$",
+    )
+)
+# ✖ Cancel/Close buttons on the input context menu and the OCR/Convert
+# format pickers — same-user bound, consume the pending record, clear the
+# menu without queuing anything.
+application.add_handler(
+    CallbackQueryHandler(
+        handle_menu_cancel_callback,
+        pattern=r"^ctxclose:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_menu_cancel_callback,
+        pattern=r"^ocrcancel:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_menu_cancel_callback,
+        pattern=r"^bookcancel:\d+:\S+$",
     )
 )
 application.add_handler(CommandHandler("ocr", cmd_ocr))

@@ -47,6 +47,85 @@ VIDEO_MIME_PREFIXES: tuple[str, ...] = (
     "video/",
 )
 
+# Stripped image extensions (no leading dot) — hoisted for infer_extension.
+_IMAGE_EXT_STRIPPED: frozenset[str] = frozenset(
+    e.lstrip(".") for e in SUPPORTED_EXTENSIONS
+)
+
+# Book/ebook MIME types → the canonical extension Calibre expects.  Used to
+# (a) accept documents that arrive WITHOUT a filename (Telegram allows it —
+# the bot then sees only ``file_<id>`` with no extension) and (b) give such
+# files the extension they need before media detection / conversion runs.
+# MIME is matched case-insensitively against this map.  Every mapped
+# extension is one Calibre can actually READ — ``application/msword``
+# (legacy ``.doc``) is deliberately absent because Calibre cannot read ``doc``
+# and renaming it ``.docx`` would just manufacture a confusing failure.
+BOOK_MIME_TO_EXT: dict[str, str] = {
+    "application/epub+zip": "epub",
+    "application/x-mobipocket-ebook": "mobi",
+    "application/x-mobipocket": "mobi",
+    "application/vnd.amazon.ebook": "azw3",
+    "application/x-azw3": "azw3",
+    "application/vnd.amazon.mobi8-ebook": "azw3",
+    "application/x-fictionbook+xml": "fb2",
+    "application/x-fictionbook": "fb2",
+    "application/rtf": "rtf",
+    "text/rtf": "rtf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.oasis.opendocument.text": "odt",
+    "application/x-cbz": "cbz",
+    "application/vnd.comicbook+zip": "cbz",
+    "application/x-cbr": "cbr",
+    "application/vnd.comicbook-rar": "cbr",
+    "application/x-pdb": "pdb",
+    "application/x-snb": "snb",
+    "application/x-tcr": "tcr",
+    "application/x-mobipocket-prc": "prc",
+    "text/plain": "txt",
+    "text/html": "html",
+    "application/xhtml+xml": "html",
+}
+
+
+def _book_ext_for_mime(mime: str) -> str | None:
+    """Canonical book extension for ``mime``, or None when not a book MIME."""
+    return BOOK_MIME_TO_EXT.get((mime or "").lower().strip())
+
+
+def infer_extension(filename: str, mime: str = "") -> str:
+    """Return ``filename`` with a MIME-derived extension when it lacks one.
+
+    Telegram documents can arrive without a filename (the bot falls back to
+    ``file_<id>``, extensionless) or with a container-ish extension (e.g. a
+    ZIP-wrapped EPUB).  Book formats are detected by extension, so such files
+    would be rejected or misrouted.  This derives the canonical extension
+    from the MIME type:
+
+    - no extension + book MIME   -> append ``.epub`` / ``.mobi`` / ...
+    - unknown extension + book MIME (``book.zip`` + epub MIME) -> replace
+    - already-known extension     -> untouched (content sniffing is Calibre's job)
+    """
+    if not filename:
+        return filename
+    mapped = _book_ext_for_mime(mime)
+    if not mapped:
+        return filename
+    base, ext = os.path.splitext(filename.strip())
+    _ext = ext.lower().lstrip(".")
+    if not ext:
+        return f"{filename}.{mapped}"
+    if _ext in _IMAGE_EXT_STRIPPED:
+        return filename
+    # Extension is unknown/container-like for this MIME → swap in the real one.
+    try:
+        import config as _cfg
+
+        if _ext in _cfg.ALLOWED_FORMATS:
+            return filename
+    except Exception:  # nosec B110 - config is always present
+        pass
+    return f"{base}.{mapped}"
+
 
 def is_supported_format(filename: str, mime: str = "") -> bool:
     """Check whether the given filename/MIME pair is a supported format.
@@ -67,6 +146,11 @@ def is_supported_format(filename: str, mime: str = "") -> bool:
             return True
         # Some image subtypes like image/x-* can slip through — allow them
         if mime_lower.startswith("image/"):
+            return True
+        # E-book MIME types (EPUB/MOBI/FB2/DOCX/...) are accepted even when
+        # the filename carries no extension — Telegram allows nameless
+        # documents, and the bot derives a real extension before processing.
+        if _book_ext_for_mime(mime_lower):
             return True
 
     # 2) Fall back to file extension check
