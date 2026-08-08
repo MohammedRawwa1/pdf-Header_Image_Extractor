@@ -260,6 +260,106 @@ def create_thumbnail_from_pdf_bytes(pdf_bytes: bytes) -> bytes:
     return _optimize_thumbnail_bytes(img)
 
 
+def extract_pdf_embedded_thumbnail(pdf_path: str, thumb_path: str) -> bool:
+    """Extract a PDF's embedded page-1 thumbnail to ``thumb_path``.
+
+    The "already has a thumbnail" validator: PDF viewers store a small cover
+    preview in the page dictionary's ``/Thumb`` entry.  When present, reusing
+    it avoids rendering page 1 at 2x — no pixmap render, no memory spike on
+    large PDFs.  Returns True when the embedded thumbnail was found and saved;
+    False when the PDF has none (caller falls back to
+    ``create_thumbnail_from_pdf``).  Best-effort: any failure returns False.
+
+    Implemented via the raw xref API (``Document.xref_get_key`` +
+    ``Document.extract_image``) because PyMuPDF 1.24.x's rebased build dropped
+    the classic ``Document.has_thumbnails`` / ``Page.get_thumbnail`` helpers.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if len(doc) == 0:
+                return False
+            _kt, _kv = doc.xref_get_key(doc.page_xref(0), "Thumb")
+            if _kt != "xref" or not _kv:
+                return False
+            _thumb_xref = int(_kv.split()[0])
+            _info = doc.extract_image(_thumb_xref)
+            if not _info or not _info.get("image"):
+                return False
+            with open(thumb_path, "wb") as _fh:
+                _fh.write(_info["image"])
+        finally:
+            doc.close()
+        _optimize_thumbnail(thumb_path)
+        return os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "tools: failed to extract embedded thumbnail from %s", pdf_path
+        )
+        return False
+
+
+def extract_pdf_embedded_thumbnail_bytes(pdf_bytes: bytes) -> bytes | None:
+    """Bytes-mode twin of :func:`extract_pdf_embedded_thumbnail`.
+
+    Returns optimized JPEG bytes of the PDF's embedded page-1 thumbnail, or
+    None when the PDF has none (caller falls back to
+    ``create_thumbnail_from_pdf_bytes``).  Best-effort: any failure returns
+    None.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if len(doc) == 0:
+                return None
+            _kt, _kv = doc.xref_get_key(doc.page_xref(0), "Thumb")
+            if _kt != "xref" or not _kv:
+                return None
+            _thumb_xref = int(_kv.split()[0])
+            _info = doc.extract_image(_thumb_xref)
+            if not _info or not _info.get("image"):
+                return None
+            img = Image.open(io.BytesIO(_info["image"])).convert("RGB")
+        finally:
+            doc.close()
+        return _optimize_thumbnail_bytes(img)
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.warning("tools: failed to extract embedded thumbnail (bytes)")
+        return None
+
+
+def pdf_has_text_layer(pdf_path: str, min_ratio: float = 0.9) -> bool:
+    """True when most pages of ``pdf_path`` already carry extractable text.
+
+    The "already OCR'd" validator: born-digital or previously-OCR'd PDFs have
+    a real text layer, so re-running ocrmypdf/tesseract would waste CPU for
+    zero gain.  ``min_ratio`` is the fraction of pages that must contain text
+    (a mixed scan only partially OCR'd still gets the full pass).  Corrupt or
+    empty PDFs return False so the OCR job proceeds and surfaces the real
+    error as today.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            total = len(doc)
+            if total == 0:
+                return False
+            with_text = sum(
+                1
+                for i in range(total)
+                if (doc.load_page(i).get_text() or "").strip()
+            )
+            return with_text / total >= min_ratio
+        finally:
+            doc.close()
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.warning("tools: failed to inspect text layer of %s", pdf_path)
+        return False
+
+
 def create_thumbnail_from_image(image_path: str, thumb_path: str) -> None:
     im = Image.open(image_path)
     im.thumbnail((320, 320))

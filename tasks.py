@@ -421,8 +421,11 @@ from tools import (  # noqa: E402
     create_thumbnail_from_image_bytes,
     create_thumbnail_from_pdf,
     create_thumbnail_from_pdf_bytes,
+    extract_pdf_embedded_thumbnail,
+    extract_pdf_embedded_thumbnail_bytes,
     extract_pdf_metadata,
     is_supported_format,
+    pdf_has_text_layer,
 )
 from utils.ebook_converter import (  # noqa: E402
     ConversionCancelledError,
@@ -434,6 +437,7 @@ from utils.ebook_converter import (  # noqa: E402
 )
 from utils.ocr import (  # noqa: E402
     OCRCancelledError,
+    _extract_pdf_text,  # noqa: PLC2701 - same package, reused as-is
     is_ocr_source,
     ocr_enabled,
     run_ocr,
@@ -834,7 +838,10 @@ def process_input_key_job(job: dict) -> dict:
         )
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         if filename.lower().endswith(".pdf"):
-            create_thumbnail_from_pdf(dest_path, thumb_path)
+            # Validator: reuse the PDF's embedded thumbnail when it has one
+            # (skips the 2x first-page render entirely).
+            if not extract_pdf_embedded_thumbnail(dest_path, thumb_path):
+                create_thumbnail_from_pdf(dest_path, thumb_path)
         else:
             create_thumbnail_from_image(dest_path, thumb_path)
 
@@ -1228,6 +1235,80 @@ def _set_io_keys(
         pass
 
     return redis_ok
+
+
+# Shared validator-result cache.  Keyed by Telegram's ``file_unique_id``
+# (an immutable property of the file's content), NOT the RQ job id, so the
+# two jobs enqueued by the OCR & Thumbnail button can share results even
+# though each writes its own ``io:in:<job_id>`` key.  Safe to reuse because
+# the embedded-thumbnail / text-layer status of a given file never changes.
+# Stored as a Redis HASH (``pdfcheck:<file_unique_id>`` with ``has_thumb`` /
+# ``has_text_layer`` fields) so each job's write is atomic per field — no
+# lost-update races between the thumbnail and OCR jobs.
+PDF_CHECK_PREFIX = "pdfcheck:"
+PDF_CHECK_TTL = 7 * 24 * 3600  # 7 days - bounds storage; content is immutable
+
+
+def _get_pdf_checks(file_unique_id: str | None) -> dict | None:
+    """Read cached validator results for a Telegram file (by file_unique_id).
+
+    Returns ``{"has_thumb": bool|None, "has_text_layer": bool|None}`` or None
+    when nothing is cached yet.  A field is None when it has never been
+    computed (caller should run the check); True/False are real cached
+    results — distinguishing "absent" from a cached False is what lets the
+    OCR job backfill missing fields without re-running on legit False values.
+    """
+    if not file_unique_id:
+        return None
+    try:
+        r = get_sync_redis()
+        if not r:
+            return None
+        _raw = r.hgetall(f"{PDF_CHECK_PREFIX}{file_unique_id}")
+        if not _raw:
+            return None
+
+        def _b(v: object) -> bool | None:
+            if v is None:
+                return None
+            return str(v) in ("1", "true", "True")
+
+        return {
+            "has_thumb": _b(_raw.get("has_thumb")),
+            "has_text_layer": _b(_raw.get("has_text_layer")),
+        }
+    except Exception:
+        logger.debug("Failed to read pdf check cache for %s", file_unique_id)
+        return None
+
+
+def _store_pdf_checks(
+    file_unique_id: str | None,
+    has_thumb: bool | None = None,
+    has_text_layer: bool | None = None,
+) -> None:
+    """Cache validator results (best-effort) under ``pdfcheck:<file_unique_id>``.
+
+    Writes only the fields explicitly given (hash fields are atomic per
+    field), so the thumbnail job (has_thumb) and the OCR job (has_text_layer)
+    can publish independently without clobbering each other.
+    """
+    if not file_unique_id:
+        return
+    try:
+        r = get_sync_redis()
+        if not r:
+            return
+        _map = {}
+        if has_thumb is not None:
+            _map["has_thumb"] = "1" if has_thumb else "0"
+        if has_text_layer is not None:
+            _map["has_text_layer"] = "1" if has_text_layer else "0"
+        if _map:
+            r.hset(f"{PDF_CHECK_PREFIX}{file_unique_id}", mapping=_map)
+            r.expire(f"{PDF_CHECK_PREFIX}{file_unique_id}", PDF_CHECK_TTL)
+    except Exception:
+        logger.debug("Failed to cache pdf checks for %s", file_unique_id)
 
 
 def _attach_job_user_meta(user_id: int | None) -> str | None:
@@ -1877,7 +1958,39 @@ def process_document_job(
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
             ):
-                create_thumbnail_from_pdf(file_path, thumb_path)
+                # Validator: reuse the PDF's embedded thumbnail when it has one
+                # (skips the 2x first-page render).  Also compute + cache BOTH
+                # check results here — this job runs FIRST on the OCR &
+                # Thumbnail button's FIFO queue, so ocr_job can reuse them
+                # instead of re-running the text-layer pass on its own download.
+                _checks = _get_pdf_checks(file_unique_id)
+                _has_thumb = extract_pdf_embedded_thumbnail(
+                    file_path, thumb_path
+                )
+                if not _has_thumb:
+                    create_thumbnail_from_pdf(file_path, thumb_path)
+                _cached_layer = (
+                    _checks["has_text_layer"]
+                    if _checks is not None
+                    else None
+                )
+                _store_pdf_checks(
+                    file_unique_id,
+                    has_thumb=_has_thumb,
+                    has_text_layer=(
+                        _cached_layer
+                        if _cached_layer is not None
+                        # Only run the (potentially page-wide) text-layer pass
+                        # when OCR is enabled — with OCR off, no ocr_job will
+                        # ever consume it, so plain Thumbnail taps stay free
+                        # of the extra pass.
+                        else (
+                            pdf_has_text_layer(file_path)
+                            if ocr_enabled()
+                            else None
+                        )
+                    ),
+                )
             else:
                 create_thumbnail_from_image(file_path, thumb_path)
 
@@ -2226,7 +2339,10 @@ def process_document_job(
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
             ):
-                thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
+                thumb_bytes = (
+                    extract_pdf_embedded_thumbnail_bytes(file_bytes)
+                    or create_thumbnail_from_pdf_bytes(file_bytes)
+                )
             else:
                 thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
 
@@ -3659,6 +3775,41 @@ def compress_pdf_job(
         _orig = os.path.getsize(_src)
         _comp = os.path.getsize(_out)
         _saved = max(0, int((1 - _comp / _orig) * 100)) if _orig else 0
+
+        # ── Validator: "already compressed" — keep the original ───────────
+        # Re-encoding a PDF Ghostscript can barely shrink wastes CPU and
+        # re-uploads a file already in the user's chat.  Skip delivery when
+        # the gain is below BOTH floors (percent AND absolute bytes) — a big
+        # file that still sheds 25MB at 5% is worth keeping, a tiny one isn't.
+        _min_gain_pct = float(getattr(config, "COMPRESS_MIN_GAIN_PCT", 5) or 5)
+        _min_gain_bytes = int(
+            getattr(config, "COMPRESS_MIN_GAIN_BYTES", 100_000) or 100_000
+        )
+        if _orig and _saved < _min_gain_pct and max(0, _orig - _comp) < _min_gain_bytes:
+            _tg_send_message(
+                None,
+                chat_id,
+                "✅ This PDF is already well-compressed: "
+                f"{_format_size(_orig)} → {_format_size(_comp)} "
+                f"(only {_saved}% smaller). Kept the original — "
+                "no meaningful gain from re-encoding.",
+            )
+            try:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "already_compressed",
+                        "orig_bytes": _orig,
+                        "compressed_bytes": _comp,
+                        "saved_pct": _saved,
+                        "timestamps": {"finished": int(time.time())},
+                    },
+                )
+            except Exception:  # nosec B110
+                pass
+            _delete_queued_messages(_rq_job_id)
+            return {"status": "already_compressed", "saved_pct": 0}
+
         _thumb_path = os.path.join(tmpdir, "thumb.jpg")
         try:
             create_thumbnail_from_pdf(_out, _thumb_path)
@@ -3874,13 +4025,55 @@ def ocr_job(
             return {"status": "cancelled"}
 
         _is_pdf_out = target == "pdf"
+
+        # ── Validator: "already OCR'd" — skip the whole OCR pass ──────────
+        # A born-digital or previously-OCR'd PDF already carries a text layer;
+        # re-running ocrmypdf/tesseract would burn a full download + engine
+        # pass for zero gain.  Detect the layer cheaply on the already
+        # downloaded file and short-circuit.
+        _src_is_pdf = filename.lower().endswith(".pdf")
+        _checks = _get_pdf_checks(file_unique_id) if _src_is_pdf else None
+        if _checks is not None and _checks["has_text_layer"] is not None:
+            # Reuse the cached result (the thumbnail job computed it on its own
+            # download — same file, immutable content) instead of re-running
+            # the text-layer pass here.
+            _already_ocr = bool(_checks["has_text_layer"])
+        else:
+            _already_ocr = _src_is_pdf and pdf_has_text_layer(_src)
+            if _src_is_pdf:
+                _store_pdf_checks(
+                    file_unique_id, has_text_layer=_already_ocr
+                )
+        if _already_ocr and _is_pdf_out:
+            _tg_send_message(
+                None,
+                chat_id,
+                "✅ This PDF already has a searchable text layer — "
+                "no OCR needed (nothing to add).",
+            )
+            _delete_queued_messages(_rq_job_id)
+            return {"status": "already_ocr", "skipped": True}
+
         if _is_pdf_out and _thumb_path is None:
             # Direct PDF or image source: build a first-page preview for the
             # OCR'd PDF (best-effort — a missing preview never fails the job).
+            # Reuse the cached embedded-thumbnail result when known (extract
+            # instead of rendering page 1 at 2x).
             _thumb_path = os.path.join(tmpdir, "thumb.jpg")
             try:
                 if filename.lower().endswith(".pdf"):
-                    create_thumbnail_from_pdf(_src, _thumb_path)
+                    _checks = _get_pdf_checks(file_unique_id)
+                    _has_thumb = (
+                        _checks["has_thumb"]
+                        if _checks is not None
+                        else None
+                    )
+                    if _has_thumb is False:
+                        create_thumbnail_from_pdf(_src, _thumb_path)
+                    elif not extract_pdf_embedded_thumbnail(
+                        _src, _thumb_path
+                    ):
+                        create_thumbnail_from_pdf(_src, _thumb_path)
                 else:
                     create_thumbnail_from_image(_src, _thumb_path)
             except Exception:  # nosec B110 - preview is best-effort
@@ -3890,7 +4083,11 @@ def ocr_job(
             detail=(
                 "\U0001f4c4 Building searchable PDF (text layer)..."
                 if _is_pdf_out
-                else "\U0001f50e Extracting text with OCR..."
+                else (
+                    "\U0001f50e Pulling the existing text layer..."
+                    if _already_ocr
+                    else "\U0001f50e Extracting text with OCR..."
+                )
             ),
             message_id=_progress_msg_id,
         )
@@ -3930,6 +4127,23 @@ def ocr_job(
                     _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
                     return {"error": "ocr_failed"}
                 text = _pdf_text or ""
+            elif _already_ocr:
+                # Already has a text layer: extract it directly — cheaper and
+                # more accurate than re-OCRing rendered pages.
+                _out_name = safe_target_name(filename, "txt")
+                _out = os.path.join(tmpdir, _out_name)
+                text = _extract_pdf_text(_src)
+                if not (text or "").strip():
+                    # Edge: validator said text but extraction came back empty;
+                    # fall through to the real OCR engine.
+                    text = run_ocr(
+                        _src,
+                        filename,
+                        lang=_lang,
+                        dpi=_dpi,
+                        timeout=_ocr_to,
+                        cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                    )
             else:
                 _out_name = safe_target_name(filename, "txt")
                 _out = os.path.join(tmpdir, _out_name)

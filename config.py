@@ -134,6 +134,14 @@ TMP_DIR: str = os.getenv("TMP_DIR", "")
 # PDF compression quality preset (used by tools.compress_pdf)
 PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
 
+# "Already compressed" validator thresholds (used by tasks.compress_pdf_job):
+# when Ghostscript's gain is below BOTH the percent floor and the absolute
+# byte floor, the job keeps the original and replies instead of re-delivering.
+COMPRESS_MIN_GAIN_PCT: float = float(os.getenv("COMPRESS_MIN_GAIN_PCT", "5"))
+COMPRESS_MIN_GAIN_BYTES: int = int(
+    os.getenv("COMPRESS_MIN_GAIN_BYTES", "100000")
+)
+
 # ── Book conversion (Calibre) ────────────────────────────────────────────────
 # ALLOWED_FORMATS: comma-separated extensions the bot accepts for book
 # conversion (e-reader + document formats). When empty, a curated default set

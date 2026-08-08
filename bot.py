@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -75,6 +76,7 @@ from config import OWNER_ID  # noqa: E402
 from tools import (  # noqa: E402
     create_thumbnail_from_image,
     create_thumbnail_from_pdf,
+    extract_pdf_embedded_thumbnail,
     extract_pdf_metadata,
     infer_extension,
     is_supported_format,
@@ -133,7 +135,7 @@ from utils.userbot_uploader import (  # noqa: E402
 # ── Logging configuration (must be before any logger usage) ──
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
-logging.basicConfig(level=numeric_level)
+logging.basicConfig(level=numeric_level, stream=sys.stdout)
 # keep httpx at least INFO to avoid leaking full request URLs in DEBUG logs
 logging.getLogger("httpx").setLevel(max(numeric_level, logging.INFO))
 logging.getLogger("rq").setLevel(numeric_level)
@@ -962,7 +964,13 @@ def _store_queued_message(job_id, chat_id, message_id) -> None:
         pass
 
 
-def enqueue_job(func_name: str, *args, job_timeout: int | None = None, **kwargs):
+def enqueue_job(
+    func_name: str,
+    *args,
+    job_timeout: int | None = None,
+    owner_user_id: int | None = None,
+    **kwargs,
+):
     """Enqueue a job on the RQ 'default' queue.
 
     Returns the RQ job id (so /canceljob can cancel it) or None on failure.
@@ -971,6 +979,12 @@ def enqueue_job(func_name: str, *args, job_timeout: int | None = None, **kwargs)
     larger than the job's own long-running phase (e.g. Calibre conversions)
     so the death penalty can't kill it mid-work.  Defaults to RQ's 180s when
     None.
+
+    ``owner_user_id`` (optional) tags the queued job's meta with its owner
+    at ENQUEUE time (not job-start time, like ``_attach_job_user_meta``) so
+    /canceljob's per-user gate also protects still-queued jobs in shared
+    group chats.  It is NOT forwarded to the task — task functions must
+    keep receiving ``user_id`` positionally in ``*args``.
 
     Uses a NON-decoding Redis connection (same as ``_cancel_rq_job`` and the
     RQ worker): RQ stores job payloads pickled as raw bytes, so the
@@ -991,6 +1005,19 @@ def enqueue_job(func_name: str, *args, job_timeout: int | None = None, **kwargs)
         # lookup function from tasks
         func = getattr(tasks, func_name)
         job = q.enqueue(func, *args, **kwargs, job_timeout=job_timeout)
+        # Tag the job with its owner now so /canceljob's per-user gate works
+        # even before the worker starts (queued jobs).  Best-effort: a failed
+        # meta write just leaves the chat-scoped fallback in place.
+        if owner_user_id is not None:
+            try:
+                job.meta["user_id"] = owner_user_id
+                job.save_meta()
+            except Exception:  # nosec B110 - best-effort ownership tag
+                logger.debug(
+                    "Could not tag job %s with owner %s (chat-scoped fallback stays in place)",
+                    getattr(job, "id", "?"),
+                    owner_user_id,
+                )
         return getattr(job, "id", None)
     except Exception:
         logger.exception("Failed to enqueue job for %s", func_name)
@@ -1415,7 +1442,10 @@ async def handle_document(
 
         # Return original file unchanged but attach generated thumbnail as header
         if lower.endswith(".pdf") or mime == "application/pdf":
-            create_thumbnail_from_pdf(file_path, thumb_path)
+            # Validator: reuse the PDF's embedded thumbnail when it has one
+            # (skips the 2x first-page render entirely).
+            if not extract_pdf_embedded_thumbnail(file_path, thumb_path):
+                create_thumbnail_from_pdf(file_path, thumb_path)
         elif mime.startswith("image/"):
             create_thumbnail_from_image(file_path, thumb_path)
         else:
@@ -2902,7 +2932,8 @@ async def cmd_endbatch(
     # enqueue a single batch job which processes items in order
     if config.REDIS_URL:
         ok = await asyncio.to_thread(
-            enqueue_job, "process_document_batch_job", chat_id, items, user_id,
+            enqueue_job, "process_document_batch_job",            chat_id, items, user_id,
+            owner_user_id=user_id,
             # job_timeout > RQ's 180s default: batches can contain large
             # e-books whose inline deliver_book_job (download + echo) must not
             # be killed by the death penalty mid-run.
@@ -3518,14 +3549,44 @@ def _wipe_job_redis_keys(job_id: str) -> None:
         pass
 
 
-def _resolve_rq_job(job_id: str, chat_id: int | None, r=None):
+def _rq_job_owned_by(job, user_id: int | None) -> bool:
+    """True when ``job`` may be cancelled by ``user_id`` (per-user gate).
+
+    Every RQ job type tags ``meta['user_id']`` via ``_attach_job_user_meta``,
+    so tagged jobs are strictly user-scoped — another group member can no
+    longer cancel them.  Untagged jobs (e.g. CLI test enqueues that pass no
+    user) fall back to the legacy chat-scoped behaviour (owned by anyone in
+    the caller's chat), so isolation never blocks legacy jobs.
+
+    When the user tag cannot be read, the job is treated as NOT owned
+    (fail-closed) — never allow a cancel we cannot verify.
+    """
+    if user_id is None:
+        return True
+    try:
+        meta_uid = (getattr(job, "meta", None) or {}).get("user_id")
+    except Exception:  # nosec B110 - meta read failure = not user-verified
+        return False
+    if meta_uid is None:
+        return True
+    try:
+        return str(meta_uid) == str(user_id)
+    except Exception:
+        return False
+
+
+def _resolve_rq_job(
+    job_id: str, chat_id: int | None, user_id: int | None = None, r=None
+):
     """Resolve an RQ job id/prefix to a Job the caller may cancel, or None.
 
     Non-mutating — used by the /canceljob confirmation prompt to describe
     what WOULD be cancelled, and by ``_cancel_rq_job`` which then performs
     the actual cancel. Ownership is enforced here: the job is only returned
     when it originated from ``chat_id`` (enqueues pass chat_id as the first
-    positional argument).
+    positional argument) AND — when ``user_id`` is provided and the job
+    carries a ``meta['user_id']`` tag — when that tag matches the caller
+    (per-user isolation in shared group chats).
 
     ``r`` is an optional raw Redis connection to reuse; ``_cancel_rq_job``
     passes its own so the fetch and the cancel flag share ONE connection
@@ -3563,6 +3624,8 @@ def _resolve_rq_job(job_id: str, chat_id: int | None, r=None):
                 c_args = list(getattr(cand, "args", None) or [])
                 if chat_id is not None and (not c_args or c_args[0] != chat_id):
                     continue
+                if not _rq_job_owned_by(cand, user_id):
+                    continue
                 job = cand
                 break
         if job is None:
@@ -3571,14 +3634,20 @@ def _resolve_rq_job(job_id: str, chat_id: int | None, r=None):
         args = list(getattr(job, "args", None) or [])
         if chat_id is not None and (not args or args[0] != chat_id):
             return None
+        if not _rq_job_owned_by(job, user_id):
+            return None
         return job
     except Exception:
         return None
 
 
-def _cancel_rq_job(job_id: str, chat_id: int | None) -> str | None:
+def _cancel_rq_job(
+    job_id: str, chat_id: int | None, user_id: int | None = None
+) -> str | None:
     """Best-effort cancel of an RQ job by id, but only when the job originated
-    from the caller's chat (ownership check for shared group chats).
+    from the caller's chat (chat ownership for shared group chats) AND, when
+    the job carries a user tag, from the caller's user (per-user isolation —
+    see ``_resolve_rq_job`` / ``_rq_job_owned_by``).
 
     Returns the RESOLVED full job id on success (RQ ids are 36-char dashed
     UUIDs, but the queued-button payload embeds ``job_id[:32]`` — callers
@@ -3606,7 +3675,7 @@ def _cancel_rq_job(job_id: str, chat_id: int | None) -> str | None:
         r = get_sync_redis_raw()
         if not r:
             return None
-        job = _resolve_rq_job(job_id, chat_id, r)
+        job = _resolve_rq_job(job_id, chat_id, user_id=user_id, r=r)
         if job is None:
             return None
         # The flag uses the RESOLVED full id (prefix inputs resolve to it).
@@ -3842,7 +3911,7 @@ def _resolve_cancel_targets(
     task_id = _owned_progress_task_id(job_id, uid)
     if task_id:
         targets.append(f"progress task `{task_id[:8]}`")
-    rq_job = _resolve_rq_job(job_id, chat_id)
+    rq_job = _resolve_rq_job(job_id, chat_id, user_id=uid)
     if rq_job is not None:
         # Label with the FULL resolved id (RQ ids are 36-char dashed UUIDs;
         # the caller may have passed a truncated 32-char prefix).
@@ -3858,7 +3927,8 @@ async def _do_cancel_job(
     """Perform the actual /canceljob cancellation (progress, RQ, pipeline).
 
     Mirrors the pre-confirmation cancel body: every path enforces its own
-    ownership gate (progress by user_id, RQ by chat_id, pipeline by user_id).
+    ownership gate (progress by user_id, RQ by chat + user, pipeline by
+    user_id).
     On any owned hit, the per-job cleanup runs — auto-delete the "Queued..."
     confirmations, wipe the io/queued_msg keys, re-arm the in-flight abort
     flag — and ``(owned, action_labels)`` is returned.
@@ -3878,9 +3948,11 @@ async def _do_cancel_job(
         if await progress_tracker.cancel_task(task_id):
             actions.append(f"progress task `{task_id[:8]}`")
 
-    # 2) RQ job (queued/started Bot API pipeline) — caller's chat only.
+    # 2) RQ job (queued/started Bot API pipeline) — caller's chat + user only.
     # _cancel_rq_job resolves the full id internally and returns it.
-    full_rq_id = await asyncio.to_thread(_cancel_rq_job, job_id, chat_id)
+    full_rq_id = await asyncio.to_thread(
+        _cancel_rq_job, job_id, chat_id, uid
+    )
     if full_rq_id:
         owned = True
         cleanup_id = full_rq_id
@@ -4002,7 +4074,8 @@ async def _cancel_all_for(
     """Cancel all of a user's jobs; returns (progress, RQ, pipeline) counts.
 
     Only touches jobs owned by the caller: progress tasks by user_id, RQ jobs
-    by chat_id, and pipeline jobs by user_id — the same isolation as /canceljob.
+    by chat + user, and pipeline jobs by user_id — the same isolation as
+    /canceljob.
     """
     tasks_cancelled = 0
     rq_cancelled = 0
@@ -4048,7 +4121,9 @@ async def _cancel_all_for(
             for m, _ in r.zrange("rq:wip:default", 0, -1, withscores=True):
                 candidates.append(m.decode() if isinstance(m, bytes) else str(m))
             for cid in candidates:
-                if await asyncio.to_thread(_cancel_rq_job, cid, chat_id):
+                if await asyncio.to_thread(
+                    _cancel_rq_job, cid, chat_id, uid
+                ):
                     rq_cancelled += 1
                     cleaned.append(cid)
     except Exception:
@@ -4543,6 +4618,7 @@ async def handle_ctx_thumb_callback(
         rec.get("forward_info"),
         rec.get("file_size"),
         armer,
+        owner_user_id=armer,
         job_timeout=1800,
     )
     if ok:
@@ -4632,6 +4708,7 @@ async def handle_ctx_thumb_ocr_callback(
         rec.get("forward_info"),
         rec.get("file_size"),
         armer,
+        owner_user_id=armer,
         job_timeout=1800,
     )
     ok_ocr = await asyncio.to_thread(
@@ -4645,6 +4722,7 @@ async def handle_ctx_thumb_ocr_callback(
         rec.get("message_id"),
         None,  # forward_info is not stored in the pending record
         rec.get("file_size"),
+        owner_user_id=armer,
         source_chat_id=rec.get("source_chat_id"),
         target=_target,
         job_timeout=7200,
@@ -4896,6 +4974,7 @@ async def handle_book_compress_callback(
         rec.get("forward_info"),
         rec.get("file_size"),
         rec.get("source_chat_id"),
+        owner_user_id=armer,
         compress=True,
         # Two-leg conversions (direct + EPUB pivot) can each use the full
         # BOOK_CONVERT_TIMEOUT_SECONDS; give the death penalty headroom.
@@ -4984,6 +5063,7 @@ async def handle_book_convert_callback(
         pending.get("forward_info"),
         pending.get("file_size"),
         pending.get("source_chat_id"),
+        owner_user_id=armer,
         # Two-leg conversions (direct + EPUB pivot) can each use the full
         # BOOK_CONVERT_TIMEOUT_SECONDS — give the death penalty headroom
         # (matches handle_book_compress_callback).
@@ -5069,6 +5149,7 @@ async def handle_compress_callback(
         rec.get("file_unique_id"),
         rec.get("message_id"),
         rec.get("file_size"),
+        owner_user_id=armer,
         source_chat_id=rec.get("source_chat_id"),
         job_timeout=1800,
     )
@@ -5482,6 +5563,7 @@ async def _enqueue_ocr_job(
         rec.get("message_id"),
         None,  # forward_info is not stored in the pending record
         rec.get("file_size"),
+        owner_user_id=uid,
         source_chat_id=rec.get("source_chat_id"),
         target=target,
         # job_timeout > RQ's 180s default: OCR of a multi-page PDF at 200-300
@@ -6404,6 +6486,7 @@ async def handle_text_with_url(
                 url,
                 base,
                 user_id,
+                owner_user_id=user_id,
                 # job_timeout > RQ's 180s default: large URL downloads (PDF or
                 # e-book echo) can legitimately outlive the death penalty.
                 job_timeout=1800,

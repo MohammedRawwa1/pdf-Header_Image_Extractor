@@ -123,7 +123,7 @@ def main():
     # Respect LOG_LEVEL env var so we can increase verbosity without changing code
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     numeric_level = getattr(logging, log_level, logging.INFO)
-    logging.basicConfig(level=numeric_level)
+    logging.basicConfig(level=numeric_level, stream=sys.stdout)
     logging.getLogger("rq").setLevel(numeric_level)
     # Keep httpx at least INFO to avoid logging full request URLs (which may contain tokens)
     import logging as _logging

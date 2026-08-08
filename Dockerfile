@@ -98,8 +98,10 @@ RUN if [ "$INSTALL_CALIBRE" = "1" ]; then \
 		# requires a real .epub FILE (a zip) -- passing the directory fails with
 		# IsADirectoryError. Package it first: mimetype must be the first zip
 		# entry and STORED (uncompressed) to be a spec-valid EPUB.
-		cd /tmp/calibre-smoke/src && zip -X0 ../smoke.epub mimetype && \
-		zip -Xr9D ../smoke.epub META-INF OEBPS && \
+		cd /tmp/calibre-smoke/src && \
+		if ! zip -X0 ../smoke.epub mimetype || ! zip -Xr9D ../smoke.epub META-INF OEBPS; then \
+			echo "ERROR: calibre smoke epub packaging failed" && exit 1; \
+		fi; \
 		cd /tmp/calibre-smoke && \
 		if ! env QT_QPA_PLATFORM=offscreen QTWEBENGINE_DISABLE_SANDBOX=1 \
 			QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \

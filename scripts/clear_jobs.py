@@ -62,7 +62,13 @@ PDF_JOB_PREFIX = "pdf:job:"
 PDF_PROGRESS_PATTERN = "pdf:progress:*"
 
 # Shared per-job bookkeeping keys (used by /canceljob and tasks.py).
-COMMON_JOB_PREFIXES = ("progress:", "io:in:", "io:out:", "cancel:")
+COMMON_JOB_PREFIXES = (
+    "progress:",
+    "io:in:",
+    "io:out:",
+    "cancel:",
+    "pdfcheck:",  # per-file validator cache (has thumb / has text layer)
+)
 
 # S3 prefix under which BigFilePipeline stores input blobs (see
 # utils/bigfile_pipeline.py: ``inputs/<job_id>/source``).
