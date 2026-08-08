@@ -24,8 +24,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Ghostscript for PDF compression (used by `tools.compress_pdf`).
 # Ghostscript is an OS package (not a Python dependency) and must be available
 # in the runtime image for `gs` to be callable by subprocess.
+# Pango/HarfBuzz + DejaVu fonts are runtime deps of WeasyPrint (the fast
+# EPUB->PDF path for text-heavy books): the image has no fonts by default,
+# so without them rendered PDFs would show tofu boxes instead of text.
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ghostscript xz-utils \
+		libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
+		fonts-dejavu-core \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Install Tesseract OCR (tesseract binary + English language pack) for the

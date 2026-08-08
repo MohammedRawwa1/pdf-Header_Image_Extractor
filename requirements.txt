@@ -16,3 +16,5 @@ tgcrypto>=1.2.5
 motor>=3.3.0
 pytesseract>=0.3.10
 ocrmypdf>=16.0.0
+weasyprint>=61.0
+defusedxml>=0.7.1

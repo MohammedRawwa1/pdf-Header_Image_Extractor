@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -482,6 +483,9 @@ from utils.ocr import (  # noqa: E402
     run_ocr,
     run_ocr_pdf,
 )
+from utils.weasyprint_converter import (  # noqa: E402
+    convert_epub_to_pdf_fast,
+)
 
 
 def _is_ebook(filename: str | None) -> bool:
@@ -497,7 +501,7 @@ def _is_ebook(filename: str | None) -> bool:
 def _book_conversion_enabled() -> bool:
     """The ENABLE_BOOK_CONVERSION master switch (default on)."""
     return bool(getattr(config, "ENABLE_BOOK_CONVERSION", False))
-from utils.progress_tracker import _format_size  # noqa: E402
+from utils.progress_tracker import _format_size, _format_time  # noqa: E402
 from utils.storage import _TransferProgress  # noqa: E402,F401
 from utils.tg_http import (  # noqa: E402
     BOOK_CONVERT_ACTION,
@@ -4236,8 +4240,53 @@ def convert_book_job(
         _timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
         _thumb = None
         _thumb_path = None
+        # ── Live "still converting" heartbeat ──────────────────────────
+        # Calibre's ebook-convert gives no progress feed, so the bar sits
+        # frozen at the compressing stage's fixed 80% for the whole run and
+        # users cancel a conversion that is actually grinding along.  A daemon
+        # thread edits the progress message every 10s with the elapsed time
+        # until the conversion returns, proving liveness.
+        _hb_stop = threading.Event()
+        _hb_holder: dict[str, int | None] = {"msg_id": _progress_msg_id}
+        _hb_thread = None
+        if _progress_msg_id:
+            _hb_started = time.monotonic()
+
+            def _hb_loop() -> None:
+                while not _hb_stop.wait(10.0):
+                    try:
+                        _elapsed = time.monotonic() - _hb_started
+                        _new = _tg_send_progress(
+                            chat_id,
+                            filename,
+                            "compressing",
+                            detail=(
+                                f"\u23f3 Converting to {target_fmt.upper()}... "
+                                f"{_format_time(_elapsed)} elapsed — large "
+                                "books can take a few minutes."
+                            ),
+                            message_id=_hb_holder["msg_id"],
+                        )
+                        if _new:
+                            _hb_holder["msg_id"] = _new
+                    except Exception:  # nosec B110 - heartbeat is best-effort
+                        pass
+
+            _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+            _hb_thread.start()
         try:
-            if target_fmt.lower() == "pdf":
+            if target_fmt.lower() == "pdf" and _src.lower().endswith(".epub"):
+                # Fast path: WeasyPrint renders text-heavy EPUBs to PDF 3-10x
+                # faster than Calibre's Chromium-per-page pipeline.  Image-
+                # heavy EPUBs and any WeasyPrint failure fall back to Calibre
+                # internally — never worse than the status quo.
+                _conv_ok = convert_epub_to_pdf_fast(
+                    _src, _out, os.path.join(tmpdir, "thumb.jpg"),
+                    timeout=_timeout,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+                _thumb_path = os.path.join(tmpdir, "thumb.jpg")
+            elif target_fmt.lower() == "pdf":
                 _conv_ok = convert_book_to_pdf_with_thumbnail(
                     _src, _out, os.path.join(tmpdir, "thumb.jpg"),
                     timeout=_timeout,
@@ -4250,11 +4299,25 @@ def convert_book_job(
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
         except ConversionCancelledError:
+            _hb_stop.set()
+            if _hb_thread is not None:
+                _hb_thread.join(timeout=1.0)
+            _progress_msg_id = _hb_holder["msg_id"]
             logger.info(
                 "convert_book_job: cancelled mid-conversion for %s", filename
             )
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
+        finally:
+            _hb_stop.set()
+        # Stop the heartbeat and sync the latest progress-message id: the
+        # heartbeat's edits can RECREATE the message (returning a fresh id on
+        # edit failure), so every subsequent progress edit / cleanup must
+        # target the CURRENT message or a stale id leaves an orphan
+        # "Converting..." message in the chat.
+        if _hb_thread is not None:
+            _hb_thread.join(timeout=1.0)
+        _progress_msg_id = _hb_holder["msg_id"]
         if not _conv_ok or not os.path.exists(_out):
             _tg_send_progress(
                 chat_id, filename, "failed",

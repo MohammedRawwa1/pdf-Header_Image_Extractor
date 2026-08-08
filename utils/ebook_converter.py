@@ -274,6 +274,13 @@ def convert_ebook_robust(
     deleted in ``finally`` — the two-step is fully virtual: no temp file
     leaks, no user-visible stage change, exactly one progress bar.  Returns
     True when ``output_path`` exists.
+
+    The direct leg keeps the full ``timeout``.  When it fails, the two-leg
+    EPUB pivot draws from a SHARED second window of ``timeout`` instead of a
+    fresh timeout per leg — so a slow first leg can never cascade into three
+    full conversions (~3x the caller's job-timeout budget, which RQ would
+    kill mid-pivot anyway).  Worst case total is therefore 2x ``timeout``,
+    which fits the caller's ``job_timeout = 2 * timeout + slack`` headroom.
     """
     if convert_ebook(
         input_path, output_path, timeout=timeout, cancel_check=cancel_check
@@ -293,6 +300,15 @@ def convert_ebook_robust(
     inter = os.path.join(
         _dir, f"_intermediate_{os.getpid()}_{int(time.time() * 1000)}.epub"
     )
+    # Shared budget for BOTH pivot legs: once the direct leg has burned its
+    # window, the pivot must fit in one more ``timeout`` (never two fresh
+    # timeouts) so the whole chain stays inside the caller's job timeout.
+    _pivot_deadline = time.monotonic() + timeout
+
+    def _leg_timeout() -> int:
+        _left = int(_pivot_deadline - time.monotonic())
+        return max(1, min(timeout, _left))
+
     try:
         logger.info(
             "convert_ebook_robust: direct %s->%s failed for %s; "
@@ -302,11 +318,14 @@ def convert_ebook_robust(
             os.path.basename(input_path),
         )
         if not convert_ebook(
-            input_path, inter, timeout=timeout, cancel_check=cancel_check
+            input_path, inter, timeout=_leg_timeout(), cancel_check=cancel_check
         ):
             return False
         return convert_ebook(
-            inter, output_path, timeout=timeout, cancel_check=cancel_check
+            inter,
+            output_path,
+            timeout=_leg_timeout(),
+            cancel_check=cancel_check,
         )
     finally:
         try:
@@ -404,11 +423,25 @@ def convert_book_to_pdf_with_thumbnail(
         input_path, pdf_path, timeout=timeout, cancel_check=cancel_check
     ):
         return False
+    finalize_cover_thumbnail(input_path, pdf_path, thumb_path)
+    return True
+
+
+def finalize_cover_thumbnail(
+    input_path: str, pdf_path: str, thumb_path: str
+) -> None:
+    """Best-effort cover thumbnail for a converted book's PDF deliverable.
+
+    Prefers the embedded cover (``ebook-meta``), then a preview of the
+    produced PDF's first page; drops a blank/white result entirely.  Shared by
+    the Calibre path and the WeasyPrint fast path so both deliver identical
+    thumbnail behavior.
+    """
     if not extract_cover_thumbnail(input_path, thumb_path):
         # No usable embedded cover: preview the converted PDF itself.  The
-        # shared PDF thumbnaller skips leading blank pages, so a Calibre PDF
-        # that opens with an empty cover page still gets a real preview
-        # instead of a blank white thumbnail.
+        # shared PDF thumbnaller skips leading blank pages, so a PDF that
+        # opens with an empty cover page still gets a real preview instead
+        # of a blank white thumbnail.
         try:
             from tools import create_thumbnail_from_pdf
 
@@ -428,7 +461,6 @@ def convert_book_to_pdf_with_thumbnail(
                 pass
     except Exception:  # nosec B110 - best-effort guard
         pass
-    return True
 
 
 def safe_target_name(filename: str, target_ext: str) -> str:
