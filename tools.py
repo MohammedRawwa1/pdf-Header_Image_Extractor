@@ -232,32 +232,209 @@ def extract_pdf_metadata(pdf_path: str) -> dict:
     return meta
 
 
-def create_thumbnail_from_pdf(pdf_path: str, thumb_path: str) -> None:
-    doc = fitz.open(pdf_path)
-    page = doc.load_page(0)
-    zoom = 2  # render at 2x for better quality
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    # save initial rendering and then optimize to meet Telegram thumbnail constraints
-    pix.save(thumb_path)
-    _optimize_thumbnail(thumb_path)
+# How many leading pages to scan past a blank first page before giving up on
+# a non-blank thumbnail (converted/ebook PDFs sometimes open with an empty
+# cover or title page, and a white preview is worse than none).
+PDF_THUMB_SCAN_LIMIT = 5
 
 
-def create_thumbnail_from_pdf_bytes(pdf_bytes: bytes) -> bytes:
-    """Render first page of a PDF (bytes) and return optimized JPEG bytes."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    zoom = 2
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    # convert pixmap to PIL Image
+def _luma_is_blank(luma: Image.Image, blank_ratio: float = 0.998) -> bool:
+    """True when a grayscale image is a (near-)blank white page.
+
+    A page counts as blank when it has almost no ink (a real render has dark
+    content pixels; a blank page has ~0% ink), or when it is a nearly
+    uniform LIGHT page — a failed/blank render.  Dark or colorful solid
+    fills (e.g. a solid-color book cover) are NOT flagged: they are
+    legitimate content.  ``blank_ratio`` is the ink-free pixel threshold.
+    """
+    w, h = luma.size
+    if w < 8 or h < 8:
+        return True
+    hist = luma.histogram()
+    total = w * h
+    if not total:
+        return True
+    # Almost no ink: fewer than (1 - blank_ratio) pixels are non-white.  A
+    # truly blank page renders with ~0% non-white pixels, while even a
+    # sparse text page carries well above 0.2%.
+    nonwhite = sum(hist[:241])
+    if nonwhite / total <= 1.0 - blank_ratio:
+        return True
+    # Nearly uniform AND near-white (a blank render of a white page).  The
+    # deliberate (240,240,240) generic placeholder stays below the 248 bar so
+    # it is never mistaken for a blank render; failed renders come out >=250.
+    lo = 255
+    hi = 0
+    for v, count in enumerate(hist):
+        if count:
+            lo = min(lo, v)
+            hi = max(hi, v)
+    return (hi - lo) <= 8 and hi >= 248
+
+
+def thumbnail_is_blank(path: str, blank_ratio: float = 0.998) -> bool:
+    """True when the image file at ``path`` is an unusable preview.
+
+    True for blank/white renders AND for files that cannot be decoded — both
+    are useless as a Telegram thumbnail, so delivery paths treat them the
+    same.  Used to reject blank-white previews (e.g. a PDF whose first page
+    renders empty after book conversion) so a white placeholder is never
+    sent to Telegram.  Best-effort: any failure returns True (unreadable =
+    unusable).
+    """
+    try:
+        im = Image.open(path)
+        try:
+            return _luma_is_blank(im.convert("L"), blank_ratio)
+        finally:
+            im.close()
+    except Exception:  # nosec B110 - unreadable = unusable
+        return True
+
+
+def thumbnail_is_usable(thumb_path: str | None) -> bool:
+    """True when ``thumb_path`` exists and is a usable preview.
+
+    A blank/white, corrupt or missing preview is worse than none, so
+    delivery paths skip the thumbnail when this returns False.
+    """
+    return bool(
+        thumb_path
+        and os.path.exists(thumb_path)
+        and not thumbnail_is_blank(thumb_path)
+    )
+
+
+def thumbnail_bytes_is_blank(
+    thumb_bytes: bytes, blank_ratio: float = 0.998
+) -> bool:
+    """True when JPEG/PNG bytes are an unusable preview.
+
+    Bytes-mode twin of :func:`thumbnail_is_blank` for the in-memory worker
+    path (no temp file needed).  Blank/white renders and undecodable bytes
+    (including empty input) both count as unusable.  Best-effort: any
+    failure returns True (unreadable = unusable).
+    """
+    try:
+        im = Image.open(io.BytesIO(thumb_bytes))
+        try:
+            return _luma_is_blank(im.convert("L"), blank_ratio)
+        finally:
+            im.close()
+    except Exception:  # nosec B110 - unreadable = unusable
+        return True
+
+
+def _pixmap_is_blank(pix, blank_ratio: float = 0.998) -> bool:
+    """True when a PyMuPDF pixmap is (near-)blank.
+
+    Avoids saving a white first-page render as the thumbnail; the caller then
+    moves on to the next page instead.
+    """
+    try:
+        mode = "RGB" if pix.n < 4 else "RGBA"
+        im = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+        try:
+            return _luma_is_blank(im.convert("L"), blank_ratio)
+        finally:
+            im.close()
+    except Exception:  # nosec B110 - best-effort blank check
+        return False
+
+
+def _page_has_content(page) -> bool:
+    """Cheap pre-filter: does the page carry text, drawings or images?
+
+    A page with none of these is certainly blank, so the caller can skip it
+    without spending a pixmap render on the blank check.
+    """
+    try:
+        if (page.get_text() or "").strip():
+            return True
+        if page.get_drawings():
+            return True
+        if page.get_images(full=True):
+            return True
+    except Exception:  # nosec B110 - treat unreadable pages as content
+        return True
+    return False
+
+
+def _pixmap_to_thumb_bytes(pix) -> bytes:
+    """Convert a PyMuPDF pixmap to optimized JPEG bytes (320px max)."""
     mode = "RGB" if pix.n < 4 else "RGBA"
     img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
     if img.mode == "RGBA":
         img = img.convert("RGB")
     img.thumbnail((320, 320), Image.LANCZOS)
-
     return _optimize_thumbnail_bytes(img)
+
+
+def _first_renderable_pixmap(doc, zoom: float = 2.0):
+    """Render the first non-blank page of ``doc`` at ``zoom``, or None.
+
+    Skips leading blank pages (blank cover/title pages are common in
+    converted books) so the preview shows real content.  The first
+    content-bearing page is rendered at full ``zoom`` and blank-checked
+    directly — the common case costs exactly one render; pages scanned past
+    a blank first page use a cheap text/drawings/images pre-filter and a 1x
+    probe first.  Returns ``None`` when every scanned page is blank.
+    """
+    total = len(doc)
+    if total == 0:
+        return None
+    for i in range(min(total, PDF_THUMB_SCAN_LIMIT)):
+        page = doc.load_page(i)
+        if not _page_has_content(page):
+            continue
+        if i == 0:
+            # Common path: a single full-quality render, checked directly.
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            if not _pixmap_is_blank(pix):
+                return pix
+            continue
+        # Page past a blank first page: cheap 1x probe before the full render.
+        probe = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+        if _pixmap_is_blank(probe):
+            continue
+        return page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return None
+
+
+def create_thumbnail_from_pdf(pdf_path: str, thumb_path: str) -> None:
+    doc = fitz.open(pdf_path)
+    try:
+        if len(doc) == 0:
+            return
+        pix = _first_renderable_pixmap(doc)
+        if pix is None:
+            # Every scanned page is blank — render page 0 anyway so the file
+            # keeps SOME preview (callers can drop it via thumbnail_is_blank).
+            pix = doc.load_page(0).get_pixmap(
+                matrix=fitz.Matrix(2, 2), alpha=False
+            )
+        # save initial rendering and then optimize to meet Telegram thumbnail
+        # constraints
+        pix.save(thumb_path)
+        _optimize_thumbnail(thumb_path)
+    finally:
+        doc.close()
+
+
+def create_thumbnail_from_pdf_bytes(pdf_bytes: bytes) -> bytes:
+    """Render first non-blank page of a PDF (bytes) to optimized JPEG bytes."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if len(doc) == 0:
+            return b""
+        pix = _first_renderable_pixmap(doc)
+        if pix is None:
+            pix = doc.load_page(0).get_pixmap(
+                matrix=fitz.Matrix(2, 2), alpha=False
+            )
+        return _pixmap_to_thumb_bytes(pix)
+    finally:
+        doc.close()
 
 
 def extract_pdf_embedded_thumbnail(pdf_path: str, thumb_path: str) -> bool:
@@ -266,9 +443,10 @@ def extract_pdf_embedded_thumbnail(pdf_path: str, thumb_path: str) -> bool:
     The "already has a thumbnail" validator: PDF viewers store a small cover
     preview in the page dictionary's ``/Thumb`` entry.  When present, reusing
     it avoids rendering page 1 at 2x — no pixmap render, no memory spike on
-    large PDFs.  Returns True when the embedded thumbnail was found and saved;
-    False when the PDF has none (caller falls back to
-    ``create_thumbnail_from_pdf``).  Best-effort: any failure returns False.
+    large PDFs.  Returns True when the embedded thumbnail was found, saved and
+    is not a blank/white render; False when the PDF has none (or its embedded
+    preview is blank — caller falls back to ``create_thumbnail_from_pdf``,
+    which skips blank pages).  Best-effort: any failure returns False.
 
     Implemented via the raw xref API (``Document.xref_get_key`` +
     ``Document.extract_image``) because PyMuPDF 1.24.x's rebased build dropped
@@ -291,6 +469,15 @@ def extract_pdf_embedded_thumbnail(pdf_path: str, thumb_path: str) -> bool:
         finally:
             doc.close()
         _optimize_thumbnail(thumb_path)
+        # A PDF that ships a blank/white or unreadable embedded preview is
+        # effectively thumb-less — fall back to a rendered page instead of
+        # reporting "already has a thumbnail".
+        if thumbnail_is_blank(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except OSError:  # nosec B110 - best-effort cleanup
+                pass
+            return False
         return os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0
     except Exception:
         logger = logging.getLogger(__name__)
@@ -304,9 +491,9 @@ def extract_pdf_embedded_thumbnail_bytes(pdf_bytes: bytes) -> bytes | None:
     """Bytes-mode twin of :func:`extract_pdf_embedded_thumbnail`.
 
     Returns optimized JPEG bytes of the PDF's embedded page-1 thumbnail, or
-    None when the PDF has none (caller falls back to
-    ``create_thumbnail_from_pdf_bytes``).  Best-effort: any failure returns
-    None.
+    None when the PDF has none (or its embedded preview is blank/white —
+    caller falls back to ``create_thumbnail_from_pdf_bytes``, which skips
+    blank pages).  Best-effort: any failure returns None.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -323,6 +510,10 @@ def extract_pdf_embedded_thumbnail_bytes(pdf_bytes: bytes) -> bytes | None:
             img = Image.open(io.BytesIO(_info["image"])).convert("RGB")
         finally:
             doc.close()
+        # A blank/white embedded preview is effectively thumb-less — return
+        # None so the caller falls back to rendering a page.
+        if _luma_is_blank(img.convert("L")):
+            return None
         return _optimize_thumbnail_bytes(img)
     except Exception:
         logger = logging.getLogger(__name__)

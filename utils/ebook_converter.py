@@ -195,7 +195,11 @@ def convert_ebook(
         _err_chunks: list[bytes] = []
 
         def _drain_stderr() -> None:
-            assert proc is not None and proc.stderr is not None
+            # ``assert`` would be stripped under ``python -O`` — keep the
+            # invariant explicit so the drain thread can never crash-silently
+            # on a None pipe.
+            if proc is None or proc.stderr is None:
+                raise RuntimeError("ebook-convert proc/stderr unavailable")
             for _line in proc.stderr:
                 _err_chunks.append(_line)
 
@@ -351,11 +355,25 @@ def extract_cover_thumbnail(input_path: str, thumb_path: str) -> bool:
             im = Image.open(tmp).convert("RGB")
             im.thumbnail((320, 320))
             im.save(thumb_path, "JPEG", quality=85)
-            return os.path.exists(thumb_path)
         except Exception:  # nosec B110 - best-effort cover thumbnail
             # Cover exists but couldn't re-encode; keep raw JPEG.
             os.replace(tmp, thumb_path)
-            return os.path.exists(thumb_path)
+        # Reject blank/white covers (books without a real cover often yield
+        # one) — the caller falls back to a PDF-page preview instead of
+        # attaching a white thumbnail.
+        try:
+            from tools import thumbnail_is_blank as _thumb_is_blank
+
+            if _thumb_is_blank(thumb_path):
+                logger.info(
+                    "extract_cover_thumbnail: cover for %s is blank or "
+                    "unreadable; ignoring it",
+                    os.path.basename(input_path),
+                )
+                return False
+        except Exception:  # nosec B110 - blank check is best-effort
+            pass
+        return os.path.exists(thumb_path)
     except Exception:  # nosec B110 - cover extraction is best-effort
         return False
     finally:
@@ -387,21 +405,29 @@ def convert_book_to_pdf_with_thumbnail(
     ):
         return False
     if not extract_cover_thumbnail(input_path, thumb_path):
+        # No usable embedded cover: preview the converted PDF itself.  The
+        # shared PDF thumbnaller skips leading blank pages, so a Calibre PDF
+        # that opens with an empty cover page still gets a real preview
+        # instead of a blank white thumbnail.
         try:
-            import fitz  # PyMuPDF
+            from tools import create_thumbnail_from_pdf
 
-            doc = fitz.open(pdf_path)
-            try:
-                page = doc.load_page(0)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                pix.save(thumb_path)
-                from tools import _optimize_thumbnail
-
-                _optimize_thumbnail(thumb_path)
-            finally:
-                doc.close()
-        except Exception:  # nosec B110 - placeholder is fine
+            create_thumbnail_from_pdf(pdf_path, thumb_path)
+        except Exception:  # nosec B110 - preview is best-effort
             pass
+    # Final guard: a blank/white preview is worse than none.  Drop the thumb
+    # so delivery attaches nothing (Telegram shows a plain document icon)
+    # instead of a blank white cover after the conversion finishes.
+    try:
+        from tools import thumbnail_is_usable as _thumb_usable
+
+        if not _thumb_usable(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except OSError:  # nosec B110 - already gone is fine
+                pass
+    except Exception:  # nosec B110 - best-effort guard
+        pass
     return True
 
 

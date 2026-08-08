@@ -284,6 +284,15 @@ def _deliver_result_via_userbot(
     except Exception:
         return None
     target = _get_bot_user_id() or "me"
+    # A blank/white (or missing) preview is worse than none — drop it so the
+    # userbot delivers without a white cover thumbnail.
+    if not thumbnail_is_usable(thumb_path):
+        logger.info(
+            "worker: skipping unusable thumbnail for %s "
+            "(userbot delivery)",
+            filename,
+        )
+        thumb_path = None
     try:
         _sent, _used = _asyncio.run(
             send_file_via_userbot_with_fallback(
@@ -318,6 +327,33 @@ def _deliver_result_via_userbot(
             _msg_chat = getattr(getattr(_sent, "chat", None), "id", None)
         _src = _msg_chat if _msg_chat is not None else target
     return (_sent, _src)
+
+
+def _publish_thumb_ready(
+    file_unique_id: str | None,
+    is_pdf: bool,
+    thumb_path: str | None = None,
+    thumb_bytes: bytes | None = None,
+) -> None:
+    """Best-effort: cache ``has_thumb=True`` after a PDF's rendered preview was
+    actually DELIVERED to Telegram.
+
+    The pdfcheck ``has_thumb`` flag short-circuits repeat sends at enqueue
+    time, so it must only flip once the thumbnail really reached the user — a
+    failed send must never mark the file as "already has a thumbnail".  PDFs
+    only, usable preview only (``thumb_bytes`` is already blank-filtered by
+    the caller; ``thumb_path`` is re-checked with
+    :func:`thumbnail_is_usable`).
+    """
+    if not is_pdf:
+        return
+    if thumb_bytes is not None:
+        if not thumb_bytes:
+            return
+    elif not thumbnail_is_usable(thumb_path):
+        return
+    # ``_store_pdf_checks`` swallows its own errors — best-effort by design.
+    _store_pdf_checks(file_unique_id, has_thumb=True)
 
 
 def _safe_local_filename(filename: str) -> str:
@@ -427,6 +463,8 @@ from tools import (  # noqa: E402
     extract_pdf_metadata,
     is_supported_format,
     pdf_has_text_layer,
+    thumbnail_bytes_is_blank,
+    thumbnail_is_usable,
 )
 from utils.ebook_converter import (  # noqa: E402
     ConversionCancelledError,
@@ -1065,6 +1103,11 @@ def process_input_key_job(job: dict) -> dict:
                     user_id=user_id,
                     chat_id=chat_id,
                 )
+                _publish_thumb_ready(
+                    job.get("file_unique_id"),
+                    filename.lower().endswith(".pdf"),
+                    thumb_path=thumb_path,
+                )
                 try:
                     out_meta.setdefault("status", "done")
                     out_meta.setdefault("delivery", "userbot")
@@ -1173,21 +1216,25 @@ def process_input_key_job(job: dict) -> dict:
             )
 
         send_start = time.time()
-        with (
-            open(upload_path, "rb") as f_doc,
-            open(thumb_path, "rb") as f_thumb,
-        ):
-            res = _tg_send_document(
-                None,
-                chat_id,
-                f_doc,
-                filename,
-                thumb_fileobj=f_thumb,
-                caption="Here is your file with an auto-generated cover preview.",
-                progress_callback=_live_send_cb,
-                compress_user_id=user_id,
-                ocr_user_id=user_id,
-            )
+        _thumb_fh = None
+        try:
+            if thumbnail_is_usable(thumb_path):
+                _thumb_fh = open(thumb_path, "rb")
+            with open(upload_path, "rb") as f_doc:
+                res = _tg_send_document(
+                    None,
+                    chat_id,
+                    f_doc,
+                    filename,
+                    thumb_fileobj=_thumb_fh,
+                    caption="Here is your file with an auto-generated cover preview.",
+                    progress_callback=_live_send_cb,
+                    compress_user_id=user_id,
+                    ocr_user_id=user_id,
+                )
+        finally:
+            if _thumb_fh is not None:
+                _thumb_fh.close()
         _cache_delivered_copy(
             _content_hash,
             filename,
@@ -1196,6 +1243,11 @@ def process_input_key_job(job: dict) -> dict:
             res,
             user_id=user_id,
             chat_id=chat_id,
+        )
+        _publish_thumb_ready(
+            job.get("file_unique_id"),
+            filename.lower().endswith(".pdf"),
+            thumb_path=thumb_path,
         )
         send_elapsed = time.time() - send_start
         out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -2431,8 +2483,6 @@ def process_document_job(
                     )
                     return {"status": "already_thumbed", "skipped": True}
                 create_thumbnail_from_pdf(file_path, thumb_path)
-            else:
-                create_thumbnail_from_image(file_path, thumb_path)
 
             # ── Full PDF metadata retrieval (persisted into io:out) ──
             if (
@@ -2584,6 +2634,12 @@ def process_document_job(
                         user_id=user_id,
                         chat_id=chat_id,
                     )
+                    _publish_thumb_ready(
+                        file_unique_id,
+                        filename.lower().endswith(".pdf")
+                        or "pdf" in (mime or "").lower(),
+                        thumb_path=thumb_path,
+                    )
                     try:
                         out_meta.setdefault("status", "done")
                         out_meta.setdefault("delivery", "userbot")
@@ -2696,20 +2752,24 @@ def process_document_job(
                 message_id=_progress_msg_id,
             )
             send_start = time.time()
-            with (
-                open(upload_path, "rb") as f_doc,
-                open(thumb_path, "rb") as f_thumb,
-            ):
-                res = _tg_send_document(
-                    None,
-                    chat_id,
-                    f_doc,
-                    filename,
-                    thumb_fileobj=f_thumb,
-                    caption="Here is your file with an auto-generated cover preview.",
-                    compress_user_id=user_id,
-                    ocr_user_id=user_id,
-                )
+            _thumb_fh = None
+            try:
+                if thumbnail_is_usable(thumb_path):
+                    _thumb_fh = open(thumb_path, "rb")
+                with open(upload_path, "rb") as f_doc:
+                    res = _tg_send_document(
+                        None,
+                        chat_id,
+                        f_doc,
+                        filename,
+                        thumb_fileobj=_thumb_fh,
+                        caption="Here is your file with an auto-generated cover preview.",
+                        compress_user_id=user_id,
+                        ocr_user_id=user_id,
+                    )
+            finally:
+                if _thumb_fh is not None:
+                    _thumb_fh.close()
             _cache_delivered_copy(
                 _content_hash,
                 filename,
@@ -2718,6 +2778,12 @@ def process_document_job(
                 res,
                 user_id=user_id,
                 chat_id=chat_id,
+            )
+            _publish_thumb_ready(
+                file_unique_id,
+                filename.lower().endswith(".pdf")
+                or "pdf" in (mime or "").lower(),
+                thumb_path=thumb_path,
             )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -2874,6 +2940,13 @@ def process_document_job(
                 thumb_bytes = create_thumbnail_from_pdf_bytes(file_bytes)
             else:
                 thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
+            # A blank/white (or empty) preview is worse than none — drop it
+            # so delivery attaches nothing instead of a white cover.
+            try:
+                if not thumb_bytes or thumbnail_bytes_is_blank(thumb_bytes):
+                    thumb_bytes = b""
+            except Exception:  # nosec B110 - best-effort guard
+                pass
 
             # If large, attempt compression via temp file flow
             if upload_limit and len(file_bytes) > upload_limit:
@@ -2956,9 +3029,13 @@ def process_document_job(
                         _ub_tmp = os.path.join(td, filename)
                         with open(_ub_tmp, "wb") as _ub_fh:
                             _ub_fh.write(file_bytes)
-                        _ub_thumb = os.path.join(td, "userbot_thumb.jpg")
-                        with open(_ub_thumb, "wb") as _ub_th:
-                            _ub_th.write(thumb_bytes)
+                        _ub_thumb = None
+                        if thumb_bytes:
+                            _ub_thumb = os.path.join(
+                                td, "userbot_thumb.jpg"
+                            )
+                            with open(_ub_thumb, "wb") as _ub_th:
+                                _ub_th.write(thumb_bytes)
                         _ub_res = _deliver_result_via_userbot(
                             chat_id,
                             _ub_tmp,
@@ -2990,6 +3067,12 @@ def process_document_job(
                                 getattr(_sent, "id", None),
                                 user_id=user_id,
                                 chat_id=chat_id,
+                            )
+                            _publish_thumb_ready(
+                                file_unique_id,
+                                filename.lower().endswith(".pdf")
+                                or "pdf" in (mime or "").lower(),
+                                thumb_bytes=thumb_bytes,
                             )
                             try:
                                 out_meta.setdefault("status", "done")
@@ -3096,9 +3179,12 @@ def process_document_job(
             # send via Telegram
             send_start = time.time()
             doc_buf = io.BytesIO(file_bytes)
-            thumb_buf = io.BytesIO(thumb_bytes)
+            thumb_buf = (
+                io.BytesIO(thumb_bytes) if thumb_bytes else None
+            )
             doc_buf.seek(0)
-            thumb_buf.seek(0)
+            if thumb_buf is not None:
+                thumb_buf.seek(0)
             res = _tg_send_document(
                 None,
                 chat_id,
@@ -3117,6 +3203,12 @@ def process_document_job(
                 res,
                 user_id=user_id,
                 chat_id=chat_id,
+            )
+            _publish_thumb_ready(
+                file_unique_id,
+                filename.lower().endswith(".pdf")
+                or "pdf" in (mime or "").lower(),
+                thumb_bytes=thumb_bytes,
             )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -3620,6 +3712,14 @@ def _deliver_converted_file(
         except Exception:  # nosec B110 - progress is best-effort
             pass
 
+    # A blank/white (or missing) preview is worse than none — deliver without
+    # a thumbnail rather than attaching a white cover.
+    if not thumbnail_is_usable(thumb_path):
+        logger.info(
+            "_deliver_converted_file: skipping unusable thumbnail for %s",
+            filename,
+        )
+        thumb_path = None
     _thumb = None
     try:
         try:
@@ -4193,11 +4293,18 @@ def convert_book_job(
                         "Here is your book converted to PDF and compressed."
                     )
                     # Refresh the thumbnail from the compressed PDF (best
-                    # effort — falls back to the pre-compression cover).
+                    # effort).  Render to a temp path and only swap it in
+                    # when usable — a blank render of the compressed PDF must
+                    # never clobber the pre-compression cover.
                     try:
                         if _thumb_path:
-                            create_thumbnail_from_pdf(_out, _thumb_path)
-                    except Exception:  # nosec B110
+                            _rethumb = _thumb_path + ".rethumb.jpg"
+                            create_thumbnail_from_pdf(_out, _rethumb)
+                            if thumbnail_is_usable(_rethumb):
+                                os.replace(_rethumb, _thumb_path)
+                            else:
+                                os.remove(_rethumb)
+                    except Exception:  # nosec B110 - best-effort
                         pass
             except Exception:  # nosec B110 - compression best-effort
                 logger.warning(
@@ -4590,6 +4697,35 @@ def compress_pdf_job(
             pass
 
 
+def _build_pdf_output_preview(
+    src: str,
+    filename: str,
+    file_unique_id: str | None,
+    tmpdir: str,
+) -> str | None:
+    """Best-effort first-page/cover preview for a PDF OCR result.
+
+    Reuses the cached embedded-thumbnail result when known (extract instead
+    of rendering page 1 at 2x); falls back to a blank-skipping page render
+    for PDFs and an image render for image sources.  Returns the thumb path
+    or ``None`` (a missing preview never fails the job).
+    """
+    thumb_path = os.path.join(tmpdir, "thumb.jpg")
+    try:
+        if filename.lower().endswith(".pdf"):
+            checks = _get_pdf_checks(file_unique_id)
+            has_thumb = checks["has_thumb"] if checks is not None else None
+            if has_thumb is False:
+                create_thumbnail_from_pdf(src, thumb_path)
+            elif not extract_pdf_embedded_thumbnail(src, thumb_path):
+                create_thumbnail_from_pdf(src, thumb_path)
+        else:
+            create_thumbnail_from_image(src, thumb_path)
+    except Exception:  # nosec B110 - preview is best-effort
+        return None
+    return thumb_path
+
+
 def ocr_job(
     chat_id: int,
     file_id: str,
@@ -4751,6 +4887,10 @@ def ocr_job(
         # ebook→PDF results get the extracted cover/first page, everything else
         # (txt, other converted formats) ships as a plain document.
         _thumb_path = None
+        # Whether this job converted an e-book to PDF mid-run (the user does
+        # not otherwise hold the converted file — used to decide whether the
+        # "already has a text layer" short-circuit should DELIVER the PDF).
+        _converted_book = False
         # E-books aren't OCR-able directly — convert to PDF with Calibre first,
         # then OCR the PDF (both searchable-PDF and text extraction work on it).
         if is_book_format(filename) and not filename.lower().endswith(".pdf"):
@@ -4788,6 +4928,7 @@ def ocr_job(
                 return {"error": "conversion_failed"}
             _src = _pdf_src
             filename = _pdf_name
+            _converted_book = True
             # The intermediate conversion already extracted the book's cover
             # (or first page) into thumb.jpg — reuse it ONLY for a PDF output;
             # a txt extraction stays a plain document (the user-facing rule:
@@ -4822,49 +4963,93 @@ def ocr_job(
                     content_hash=_content_hash,
                 )
         if _already_ocr and _is_pdf_out:
-            upsert_processed_record(
-                _content_hash,
-                "ocr",
-                "skipped",
-                filename=_orig_filename,
-                file_size=file_size,
-                user_id=user_id,
-                chat_id=chat_id,
-                target=target,
+            # The file already carries a searchable text layer — no OCR pass
+            # is needed.  But the button promised the searchable PDF, so
+            # deliver it: books ship the Calibre-converted PDF (which the user
+            # never received); direct PDFs get the original file back.
+            if _converted_book:
+                _caption = (
+                    "\U0001f4d6 Here is your book as a searchable PDF — the "
+                    "converted file already has a text layer, so no OCR "
+                    "was needed."
+                )
+            else:
+                # Direct PDF: build a cover preview so the re-sent file
+                # carries one (best-effort — a missing preview is dropped at
+                # delivery rather than shipping a white box).
+                _thumb_path = _build_pdf_output_preview(
+                    _src, filename, file_unique_id, tmpdir
+                )
+                _caption = (
+                    "\U0001f4c4 Here is your PDF back — it already has a "
+                    "searchable text layer, so no OCR was needed."
+                )
+            _ocr_res = _deliver_converted_file(
+                chat_id, _src, filename, _thumb_path, _caption, user_id,
+                progress_msg_id=_progress_msg_id,
             )
-            _tg_send_message(
-                None,
-                chat_id,
-                "✅ This PDF already has a searchable text layer — "
-                "no OCR needed (nothing to add).",
-            )
+            if _ocr_res and _ocr_res.get("ok"):
+                try:
+                    _doc = (_ocr_res.get("result") or {}).get(
+                        "document"
+                    ) or {}
+                    upsert_processed_record(
+                        _content_hash,
+                        "ocr",
+                        "done",
+                        filename=_orig_filename,
+                        file_size=file_size,
+                        file_id=_doc.get("file_id"),
+                        thumb_file_id=(_doc.get("thumbnail") or {}).get(
+                            "file_id"
+                        ),
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        target=target,
+                    )
+                except Exception:  # nosec B110 - cache is best-effort
+                    pass
+            elif _ocr_res and _ocr_res.get("delivery") == "userbot":
+                _cache_userbot_delivered_copy(
+                    _content_hash,
+                    _orig_filename,
+                    file_size,
+                    "ocr",
+                    _ocr_res.get("src_chat_id"),
+                    _ocr_res.get("src_message_id"),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    target=target,
+                )
+            if _ocr_res and not _converted_book:
+                # Direct PDF delivered with its preview — publish
+                # has_thumb=True so repeat taps short-circuit at enqueue
+                # (PDFs only; the ebook fuid must never be flagged).
+                _publish_thumb_ready(
+                    file_unique_id,
+                    filename.lower().endswith(".pdf"),
+                    thumb_path=_thumb_path,
+                )
+            try:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "already_ocr_delivered",
+                        "filename": filename,
+                        "timestamps": {"finished": int(time.time())},
+                    },
+                )
+            except Exception:  # nosec B110
+                pass
             _delete_queued_messages(_rq_job_id)
-            return {"status": "already_ocr", "skipped": True}
+            return {"status": "already_ocr_delivered", "delivered": True}
 
         if _is_pdf_out and _thumb_path is None:
             # Direct PDF or image source: build a first-page preview for the
             # OCR'd PDF (best-effort — a missing preview never fails the job).
-            # Reuse the cached embedded-thumbnail result when known (extract
-            # instead of rendering page 1 at 2x).
-            _thumb_path = os.path.join(tmpdir, "thumb.jpg")
-            try:
-                if filename.lower().endswith(".pdf"):
-                    _checks = _get_pdf_checks(file_unique_id)
-                    _has_thumb = (
-                        _checks["has_thumb"]
-                        if _checks is not None
-                        else None
-                    )
-                    if _has_thumb is False:
-                        create_thumbnail_from_pdf(_src, _thumb_path)
-                    elif not extract_pdf_embedded_thumbnail(
-                        _src, _thumb_path
-                    ):
-                        create_thumbnail_from_pdf(_src, _thumb_path)
-                else:
-                    create_thumbnail_from_image(_src, _thumb_path)
-            except Exception:  # nosec B110 - preview is best-effort
-                _thumb_path = None
+            _thumb_path = _build_pdf_output_preview(
+                _src, filename, file_unique_id, tmpdir
+            )
         _progress_msg_id = _tg_send_progress(
             chat_id, filename, "ocr",
             detail=(
@@ -4986,6 +5171,15 @@ def ocr_job(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
         )
+        if _ocr_res and not _converted_book:
+            # Only direct-PDF/image sources: a converted book's fuid is not a
+            # PDF (the has_thumb gate targets PDFs), so the ebook must never
+            # be flagged even though its OCR output carried a preview.
+            _publish_thumb_ready(
+                file_unique_id,
+                filename.lower().endswith(".pdf"),
+                thumb_path=_thumb_path,
+            )
         if _ocr_res and _ocr_res.get("ok"):
             try:
                 _doc = (_ocr_res.get("result") or {}).get("document") or {}
@@ -5273,17 +5467,24 @@ def process_url_job(
                 )
                 return
 
-        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-            _tg_send_document(
-                None,
-                chat_id,
-                f_doc,
-                filename,
-                thumb_fileobj=f_thumb,
-                caption="Here is your file with an auto-generated cover preview.",
-                compress_user_id=user_id,
-                ocr_user_id=user_id,
-            )
+        _thumb_fh = None
+        try:
+            if thumbnail_is_usable(thumb_path):
+                _thumb_fh = open(thumb_path, "rb")
+            with open(file_path, "rb") as f_doc:
+                _tg_send_document(
+                    None,
+                    chat_id,
+                    f_doc,
+                    filename,
+                    thumb_fileobj=_thumb_fh,
+                    caption="Here is your file with an auto-generated cover preview.",
+                    compress_user_id=user_id,
+                    ocr_user_id=user_id,
+                )
+        finally:
+            if _thumb_fh is not None:
+                _thumb_fh.close()
         _write_out("done")
         _cleanup_after_success(chat_id, _rq_job_id, _progress_msg_id)
         logger.info(

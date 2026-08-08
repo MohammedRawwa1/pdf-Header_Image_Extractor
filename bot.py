@@ -81,6 +81,7 @@ from tools import (  # noqa: E402
     infer_extension,
     is_supported_format,
     is_valid_pdf,
+    thumbnail_is_usable,
 )
 from utils.bigfile_pipeline import BigFilePipeline  # noqa: E402
 from utils.ebook_converter import (  # noqa: E402
@@ -101,6 +102,7 @@ from utils.ocr import (  # noqa: E402
 from utils.processed_cache import (  # noqa: E402
     _get_pdf_checks,
     _store_fuid_binding,
+    _store_pdf_checks,
     get_processed_by_file_unique_id,
     get_processed_op,
 )
@@ -368,6 +370,15 @@ async def _send_with_upload_progress(
 
     Returns True on success, raises on failure.
     """
+    # A blank/white (or missing) preview is worse than none — drop it so the
+    # userbot delivers without a white cover thumbnail.
+    if not thumbnail_is_usable(thumb_path):
+        logger.info(
+            "_send_with_upload_progress: skipping unusable thumbnail "
+            "for %s",
+            filename,
+        )
+        thumb_path = None
     if task is None:
         task_id = uuid.uuid4().hex[:12]
         task = progress_tracker.create_task(
@@ -505,14 +516,28 @@ async def _send_document_via_bot_api(
     When no tracker exists (tiny files that upload in under a second) the plain
     PTB path is kept, so behaviour is unchanged for those.
     """
+    # A blank/white (or missing) preview is worse than none — skip it so a
+    # white placeholder is never attached to a delivered document.
+    if not thumbnail_is_usable(thumb_path):
+        thumb_path = None
+    _thumb_fh = None
+    try:
+        if thumb_path:
+            _thumb_fh = open(thumb_path, "rb")
+    except Exception:  # nosec B110 - thumb is optional
+        _thumb_fh = None
     if task is None or progress_msg_id is None:
-        with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-            _sent = await bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(f_doc, filename=filename),
-                thumbnail=f_thumb,
-                caption=caption,
-            )
+        try:
+            with open(file_path, "rb") as f_doc:
+                _sent = await bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f_doc, filename=filename),
+                    thumbnail=_thumb_fh,
+                    caption=caption,
+                )
+        finally:
+            if _thumb_fh is not None:
+                _thumb_fh.close()
         # Attach the result buttons (🗜 Compress + 🔎 OCR for PDFs, 🔎 OCR for
         # images) — parity with the raw-HTTP path in _tg_send_document.
         if user_id:
@@ -552,19 +577,23 @@ async def _send_document_via_bot_api(
     progress_msg_id, _cb = await _begin_upload_phase(
         bot, chat_id, task, _loop, progress_msg_id
     )
-    with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-        await asyncio.to_thread(
-            _tg_send_document,
-            config.BOT_TOKEN,
-            chat_id,
-            f_doc,
-            filename,
-            f_thumb,
-            caption,
-            _cb,
-            user_id,
-            ocr_user_id=user_id,
-        )
+    try:
+        with open(file_path, "rb") as f_doc:
+            await asyncio.to_thread(
+                _tg_send_document,
+                config.BOT_TOKEN,
+                chat_id,
+                f_doc,
+                filename,
+                _thumb_fh,
+                caption,
+                _cb,
+                user_id,
+                ocr_user_id=user_id,
+            )
+    finally:
+        if _thumb_fh is not None:
+            _thumb_fh.close()
 
 
 async def _notify_download_failed(msg, file_size=None):
@@ -1641,6 +1670,17 @@ async def handle_document(
                 task=task,
                 progress_msg_id=progress_msg_id,
                 user_id=user_id,
+            )
+        # Both send helpers raise on failure, so reaching here means the file
+        # (with its preview) was delivered — publish has_thumb=True so repeat
+        # sends / button taps short-circuit at enqueue instead of re-rendering
+        # (PDFs only: the deliberate gray placeholder for other types must
+        # never set the flag).
+        if (
+            lower.endswith(".pdf") or mime == "application/pdf"
+        ) and thumbnail_is_usable(thumb_path):
+            _store_pdf_checks(
+                getattr(doc, "file_unique_id", None), has_thumb=True
             )
         if task:
             await progress_tracker.complete_task(task.task_id)
@@ -3756,8 +3796,10 @@ def _resolve_rq_job(
             for candidate in _rq_ids_by_prefix(r, job_id):
                 try:
                     cand = Job.fetch(candidate, connection=r)
-                except Exception:  # nosec B110
-                    continue
+                except Exception:
+                    # A corrupt/stale job key shouldn't abort the scan —
+                    # fall through and check the next prefix candidate.
+                    cand = None
                 if cand is None:
                     continue
                 # Ownership: only cancel jobs from the caller's chat — keep
@@ -4900,9 +4942,6 @@ async def handle_ctx_thumb_ocr_callback(
     # proved pointless (embedded thumb / text layer).
     _fchecks = _get_pdf_checks(rec.get("file_unique_id"))
     _f_thumb = _fchecks.get("has_thumb") if _fchecks is not None else None
-    _f_ocr = (
-        _fchecks.get("has_text_layer") if _fchecks is not None else None
-    )
     _rec = (
         get_processed_by_file_unique_id(rec.get("file_unique_id"))
         if rec.get("file_unique_id")
@@ -4912,7 +4951,11 @@ async def handle_ctx_thumb_ocr_callback(
     _thumb_entry = _ops.get("thumb")
     _ocr_entry = _ops.get("ocr")
     _thumb_handled = _thumb_entry is not None or _f_thumb is True
-    _ocr_handled = _ocr_entry is not None or _f_ocr is True
+    # ``has_text_layer`` no longer counts as "OCR handled": an already-
+    # searchable PDF still needs the OCR job — the worker now DELIVERS the
+    # searchable file back in one tap instead of messaging "nothing to add".
+    # Only a real cached delivery (a done ``ocr`` entry) skips the enqueue.
+    _ocr_handled = _ocr_entry is not None
     if _thumb_handled and _ocr_handled:
         # Both parts are already done: re-send one cached copy if available.
         _resent = False
@@ -4952,11 +4995,25 @@ async def handle_ctx_thumb_ocr_callback(
         return
     _want_thumb = not _thumb_handled
     _want_ocr = not _ocr_handled
-    # OCR target: honor the user's pinned default, else searchable PDF when
-    # the engine is available, else plain text.
+    # Cached text-layer check: an already-searchable PDF's OCR "output" is
+    # the file itself (the worker delivers it back, no engine needed).
+    _already_searchable = (
+        filename.lower().endswith(".pdf")
+        and _fchecks is not None
+        and _fchecks.get("has_text_layer") is True
+    )
+    # OCR target: honor the user's pinned default; else, when the cached
+    # text-layer check already proves the PDF is searchable, enqueue
+    # target="pdf" — the worker delivers the already-searchable file back in
+    # one tap (no OCR engine needed), so the engine check is skipped; else
+    # searchable PDF when the engine is available, else plain text.
     _target = (get_user_setting(armer, "ocr_target", "") or "").lower()
     if _target not in ("pdf", "txt"):
-        _target = "pdf" if ocr_pdf_available() else "txt"
+        _target = (
+            "pdf"
+            if (_already_searchable or ocr_pdf_available())
+            else "txt"
+        )
     # Warm the durable fuid->content_hash index from the worker's pdfcheck
     # binding so the SURFACE fast-path stays alive even before the worker
     # runs (heals transient pfuid write failures).
@@ -4978,6 +5035,24 @@ async def handle_ctx_thumb_ocr_callback(
             owner_user_id=armer,
             job_timeout=1800,
         )
+    # Double-delivery guard: when the thumbnail job actually queued AND the
+    # OCR target is the deliver-back (already-searchable PDF → target=pdf),
+    # the thumbnail job will deliver the file back with its cover — re-running
+    # ocr_job would re-send identical bytes.  Suppress it so the all-in-one
+    # tap yields exactly one delivery.  (target=txt still runs: it produces a
+    # different artifact, the extracted text.)  Only suppressed once the thumb
+    # enqueue succeeded — a failed thumb enqueue keeps the OCR deliver-back
+    # as the fallback, so the tap never ends with nothing queued.
+    _ocr_suppressed_dupe = False
+    if (
+        _want_thumb
+        and ok_thumb is not None
+        and _want_ocr
+        and _target == "pdf"
+        and _already_searchable
+    ):
+        _want_ocr = False
+        _ocr_suppressed_dupe = True
     ok_ocr = None
     if _want_ocr:
         ok_ocr = await asyncio.to_thread(
@@ -5013,7 +5088,12 @@ async def handle_ctx_thumb_ocr_callback(
         if not _want_thumb:
             _skipped_parts.append("\U0001f5bc\ufe0f thumbnail already done")
         if not _want_ocr:
-            _skipped_parts.append("\U0001f50e OCR already done")
+            _skipped_parts.append(
+                "\U0001f50e OCR skipped — already searchable "
+                "(delivered with the thumbnail)"
+                if _ocr_suppressed_dupe
+                else "\U0001f50e OCR already done"
+            )
         _failed_part = (ok_thumb is None and _want_thumb) or (
             ok_ocr is None and _want_ocr
         )
@@ -5851,6 +5931,29 @@ async def handle_ocr_callback(
             await _enqueue_ocr_job(query, _rec2, armer, _default)
             return
     filename = rec.get("filename") or "file"
+    # ── Already-searchable direct PDF: skip the picker, one tap ──────────
+    # When the pdfcheck cache (written by the thumbnail/OCR validator over
+    # this same immutable content) already proves the PDF carries a searchable
+    # text layer, the OCR button's promise is just the file itself — the
+    # worker re-sends the searchable PDF back with an explanatory caption,
+    # and no OCR engine is needed.  Consumed atomically so a double-tap can't
+    # double-enqueue.  Falls through to the picker when the layer is unknown
+    # (the worker re-checks and decides there).
+    _fchecks = _get_pdf_checks(rec.get("file_unique_id"))
+    if (
+        filename.lower().endswith(".pdf")
+        and _fchecks is not None
+        and _fchecks.get("has_text_layer") is True
+    ):
+        _rec2 = _load_pending_token(token, True, "bookocr", "ctxfile")
+        if not _rec2:
+            await query.answer(
+                "This OCR link has expired. Send the file again.",
+                show_alert=True,
+            )
+            return
+        await _enqueue_ocr_job(query, _rec2, armer, "pdf")
+        return
     try:
         await query.answer()
     except Exception:  # nosec B110 - stale/redelivered query
