@@ -1207,42 +1207,11 @@ async def handle_document(
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
-    # If Telegram reports a file_size on the Document, check it against the Bot API
-    # DOWNLOAD limit (getFile cap, 20MB) before attempting to enqueue or download.
-    # Telegram's Bot API rejects downloads above that cap with 400 "file is too big",
-    # so such files must route through the userbot / BigFilePipeline instead.
-    file_size = getattr(doc, "file_size", None)
-    download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
-    use_userbot_download = False
-    if file_size and download_limit and file_size > download_limit:
-        _userbot_ok = _check_userbot_available(user_id)
-        if _userbot_ok:
-            use_userbot_download = True
-            logger.info(
-                "file too large for Bot API (%d MB), falling back to userbot download",
-                file_size // (1024 * 1024),
-            )
-        else:
-            # Inform the user
-            try:
-                mb_limit = download_limit // (1024 * 1024)
-                mb_size = file_size // (1024 * 1024)
-                await msg.reply_text(
-                    f"I can't download files larger than {mb_limit} MB via the Bot API. "
-                    f"Your file is approximately {mb_size} MB.\n\n"
-                    "Options:\n"
-                    "- Upload a smaller file (under the limit).\n"
-                    "- Send a public HTTPS URL to the file (I can download and process URLs).\n"
-                    "- Use a user account client (Pyrogram user) which supports larger uploads.\n"
-                    "If you want automatic external-hosting fallback, enable S3 fallback in the bot config."
-                )
-            except Exception:
-                logger.exception("Failed to notify user about large file")
-            return
-
     # ── E-books: conversion has its own clean interface ──
-    # Routed before the Redis/userbot gates so books of every size are handled
-    # by the conversion-only flow — never the thumbnail pipeline.
+    # Routed BEFORE the size/userbot gates so books of every size are handled
+    # by the conversion-only flow — never the thumbnail pipeline (a large book
+    # is never rejected by the Bot API size gate before it reaches Convert).
+    file_size = getattr(doc, "file_size", None)
     if is_book_format(filename) and not filename.lower().endswith(".pdf"):
         if not getattr(config, "ENABLE_BOOK_CONVERSION", False):
             # Feature disabled → pre-feature behavior: reject e-books clearly
@@ -1323,6 +1292,38 @@ async def handle_document(
                 getattr(_q_msg, "message_id", None),
             )
         return
+
+    # If Telegram reports a file_size on the Document, check it against the Bot API
+    # DOWNLOAD limit (getFile cap, 20MB) before attempting to enqueue or download.
+    # Telegram's Bot API rejects downloads above that cap with 400 "file is too big",
+    # so such files must route through the userbot / BigFilePipeline instead.
+    download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
+    use_userbot_download = False
+    if file_size and download_limit and file_size > download_limit:
+        _userbot_ok = _check_userbot_available(user_id)
+        if _userbot_ok:
+            use_userbot_download = True
+            logger.info(
+                "file too large for Bot API (%d MB), falling back to userbot download",
+                file_size // (1024 * 1024),
+            )
+        else:
+            # Inform the user
+            try:
+                mb_limit = download_limit // (1024 * 1024)
+                mb_size = file_size // (1024 * 1024)
+                await msg.reply_text(
+                    f"I can't download files larger than {mb_limit} MB via the Bot API. "
+                    f"Your file is approximately {mb_size} MB.\n\n"
+                    "Options:\n"
+                    "- Upload a smaller file (under the limit).\n"
+                    "- Send a public HTTPS URL to the file (I can download and process URLs).\n"
+                    "- Use a user account client (Pyrogram user) which supports larger uploads.\n"
+                    "If you want automatic external-hosting fallback, enable S3 fallback in the bot config."
+                )
+            except Exception:
+                logger.exception("Failed to notify user about large file")
+            return
 
     if config.REDIS_URL:
         # When file is too large (>20MB) and userbot is available, route through
@@ -4343,9 +4344,15 @@ async def handle_book_convert_button_callback(
     rec = _load_book_convert(token, consume=False)
     if not rec:
         try:
-            await query.edit_message_text(
+            await query.answer(
                 "⏰ This Convert button has expired. Send the book again.",
-                reply_markup=InlineKeyboardMarkup([]),
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([])
             )
         except Exception:  # nosec B110
             pass
@@ -4355,16 +4362,33 @@ async def handle_book_convert_button_callback(
     kb = _book_conv_kb(armer, token, filename)
     if not kb:
         try:
-            await query.edit_message_text(
+            await query.answer(
                 f"\u274c No convertible target formats for `{safe_code_span(filename)}`.",
-                reply_markup=InlineKeyboardMarkup([]),
-                parse_mode="Markdown",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([])
             )
         except Exception:  # nosec B110
             pass
         return
     try:
-        await query.edit_message_text(
+        await query.answer()
+    except Exception:  # nosec B110 - stale/redelivered query
+        pass
+    try:
+        # The Convert button sits on the delivered BOOK message (a document),
+        # which Telegram cannot text-edit (400 "no text in the message to
+        # edit").  Clear the button on the media message and present the
+        # format picker as a NEW text message instead, so the final format tap
+        # (handle_book_convert_callback) can edit that text message in place.
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([])
+        )
+        await query.message.reply_text(
             f"\U0001f501 Convert `{safe_code_span(filename)}` to:",
             reply_markup=kb,
             parse_mode="Markdown",
@@ -4811,7 +4835,19 @@ async def handle_ocr_callback(
             return
     filename = rec.get("filename") or "file"
     try:
-        await query.edit_message_text(
+        await query.answer()
+    except Exception:  # nosec B110 - stale/redelivered query
+        pass
+    try:
+        # The 🔎 OCR button sits on a delivered PDF/image (a document), which
+        # Telegram cannot text-edit (400 "no text in the message to edit").
+        # Clear the button on the media message and reveal the picker as a NEW
+        # text message instead, so the final pick (handle_ocr_pick_callback)
+        # can edit that text message in place.
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([])
+        )
+        await query.message.reply_text(
             f"\U0001f50e OCR `{safe_code_span(filename)}` as:",
             reply_markup=_ocr_pick_kb(armer, token),
             parse_mode="Markdown",
