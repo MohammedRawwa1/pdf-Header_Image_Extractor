@@ -57,7 +57,7 @@ RUN if [ "$INSTALL_OCR" = "1" ]; then \
 # (cover extraction for thumbnails). Build arg lets deployments skip it.
 ARG INSTALL_CALIBRE="1"
 RUN if [ "$INSTALL_CALIBRE" = "1" ]; then \
-		apt-get update && apt-get install -y --no-install-recommends wget xz-utils xdg-utils \
+		apt-get update && apt-get install -y --no-install-recommends wget xz-utils xdg-utils zip \
 			libnss3 libxcomposite1 libxcursor1 libasound2 libatk1.0-0 libatk-bridge2.0-0 \
 			libcups2 libdrm2 libgbm1 libgtk-3-0 libxkbcommon0 libgl1 libegl1 libopengl0 \
 			libx11-6 libxext6 libxrender1 libxi6 libxinerama1 libxfixes3 libxdamage1 \
@@ -89,16 +89,22 @@ RUN if [ "$INSTALL_CALIBRE" = "1" ]; then \
 		# QVulkanInstance + credentials.cc Permission denied).  Smoke-convert
 		# a minimal EPUB with the headless env so this build can't ship a
 		# Calibre whose renderer dies at runtime.
-		mkdir -p /tmp/calibre-smoke/book.epub/META-INF /tmp/calibre-smoke/book.epub/OEBPS && \
-		printf 'application/epub+zip' > /tmp/calibre-smoke/book.epub/mimetype && \
-		printf '%s' '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>' > /tmp/calibre-smoke/book.epub/META-INF/container.xml && \
-		printf '%s' '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">smoke</dc:identifier><dc:title>Smoke</dc:title><dc:language>en</dc:language></metadata><manifest><item id="c1" href="content.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>' > /tmp/calibre-smoke/book.epub/OEBPS/content.opf && \
-		printf '%s' '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Smoke</title></head><body><p>Smoke</p></body></html>' > /tmp/calibre-smoke/book.epub/OEBPS/content.xhtml && \
+		mkdir -p /tmp/calibre-smoke/src/META-INF /tmp/calibre-smoke/src/OEBPS && \
+		printf 'application/epub+zip' > /tmp/calibre-smoke/src/mimetype && \
+		printf '%s' '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>' > /tmp/calibre-smoke/src/META-INF/container.xml && \
+		printf '%s' '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">smoke</dc:identifier><dc:title>Smoke</dc:title><dc:language>en</dc:language></metadata><manifest><item id="c1" href="content.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>' > /tmp/calibre-smoke/src/OEBPS/content.opf && \
+		printf '%s' '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Smoke</title></head><body><p>Smoke</p></body></html>' > /tmp/calibre-smoke/src/OEBPS/content.xhtml && \
+		# The fixture above is an UNCOMPRESSED epub directory, but ebook-convert
+		# requires a real .epub FILE (a zip) -- passing the directory fails with
+		# IsADirectoryError. Package it first: mimetype must be the first zip
+		# entry and STORED (uncompressed) to be a spec-valid EPUB.
+		cd /tmp/calibre-smoke/src && zip -X0 ../smoke.epub mimetype && \
+		zip -Xr9D ../smoke.epub META-INF OEBPS && \
 		cd /tmp/calibre-smoke && \
 		if ! env QT_QPA_PLATFORM=offscreen QTWEBENGINE_DISABLE_SANDBOX=1 \
 			QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \
 			QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 HOME=/tmp/calibre-smoke \
-			ebook-convert book.epub smoke.pdf >/tmp/calibre-smoke.log 2>&1; then \
+			ebook-convert smoke.epub smoke.pdf >/tmp/calibre-smoke.log 2>&1; then \
 			cat /tmp/calibre-smoke.log; \
 			echo "ERROR: calibre EPUB->PDF smoke conversion failed" && exit 1; \
 		fi; \
