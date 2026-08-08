@@ -26,11 +26,26 @@ from typing import Any, Protocol
 
 import requests
 
-from utils.markdown_utils import escape_markdown
+from utils.markdown_utils import escape_markdown, sanitize_text
 from utils.ocr import is_ocr_source, ocr_enabled
 from utils.progress_tracker import _build_progress_bar, _format_size
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_outbound(text: str | None) -> str | None:
+    """Sanitize-on-send wrapper for every outbound text field.
+
+    Third-party content (filenames, captions, error/detail strings) can
+    contain corrupted surrogate escapes or control characters that crash the
+    Bot API send layer with ``UnicodeEncodeError: surrogates not allowed``
+    or a 400 ``Bad Request``.  All outbound ``text`` / ``caption`` / multipart
+    ``filename`` values flow through this helper (see the call sites below)
+    so no third-party text can take down a send.  ``None`` passes through.
+    """
+    if text is None:
+        return None
+    return sanitize_text(text)
 
 # Shared HTTP session for Bot API calls.  urllib3's connection pools are
 # thread-safe, so a single session is reused across the web process's streaming
@@ -175,6 +190,13 @@ def _tg_send_document(
             doc_fileobj, _doc_total, progress_callback
         )
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    # Sanitize-on-send: the multipart filename and caption may carry
+    # third-party text (user filenames) — a corrupted surrogate would crash
+    # the send-layer encoding.  If sanitization strips a pathological
+    # filename to nothing, fall back to a safe placeholder instead of the
+    # raw (crash-causing) original.
+    filename = _sanitize_outbound(filename) or "file"
+    caption = _sanitize_outbound(caption)
     files: dict[str, Any] = {"document": (filename, doc_fileobj)}
     if thumb_fileobj is not None:
         files["thumb"] = ("thumb.jpg", thumb_fileobj, "image/jpeg")
@@ -331,6 +353,11 @@ def _tg_send_document_by_id(
     """
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    # Sanitize-on-send: the caption and filename may carry third-party text
+    # (user filenames) — see _tg_send_document.  Same safe fallback: never
+    # restore the raw filename if sanitization empties it.
+    filename = _sanitize_outbound(filename) or "file"
+    caption = _sanitize_outbound(caption)
     data: dict[str, Any] = {
         "chat_id": str(chat_id),
         "document": document_file_id,
@@ -397,7 +424,10 @@ def _tg_send_message(
 ):
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": str(chat_id), "text": text}
+    # Sanitize-on-send: ``text`` may embed third-party content (filenames,
+    # error strings, user details) — a corrupted surrogate would crash the
+    # send-layer URL-encoding with "surrogates not allowed".
+    data = {"chat_id": str(chat_id), "text": _sanitize_outbound(text) or ""}
     if reply_markup is not None:
         # The Bot API expects reply_markup as a JSON-serialized form value;
         # passing the dict raw makes requests urlencode it as a mangled
@@ -475,7 +505,8 @@ def _tg_edit_message_text(
         data = {
             "chat_id": str(chat_id),
             "message_id": message_id,
-            "text": text,
+            # Sanitize-on-send: edited text can embed third-party content.
+            "text": _sanitize_outbound(text) or "",
             "parse_mode": parse_mode,
         }
         if reply_markup is not None:

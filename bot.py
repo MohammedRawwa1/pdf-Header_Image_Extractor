@@ -84,6 +84,7 @@ from tools import (  # noqa: E402
     thumbnail_is_usable,
 )
 from utils.bigfile_pipeline import BigFilePipeline  # noqa: E402
+from utils.cache_cleanup import run_cache_clear  # noqa: E402
 from utils.ebook_converter import (  # noqa: E402
     calibre_available,
     conversion_targets_for,
@@ -115,7 +116,10 @@ from utils.rate_limiter import (  # noqa: E402
     RedisSlidingWindowRateLimiter,
     telegram_api_limiter,  # shared singleton (bot.py + progress tracker)
 )
-from utils.redis_client import get_sync_redis  # noqa: E402
+from utils.redis_client import (  # noqa: E402
+    get_sync_redis,
+    get_sync_redis_raw,
+)
 from utils.session_healthcheck import (  # noqa: E402
     get_session_healthchecker,
     source_label,
@@ -2258,15 +2262,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /clearflood — reset a stuck login flow\n"
         "• /cancel — cancel an active login flow\n\n"
         "📦 Jobs\n"
-        "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n"
-        "• /cancelall — cancel all of your jobs (asks for confirmation)\n\n"
+        "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n\n"
         "🗂 Batch\n"
         "• /startbatch — start collecting forwarded files\n"
         "• /endbatch — process the collected batch\n"
         "• /cancelbatch — discard the collected batch\n\n"
-        "⚙️ Admin / owner\n"
-        "• /admin add|remove|list <user_id> — manage allowed users\n"
+        "⚙️ Admin / owner — these commands are restricted\n"
+        "• /admin add|remove|list <user_id> — manage allowed users "
+        "(admin)\n"
         "• /sessionstatus — userbot session health (owner)\n"
+        "• /clear_cache — wipe cached results, leftovers & thumbnails "
+        "(admin)\n"
+        "• /cancelall — cancel ALL queued/running jobs (admin, asks to "
+        "confirm)\n"
         "• /setwebhook <url> — set webhook (owner)\n"
         "• /delwebhook — delete webhook (owner)\n"
         "• /setcommands — push this list to Telegram (owner)\n\n"
@@ -2374,7 +2382,7 @@ def _cancel_all_kb() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "\U0001f5d1 Cancel all my jobs", callback_data="cancelall"
+                    "\U0001f5d1 Cancel all jobs", callback_data="cancelall"
                 )
             ]
         ]
@@ -2388,17 +2396,21 @@ def _cancel_status_reply(
 
     Shared by the /cancelall and /canceljob confirm flows so a successful
     cancel shows the updated job list instead of a one-line confirmation.
-    The cancel-all button is re-attached when the caller still has
-    queued/running jobs; ``None`` is returned otherwise. Callers that EDIT a
-    message must substitute an empty keyboard for ``None`` — Telegram keeps
-    the existing inline keyboard when ``reply_markup`` is omitted, so plain
-    ``None`` would leave stale confirmation buttons behind. New replies can
-    pass ``None`` as-is (never send an empty keyboard on sendMessage: it
+    The cancel-all button (admin-only) is re-attached when the caller still
+    has queued/running jobs; ``None`` is returned otherwise. Callers that
+    EDIT a message must substitute an empty keyboard for ``None`` — Telegram
+    keeps the existing inline keyboard when ``reply_markup`` is omitted, so
+    plain ``None`` would leave stale confirmation buttons behind. New replies
+    can pass ``None`` as-is (never send an empty keyboard on sendMessage: it
     serializes to ``{}``, which Telegram rejects for a required field).
     """
     summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
     text = header + "\n\n" + summary
-    kb = _cancel_all_kb() if has_jobs else None
+    kb = (
+        _cancel_all_kb()
+        if has_jobs and config.is_admin_user(uid)
+        else None
+    )
     return text, kb
 
 # ── Token-based pending-action state ───────────────────────────────────
@@ -2902,8 +2914,11 @@ async def cmd_status(
     # Falls back to "Bot: active" if Redis is unreachable.
     summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
     if has_jobs:
+        # The queue-wide cancel button is admin-only: only attach it for
+        # admins (the confirm flow itself also enforces the admin gate).
+        _kb = _cancel_all_kb() if config.is_admin_user(uid) else None
         await update.effective_message.reply_text(
-            summary, reply_markup=_cancel_all_kb(), parse_mode="Markdown"
+            summary, reply_markup=_kb, parse_mode="Markdown"
         )
     else:
         await update.effective_message.reply_text(
@@ -2978,7 +2993,7 @@ async def cmd_setwebhook(
         )
         await update.effective_message.reply_text(
             f"Webhook set to {full_url}\n"
-            f"\ud83d\udd12 CSRF protection enabled (secret token configured)"
+            f"\U0001f512 CSRF protection enabled (secret token configured)"
         )
     except Exception:
         logger.exception("Failed to set webhook")
@@ -3031,12 +3046,15 @@ async def cmd_setcommands(
         BotCommand("logoutpyro", "Logout your Pyrogram session"),
         BotCommand("clearflood", "Clear an active login flow"),
         BotCommand("admin", "Manage allowed users"),
+        BotCommand(
+            "clear_cache", "(admin) Clear cached results & thumbnails"
+        ),
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
         BotCommand("ocr", "Set OCR output default (pdf/txt/picker)"),
         BotCommand("canceljob", "Cancel a job (asks to confirm)"),
-        BotCommand("cancelall", "Cancel all of your jobs"),
+        BotCommand("cancelall", "(admin) Cancel all queued jobs"),
         BotCommand("cancel", "Cancel an active login flow"),
         BotCommand("setcommands", "(owner) Update the command list"),
         BotCommand("sessionstatus", "(owner) Check userbot session health"),
@@ -3647,6 +3665,205 @@ async def cmd_admin(
     await update.message.reply_text("Unknown admin command")
 
 
+# ── Admin: /clear_cache (cached results, leftovers & thumbnails) ──
+
+
+def _format_clearcache_result(res: dict) -> str:
+    """Human-readable summary of a ``run_cache_clear`` result dict."""
+    r = res.get("redis", {})
+    f = res.get("files", {})
+    lines = ["\u2705 Cache cleared"]
+    deleted = r.get("deleted", 0) or 0
+    skipped = r.get("skipped_live", 0) or 0
+    lines.append(
+        f"\u2022 Redis: {deleted:,} key(s) removed"
+        + (f" \u00b7 {skipped:,} live-job key(s) kept" if skipped else "")
+    )
+    keys_before = r.get("keys_before")
+    keys_after = r.get("keys_after")
+    if keys_before is not None and keys_after is not None:
+        lines.append(f"  cache keys: {keys_before:,} \u2192 {keys_after:,}")
+    freed = f.get("freed_bytes", 0) or 0
+    lines.append(
+        f"\u2022 Files: {f.get('deleted_files', 0):,} deleted / "
+        f"{_format_size(freed) or '0 B'}"
+    )
+    for name in ("thumbnails", "temp", "input", "output"):
+        by_dir = f.get("by_dir", {}).get(name)
+        if by_dir:
+            lines.append(
+                f"  {name}: {by_dir.get('files', 0):,} / "
+                f"{_format_size(by_dir.get('bytes', 0)) or '0 B'}"
+            )
+    lines.append(
+        "\nQueued & running jobs were left untouched. "
+        "You can run /clear_cache again anytime."
+    )
+    return "\n".join(lines)
+
+
+async def _run_clearcache(update: Update) -> None:
+    """Run the cache clear on a worker thread and report the result."""
+    try:
+        result = await asyncio.to_thread(run_cache_clear)
+    except Exception:
+        logger.exception("clear_cache failed")
+        try:
+            await update.effective_message.reply_text(
+                "\u274c Cache clear failed \u2014 check the logs."
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    try:
+        await update.effective_message.reply_text(
+            _format_clearcache_result(result)
+        )
+    except Exception:
+        logger.exception("clear_cache: failed to send result")
+
+
+async def cmd_clearcache(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Clear cached results, job leftovers and cached files (admin only)."""
+    await _track_user_session(update, "/clear_cache")
+    if not config.is_admin_user(getattr(update.effective_user, "id", None)):
+        await update.effective_message.reply_text(
+            "Unauthorized: admin only"
+        )
+        return
+    uid = getattr(update.effective_user, "id", None)
+    args = context.args if hasattr(context, "args") else []
+    if args and args[0].strip().lower() == "confirm":
+        await _run_clearcache(update)
+        return
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "\U0001f5d1\ufe0f Yes, clear caches",
+                    callback_data=f"clearcache_confirm:{uid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "\u274c No", callback_data=f"clearcache_abort:{uid}"
+                )
+            ],
+        ]
+    )
+    try:
+        await update.effective_message.reply_text(
+            "\U0001f9f9 Clear all caches?\n\n"
+            "This wipes:\n"
+            "\u2022 Redis caches \u2014 re-send/dedup records, pdfcheck, "
+            "file/session caches, pending menus, batch state\n"
+            "\u2022 Job leftovers \u2014 progress / io / cancel / pipeline "
+            "bookkeeping (only finished jobs; active jobs are preserved)\n"
+            "\u2022 Cached files \u2014 thumbnails, temp, input, output "
+            "folders (skipping files in use by active jobs)\n\n"
+            "Queued & running jobs are NOT cancelled.\n"
+            "Reply with /clear_cache confirm, or tap the button below.",
+            reply_markup=confirm_kb,
+        )
+    except Exception:
+        logger.exception("clear_cache: failed to show confirmation")
+
+
+async def handle_clearcache_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Second tap: actually clear the caches (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        armer = int(str(query.data).split(":", 1)[1])
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can confirm.", show_alert=True
+        )
+        return
+    try:
+        await query.answer()
+    except Exception:  # nosec B110
+        pass
+    try:
+        await query.edit_message_text("\U0001f9f9 Clearing caches\u2026")
+    except Exception:  # nosec B110
+        pass
+    try:
+        result = await asyncio.to_thread(run_cache_clear)
+    except Exception:
+        logger.exception("clear_cache failed")
+        try:
+            await query.edit_message_text(
+                "\u274c Cache clear failed \u2014 check the logs."
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    try:
+        await query.edit_message_text(_format_clearcache_result(result))
+    except Exception:
+        logger.exception("clear_cache: failed to report result")
+
+
+async def handle_clearcache_abort_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Second tap on \"No\": keep everything (same-user only)."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(query.from_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await query.answer("Access denied", show_alert=True)
+        return
+    try:
+        armer = int(str(query.data).split(":", 1)[1])
+    except Exception:
+        await query.answer("Invalid confirmation", show_alert=True)
+        return
+    if uid != armer:
+        await query.answer(
+            "Only the person who started this can abort it.",
+            show_alert=True,
+        )
+        return
+    try:
+        await query.answer()
+        await query.edit_message_text(
+            "Cache clear aborted \u2014 nothing was changed."
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_clearcache_stale_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Old unsuffixed buttons from before the same-user binding."""
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer(
+            "This button is outdated \u2014 run /clear_cache instead",
+            show_alert=True,
+        )
+    except Exception:  # nosec B110
+        pass
+
+
 async def cmd_clearflood(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -3998,7 +4215,8 @@ def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
         #    pdf:job:<id> hash (user_id stored by enqueue_job) and set the
         #    cancel flag so the worker's mid-flight checks abort it.  Terminal
         #    statuses and an already-set cancel flag mean nothing NEW to cancel.
-        if not removed and user_id is not None:
+        #    ``user_id=None`` (admin /cancelall) bypasses the ownership gate.
+        if not removed:
             try:
                 h = r.hgetall(f"pdf:job:{job_id}") or {}
             except Exception:  # nosec B110
@@ -4009,7 +4227,7 @@ def _cancel_pipeline_job(job_id: str, user_id: int | None) -> bool:
                 howner = h.get("user_id") or h.get(b"user_id") or ""
                 if isinstance(howner, bytes):
                     howner = howner.decode()
-                if str(howner) == str(user_id):
+                if user_id is None or str(howner) == str(user_id):
                     try:
                         r.hset(f"pdf:job:{job_id}", mapping={"cancel": "1"})
                         flag_set = True
@@ -4251,86 +4469,177 @@ async def cmd_canceljob(
     )
 
 
-async def _cancel_all_for(
-    uid: int | None, chat_id: int | None
-) -> tuple[int, int, int]:
-    """Cancel all of a user's jobs; returns (progress, RQ, pipeline) counts.
+async def _cancel_all_stalled() -> tuple[int, int, int]:
+    """Cancel ALL queued/in-flight jobs across both pipelines (admin only).
 
-    Only touches jobs owned by the caller: progress tasks by user_id, RQ jobs
-    by chat + user, and pipeline jobs by user_id — the same isolation as
-    /canceljob.
+    Admin /cancelall: unlike the old per-user ``_cancel_all_for``, the
+    ownership gates are bypassed (``user_id=None`` / ``chat_id=None``) so the
+    ENTIRE queue is cleared — every user's progress tasks, RQ jobs (queued +
+    in-flight + scheduled/deferred) and BigFile pipeline jobs (queued +
+    in-flight).  Each job goes through the same machinery as /canceljob:
+    cancel flags the worker honours mid-flight, registry cleanup, and
+    Queued-message removal.
+
+    Returns (progress, RQ, pipeline) counts.
     """
     tasks_cancelled = 0
     rq_cancelled = 0
     pipe_cancelled = 0
     cleaned: list[str] = []
 
-    # 1) Inline progress tasks owned by this user
+    # 1) Progress tasks — every user, in-memory + Redis.
+    cancelled_tids: set[str] = set()
     try:
-        task_ids = [
-            tid
-            for tid, t in progress_tracker.tasks.items()
-            if getattr(t, "user_id", None) == uid
-        ]
-        try:
-            r = get_sync_redis()
-            if r:
-                for key in r.scan_iter(
-                    f"{progress_tracker.PREFIX_PROGRESS}*", count=100
-                ):
-                    k = key.decode() if isinstance(key, bytes) else key
-                    tid = k[len(progress_tracker.PREFIX_PROGRESS):]
-                    if tid not in task_ids:
-                        t = progress_tracker.get_task(tid)
-                        if t is not None and getattr(t, "user_id", None) == uid:
-                            task_ids.append(tid)
-        except Exception:  # nosec B110 - Redis fallback is best-effort
-            pass
-        for tid in task_ids:
+        for tid in list(progress_tracker.tasks.keys()):
             if await progress_tracker.cancel_task(tid):
                 tasks_cancelled += 1
+                cancelled_tids.add(tid)
+        r = get_sync_redis()
+        if r:
+            for key in r.scan_iter(
+                f"{progress_tracker.PREFIX_PROGRESS}*", count=100
+            ):
+                k = key.decode() if isinstance(key, bytes) else key
+                tid = k[len(progress_tracker.PREFIX_PROGRESS):]
+                # Skip tasks the in-memory loop already cancelled (their
+                # Redis record may still exist) and stale orphans with no
+                # task record at all.
+                if tid in cancelled_tids or tid in progress_tracker.tasks:
+                    continue
+                t = progress_tracker.get_task(tid)
+                if t is not None:
+                    if await progress_tracker.cancel_task(tid):
+                        tasks_cancelled += 1
+                        cancelled_tids.add(tid)
     except Exception:
         logger.exception("cancelall: progress-task cancellation failed")
 
-    # 2) RQ jobs (queued + started) from the caller's chat
+    # 2) RQ jobs — queued + in-flight + scheduled/deferred, every user.
     try:
-        from utils.redis_client import get_sync_redis_raw
-
         r = get_sync_redis_raw()
         if r:
-            candidates = []
-            for m in r.lrange("rq:queue:default", 0, -1):
-                candidates.append(m.decode() if isinstance(m, bytes) else str(m))
-            for m, _ in r.zrange("rq:wip:default", 0, -1, withscores=True):
-                candidates.append(m.decode() if isinstance(m, bytes) else str(m))
+            candidates: list[str] = []
+            for key in r.keys("rq:queue:*"):
+                for m in r.lrange(key, 0, -1):
+                    candidates.append(
+                        m.decode() if isinstance(m, bytes) else str(m)
+                    )
+            for key in (
+                r.keys("rq:wip:*")
+                + r.keys("rq:started:*")
+                + r.keys("rq:scheduled:*")
+                + r.keys("rq:deferred:*")
+            ):
+                for m, _score in r.zrange(key, 0, -1, withscores=True):
+                    candidates.append(
+                        m.decode() if isinstance(m, bytes) else str(m)
+                    )
+            seen: set[str] = set()
             for cid in candidates:
-                if await asyncio.to_thread(
-                    _cancel_rq_job, cid, chat_id, uid
-                ):
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                # None ownership bypasses the chat/user gates.
+                _full = await asyncio.to_thread(
+                    _cancel_rq_job, cid, None, None
+                )
+                if _full:
                     rq_cancelled += 1
-                    cleaned.append(cid)
+                    cleaned.append(_full)
     except Exception:
-        logger.exception("cancelall: RQ job cancellation failed")
+        logger.exception("cancelall: RQ cancellation failed")
 
-    # 3) BigFilePipeline jobs owned by this user
+    # 3) BigFilePipeline jobs — queued + in-flight, every user.
     try:
-        from utils.job_queue import JOB_LIST
+        from utils.cache_cleanup import PIPELINE_TERMINAL_STATUSES
+        from utils.job_queue import DELAYED_SET, JOB_LIST
 
         r = get_sync_redis()
         if r:
-            for item in r.lrange(JOB_LIST, 0, -1):
-                raw = item.decode() if isinstance(item, bytes) else item
+            # Queued: every entry in the pdf:jobs list + pdf:delayed zset.
+            pipe_ids: set[str] = set()
+            delayed_ids: set[str] = set()
+            for key in (JOB_LIST, DELAYED_SET):
                 try:
-                    d = json.loads(raw)
-                except Exception:  # nosec B112 - skip non-JSON entries
+                    _type = r.type(key)
+                    if isinstance(_type, bytes):
+                        _type = _type.decode()
+                    _type = str(_type)
+                except Exception:
+                    _type = ""
+                try:
+                    if _type == "list":
+                        items = r.lrange(key, 0, -1)
+                    elif _type == "zset":
+                        items = r.zrange(key, 0, -1)
+                    else:
+                        items = []
+                except Exception:
+                    items = []
+                for item in items:
+                    raw = item.decode() if isinstance(item, bytes) else item
+                    try:
+                        d = json.loads(raw)
+                    except Exception:  # nosec B112 - skip non-JSON entries
+                        continue
+                    _jid = str(d.get("job_id") or "")
+                    if _jid:
+                        pipe_ids.add(_jid)
+                    if _type == "zset":
+                        # Delayed jobs are cancelled by removing their entry
+                        # (they will never be promoted); flag the metadata
+                        # hash too so the job reads as cancelled.
+                        delayed_ids.add(_jid)
+                        try:
+                            r.zrem(key, item)
+                        except Exception:  # nosec B110
+                            pass
+                        if _jid:
+                            pipe_cancelled += 1
+                            cleaned.append(_jid)
+                            try:
+                                r.hset(
+                                    f"pdf:job:{_jid}",
+                                    mapping={"cancel": "1"},
+                                )
+                            except Exception:  # nosec B110
+                                pass
+            for _jid in pipe_ids:
+                # Delayed entries are fully handled above (zrem + flag); the
+                # generic cancel below would only re-set the same flag.
+                if _jid in delayed_ids:
                     continue
-                if d.get("user_id") == uid and d.get("job_id"):
-                    _jid = str(d["job_id"])
-                    if _cancel_pipeline_job(_jid, uid):
+                if _cancel_pipeline_job(_jid, None):
+                    pipe_cancelled += 1
+                    cleaned.append(_jid)
+            # In-flight: the worker popped the queue entry, so only the
+            # pdf:job:<id> hash remains (non-terminal status).
+            try:
+                for key in r.scan_iter("pdf:job:*", count=200):
+                    k = key.decode() if isinstance(key, bytes) else key
+                    _jid = k[len("pdf:job:"):]
+                    if not _jid or _jid in pipe_ids:
+                        continue
+                    try:
+                        h = r.hgetall(key) or {}
+                    except Exception:  # nosec B110
+                        h = {}
+                    if not h:
+                        continue
+                    _status = h.get("status") or h.get(b"status") or ""
+                    if isinstance(_status, bytes):
+                        _status = _status.decode()
+                    if _status in PIPELINE_TERMINAL_STATUSES:
+                        continue
+                    if _cancel_pipeline_job(_jid, None):
                         pipe_cancelled += 1
                         cleaned.append(_jid)
+            except Exception:
+                logger.debug(
+                    "cancelall: pipeline in-flight scan failed", exc_info=True
+                )
     except Exception:
-        logger.exception("cancelall: pipeline job cancellation failed")
+        logger.exception("cancelall: pipeline cancellation failed")
 
     # Mirror cmd_canceljob's per-job cleanup: delete the "Queued..."
     # confirmation FIRST (the wipe would remove the queued_msg:<id> record
@@ -4356,19 +4665,19 @@ async def _cancel_all_for(
 async def cmd_cancelall(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Cancel ALL of the caller's queued/running jobs (progress, RQ, pipeline).
+    """Cancel ALL queued/in-flight jobs in both pipelines (admin only).
 
-    Requires an explicit ``/cancelall confirm`` so an accidental tap can't
-    wipe every job at once.
+    Clears the whole queue — every user's progress tasks, RQ jobs and
+    BigFile pipeline jobs.  Requires an explicit ``/cancelall confirm`` so
+    an accidental tap can't wipe every job at once.
     """
     await _track_user_session(update, "/cancelall")
-    if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
+    if not config.is_admin_user(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            "Unauthorized: admin only"
         )
         return
     uid = getattr(update.effective_user, "id", None)
-    chat_id = update.effective_chat.id if update.effective_chat else None
     args = context.args if hasattr(context, "args") else []
     if not (args and args[0].strip().lower() == "confirm"):
         confirm_kb = InlineKeyboardMarkup(
@@ -4382,14 +4691,14 @@ async def cmd_cancelall(
             ]
         )
         await update.effective_message.reply_text(
-            "⚠️ This will cancel ALL of your own queued/running jobs "
+            "⚠️ This will cancel ALL queued/running jobs for ALL users "
             "(documents, batches, URL jobs, and large-file pipeline jobs).\n\n"
             "Reply with /cancelall confirm, or tap the button below.",
             reply_markup=confirm_kb,
         )
         return
-    tasks_cancelled, rq_cancelled, pipe_cancelled = await _cancel_all_for(
-        uid, chat_id
+    tasks_cancelled, rq_cancelled, pipe_cancelled = (
+        await _cancel_all_stalled()
     )
     total = tasks_cancelled + rq_cancelled + pipe_cancelled
     if total:
@@ -4401,11 +4710,11 @@ async def cmd_cancelall(
         if tasks_cancelled:
             bits.append(f"{tasks_cancelled} progress")
         await update.effective_message.reply_text(
-            f"✅ Cancelled {total} of your job(s): " + ", ".join(bits) + "."
+            f"✅ Cancelled {total} job(s): " + ", ".join(bits) + "."
         )
     else:
         await update.effective_message.reply_text(
-            "✅ Nothing to cancel \u2014 you have no queued/running jobs."
+            "✅ Nothing to cancel \u2014 the queue is empty."
         )
 
 
@@ -4417,8 +4726,8 @@ async def handle_cancelall_callback(
     if query is None:
         return
     uid = getattr(query.from_user, "id", None)
-    if not config.is_user_allowed(uid):
-        await query.answer("Access denied", show_alert=True)
+    if not config.is_admin_user(uid):
+        await query.answer("Admin only", show_alert=True)
         return
     try:
         await query.answer()
@@ -4440,7 +4749,7 @@ async def handle_cancelall_callback(
     )
     try:
         await query.edit_message_text(
-            "⚠️ Cancel ALL of your own queued/running jobs?",
+            "⚠️ Cancel ALL queued/running jobs for ALL users?",
             reply_markup=confirm_kb,
         )
     except Exception:
@@ -4450,13 +4759,13 @@ async def handle_cancelall_callback(
 async def handle_cancelall_confirm_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Second tap: actually cancel all of the armer's jobs (same-user only)."""
+    """Second tap: actually cancel the whole queue (admin, same-user only)."""
     query = update.callback_query
     if query is None:
         return
     uid = getattr(query.from_user, "id", None)
-    if not config.is_user_allowed(uid):
-        await query.answer("Access denied", show_alert=True)
+    if not config.is_admin_user(uid):
+        await query.answer("Admin only", show_alert=True)
         return
     try:
         armer = int(str(query.data).split(":", 1)[1])
@@ -4475,10 +4784,9 @@ async def handle_cancelall_confirm_callback(
     except Exception:  # nosec B110
         pass
     await _track_user_session(update, "/cancelall")
-    chat_id = query.message.chat.id if query.message else None
     try:
-        tasks_cancelled, rq_cancelled, pipe_cancelled = await _cancel_all_for(
-            uid, chat_id
+        tasks_cancelled, rq_cancelled, pipe_cancelled = (
+            await _cancel_all_stalled()
         )
     except Exception:
         logger.exception("cancelall: confirm-callback cancellation failed")
@@ -4489,7 +4797,7 @@ async def handle_cancelall_confirm_callback(
         return
     total = tasks_cancelled + rq_cancelled + pipe_cancelled
     header = (
-        f"✅ Cancelled {total} of your job(s)."
+        f"✅ Cancelled {total} job(s)."
         if total
         else "✅ Nothing was cancelled."
     )
@@ -4527,13 +4835,13 @@ async def handle_cancelall_stale_callback(
 async def handle_cancelall_abort_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Second tap on the confirmation: keep everything (same-user only)."""
+    """Second tap on the confirmation: keep everything (admin, same-user)."""
     query = update.callback_query
     if query is None:
         return
     uid = getattr(query.from_user, "id", None)
-    if not config.is_user_allowed(uid):
-        await query.answer("Access denied", show_alert=True)
+    if not config.is_admin_user(uid):
+        await query.answer("Admin only", show_alert=True)
         return
     try:
         armer = int(str(query.data).split(":", 1)[1])
@@ -6187,6 +6495,27 @@ application.add_handler(
 application.add_handler(
     CallbackQueryHandler(
         handle_cancelall_abort_callback, pattern=r"^cancelall_abort:\d+$"
+    )
+)
+# /clear_cache confirmation buttons (same-user bound, id in callback data).
+application.add_handler(CommandHandler("clear_cache", cmd_clearcache))
+application.add_handler(
+    CallbackQueryHandler(
+        handle_clearcache_confirm_callback,
+        pattern=r"^clearcache_confirm:\d+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_clearcache_abort_callback,
+        pattern=r"^clearcache_abort:\d+$",
+    )
+)
+# Legacy unsuffixed buttons (pre same-user binding) — tell the user what to do.
+application.add_handler(
+    CallbackQueryHandler(
+        handle_clearcache_stale_callback,
+        pattern=r"^clearcache_(confirm|abort)$",
     )
 )
 # Legacy unsuffixed buttons (pre same-user binding) — tell the user what to do.

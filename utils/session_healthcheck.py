@@ -30,6 +30,7 @@ import os
 import time
 
 from utils.markdown_utils import safe_code_span as _safe_code_span
+from utils.markdown_utils import sanitize_text  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +327,7 @@ class SessionHealthChecker:
             if now - self._last_advisory_time > self._min_advisory_interval:
                 self._last_advisory_time = now
                 lines = [
-                    "\ud83d\udea8 *Persistent session failures detected*",
+                    "\U0001f6a8 *Persistent session failures detected*",
                     f"Pyrogram failures: {self._pyrogram_failures}",
                     f"Telethon failures: {self._telethon_failures}",
                     "",
@@ -959,9 +960,9 @@ class SessionHealthChecker:
         ]
         phone = self._mask_phone(result.get("phone"))
         if phone:
-            lines.append(f"\ud83d\udcf1 Phone: `{phone}`")
+            lines.append(f"\U0001f4f1 Phone: `{phone}`")
         if result.get("dc_id"):
-            lines.append(f"\ud83d\udda5 DC: `{result['dc_id']}`")
+            lines.append(f"\U0001f5a5 DC: `{result['dc_id']}`")
         lines.extend(
             [
                 "",
@@ -982,7 +983,7 @@ class SessionHealthChecker:
         try:
             await self.bot_app.bot.send_message(
                 chat_id=self.admin_user_id,
-                text=text,
+                text=sanitize_text(text),
                 parse_mode="Markdown",
             )
         except Exception as exc:
@@ -996,11 +997,11 @@ class SessionHealthChecker:
     def format_status_text(self) -> str:
         """Return a human-readable Markdown string of the last health results."""
         if not self.last_health:
-            return (
-                "\ud83e\ude7a *Session Health* \u2014 No checks have run yet."
+            return sanitize_text(
+                "\U0001fa7a *Session Health* \u2014 No checks have run yet."
             )
 
-        lines = ["\ud83e\ude7a *Session Health Report*\n"]
+        lines = ["\U0001fa7a *Session Health Report*\n"]
         for name in ("pyrogram", "telethon"):
             r = self.last_health.get(name)
             if r is None:
@@ -1024,13 +1025,13 @@ class SessionHealthChecker:
             lines.append("")
 
         lines.append(
-            "\ud83d\udd04 Check interval: `{}s`\n"
-            "\ud83d\udd14 Admin alerts: `{}`".format(
+            "\U0001f504 Check interval: `{}s`\n"
+            "\U0001f514 Admin alerts: `{}`".format(
                 self.check_interval,
                 "Enabled" if self.admin_user_id else "Disabled",
             )
         )
-        return "\n".join(lines)
+        return sanitize_text("\n".join(lines))
 
 
 # ──────────────────────────────────────────────────────────────────────
