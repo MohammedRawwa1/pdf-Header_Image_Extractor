@@ -237,6 +237,24 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             e,
         )
 
+    # Final fallback: scan recent dialogs for the peer.  The bot the user DMs
+    # shows up here with its access_hash, which get_chat/get_users above may
+    # not resolve for an account that has never synced the peer's cache.
+    try:
+        _dialogs = await client.get_dialogs(limit=200)
+        for _d in _dialogs:
+            _chat = getattr(_d, "chat", None)
+            if _chat is not None and getattr(_chat, "id", None) == peer_id:
+                logger.info(
+                    "resolve_pyrogram_peer: found %s via dialog scan",
+                    peer_id,
+                )
+                return getattr(_chat, "id", None) or peer_id
+    except Exception as e:
+        logger.debug(
+            "resolve_pyrogram_peer: dialog scan failed: %s", e
+        )
+
     # Could not resolve; return original ID (get_messages will fail gracefully)
     logger.info(
         "resolve_pyrogram_peer: could not resolve %s, will try as-is",
@@ -697,6 +715,49 @@ async def _resolve_telethon_entity(client, chat_id: int | str):
     return None
 
 
+async def _resolve_bot_entity(client):
+    """Resolve the bot's user entity so the userbot can read the bot DM.
+
+    ``client.get_entity(bot_user_id)`` fails with "Could not find the input
+    entity" when the session has never cached the bot (no access hash) —
+    exactly what the production log shows for big-file downloads.  The
+    userbot HAS an active DM with the bot (that's where the file lives), so
+    a dialog scan reliably finds it; an optional ``BOT_USERNAME`` env is the
+    last resort.
+    """
+    bot_user_id = _get_bot_user_id()
+    if bot_user_id is None:
+        return None
+    # 1) Cached entity (session already knows the bot)
+    try:
+        entity = await client.get_entity(bot_user_id)
+        if entity is not None:
+            return entity
+    except Exception:  # nosec B110 - fall through to dialog scan
+        pass
+    # 2) Dialog scan: the DM with the bot is an active dialog for the userbot
+    try:
+        async for dialog in client.iter_dialogs(limit=300):
+            ent = getattr(dialog, "entity", None)
+            if ent is not None and getattr(ent, "id", None) == bot_user_id:
+                logger.info(
+                    "userbot: resolved bot entity %s via dialog scan",
+                    bot_user_id,
+                )
+                return ent
+    except Exception:  # nosec B110
+        pass
+    # 3) Username resolution (BOT_USERNAME env, optional but most reliable)
+    _username = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+    if _username:
+        try:
+            return await client.get_entity(_username)
+        except Exception:  # nosec B110
+            pass
+    logger.warning("userbot: could not resolve bot entity %s", bot_user_id)
+    return None
+
+
 async def _download_with_telethon(
     chat_id: int | str,
     message_id: int,
@@ -791,29 +852,34 @@ async def _download_with_telethon(
                 msgs = None
 
         # ── DM fallback: Bot API chat_id maps to user ID in DMs, but MTProto
-        # needs the **bot's** user ID.  Try resolving the bot from BOT_TOKEN.
+        # needs the **bot's** user ID.  Try resolving the bot — via the cached
+        # entity, a DIALOG SCAN (the userbot has the DM with the bot in its
+        # dialog list), or the BOT_USERNAME env — so get_messages can read the
+        # bot DM.  A bare get_entity(bot_id) fails here when the session has
+        # never cached the bot (no access hash), which silently killed every
+        # big-file DM download before this resolver existed.
         if msgs is None and _is_user_dm_chat(chat_id):
             bot_user_id = _get_bot_user_id()
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
-                try:
-                    logger.info(
-                        "userbot: DM chat detected (chat_id=%s), trying bot entity (bot_id=%s)",
-                        chat_id,
-                        bot_user_id,
-                    )
-                    bot_entity = await client.get_entity(bot_user_id)
-                    if bot_entity is not None:
+                logger.info(
+                    "userbot: DM chat detected (chat_id=%s), resolving bot entity (bot_id=%s)",
+                    chat_id,
+                    bot_user_id,
+                )
+                bot_entity = await _resolve_bot_entity(client)
+                if bot_entity is not None:
+                    try:
                         logger.info(
                             "userbot: resolved bot entity, trying get_messages from bot DM"
                         )
                         msgs = await client.get_messages(
                             bot_entity, ids=message_id
                         )
-                except Exception as e:
-                    logger.warning(
-                        "userbot: bot entity resolution failed: %s", e
-                    )
-                    msgs = None
+                    except Exception as e:
+                        logger.warning(
+                            "userbot: get_messages from bot DM failed: %s", e
+                        )
+                        msgs = None
 
         if msgs:
             msg = msgs[0] if isinstance(msgs, (list, tuple)) else msgs
@@ -901,58 +967,39 @@ async def _download_with_telethon(
                         )
                         await asyncio.sleep(2**attempt)
 
-        # Scan recent messages as fallback
+        # Scan recent messages as fallback.  GUARD: in a Bot API DM the
+        # ``chat_id`` IS the user's own ID, so a scan of ``target`` would
+        # iterate the userbot's Saved Messages and download an UNRELATED
+        # file — skip the scan in that case (the bot-DM path above is the
+        # correct route for DMs).  A successful scan still counts as success.
+        _self_id = getattr(client, "_self_id", None)
+        if _self_id is None:
+            try:
+                _me = await client.get_me()
+                _self_id = getattr(_me, "id", None)
+            except Exception:  # nosec B110
+                pass
+        _target_is_self = False
         try:
-            async for m in client.iter_messages(target, limit=200):
-                if total_attempts > MAX_TOTAL_ATTEMPTS:
-                    logger.warning(
-                        "userbot: hit max total attempts (%d), giving up scan-fallback",
-                        MAX_TOTAL_ATTEMPTS,
-                    )
-                    break
-                if getattr(m, "media", None):
-                    for attempt in range(3):
-                        total_attempts += 1
-                        if total_attempts > MAX_TOTAL_ATTEMPTS:
-                            logger.warning(
-                                "userbot: hit max total attempts (%d), giving up scan-fallback",
-                                MAX_TOTAL_ATTEMPTS,
-                            )
-                            break
-                        try:
-                            kwargs = {
-                                "file": dest_path,
-                                "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
-                            }
-                            if progress_callback is not None:
-                                kwargs["progress_callback"] = progress_callback
-                            # Wrap in asyncio.wait_for to enforce total-download timeout
-                            await asyncio.wait_for(
-                                _download_media_with_part_size(client, m, **kwargs),
-                                timeout=DOWNLOAD_TOTAL_TIMEOUT,
-                            )
-                            if (
-                                os.path.exists(dest_path)
-                                and os.path.getsize(dest_path) > 0
-                            ):
-                                if _is_likely_pdf(
-                                    dest_path
-                                ) and not _validate_downloaded_pdf(dest_path):
-                                    logger.warning(
-                                        "userbot: scan-fallback downloaded PDF is corrupted/invalid, removing",
-                                    )
-                                    try:
-                                        os.remove(dest_path)
-                                    except Exception:  # nosec B110
-                                        pass
-                                    await asyncio.sleep(2**attempt)
-                                    continue
-                                return True
-                            await asyncio.sleep(2**attempt)
-                        except Exception:
-                            await asyncio.sleep(2**attempt)
-        except Exception:  # nosec B110
+            _target_is_self = (
+                _self_id is not None
+                and str(abs(int(target))) == str(abs(int(_self_id)))
+            )
+        except (TypeError, ValueError):  # nosec B110 - non-numeric target
             pass
+        if _target_is_self:
+            logger.warning(
+                "userbot: scan target %s is the userbot's own account; "
+                "skipping Saved Messages scan (would download the wrong file)",
+                target,
+            )
+        else:
+            _scan_ok = await _scan_fallback_download(
+                client, target, dest_path, progress_callback,
+                MAX_TOTAL_ATTEMPTS, DOWNLOAD_TOTAL_TIMEOUT,
+            )
+            if _scan_ok:
+                return True
 
         logger.warning(
             "userbot: Telethon download failed after %d attempts (chat=%s msg=%s)",
@@ -966,6 +1013,77 @@ async def _download_with_telethon(
             await client.disconnect()
         except Exception:  # nosec B110
             pass
+
+
+async def _scan_fallback_download(
+    client,
+    target,
+    dest_path: str,
+    progress_callback: Callable[[int, int], None] | None,
+    max_attempts: int,
+    timeout: int,
+) -> bool:
+    """Scan recent messages of ``target`` and download the first media found.
+
+    Used as a last-resort fallback in :func:`_download_with_telethon` when
+    the exact message can't be fetched by id.  Returns True when a file was
+    actually downloaded to ``dest_path`` (callers must treat that as
+    success — a discarded result would waste a valid download).  Never
+    raises.
+    """
+    total_attempts = 0
+    try:
+        async for m in client.iter_messages(target, limit=200):
+            if total_attempts > max_attempts:
+                logger.warning(
+                    "userbot: hit max total attempts (%d), giving up scan-fallback",
+                    max_attempts,
+                )
+                break
+            if getattr(m, "media", None):
+                for attempt in range(3):
+                    total_attempts += 1
+                    if total_attempts > max_attempts:
+                        logger.warning(
+                            "userbot: hit max total attempts (%d), giving up scan-fallback",
+                            max_attempts,
+                        )
+                        break
+                    try:
+                        kwargs = {
+                            "file": dest_path,
+                            "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+                        }
+                        if progress_callback is not None:
+                            kwargs["progress_callback"] = progress_callback
+                        # Wrap in asyncio.wait_for to enforce total-download timeout
+                        await asyncio.wait_for(
+                            _download_media_with_part_size(client, m, **kwargs),
+                            timeout=timeout,
+                        )
+                        if (
+                            os.path.exists(dest_path)
+                            and os.path.getsize(dest_path) > 0
+                        ):
+                            if _is_likely_pdf(
+                                dest_path
+                            ) and not _validate_downloaded_pdf(dest_path):
+                                logger.warning(
+                                    "userbot: scan-fallback downloaded PDF is corrupted/invalid, removing",
+                                )
+                                try:
+                                    os.remove(dest_path)
+                                except Exception:  # nosec B110
+                                    pass
+                                await asyncio.sleep(2**attempt)
+                                continue
+                            return True
+                        await asyncio.sleep(2**attempt)
+                    except Exception:
+                        await asyncio.sleep(2**attempt)
+    except Exception:  # nosec B110
+        pass
+    return False
 
 
 async def _download_bytes_with_pyrogram(
@@ -1579,15 +1697,15 @@ async def download_bytes_via_userbot(
                         msgs = None
 
                     # ── DM fallback: try bot entity for in-memory download too
+                    # (via the same robust resolver — a bare get_entity(bot_id)
+                    # fails when the session never cached the bot).
                     if not msgs and _is_user_dm_chat(chat_id):
                         bot_user_id = _get_bot_user_id()
                         if bot_user_id is not None and bot_user_id != abs(
                             int(chat_id)
                         ):
                             try:
-                                bot_entity = await _client.get_entity(
-                                    bot_user_id
-                                )
+                                bot_entity = await _resolve_bot_entity(_client)
                                 if bot_entity is not None:
                                     logger.info(
                                         "userbot: in-memory DM fallback, trying bot entity %s",
