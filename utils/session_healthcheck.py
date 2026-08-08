@@ -29,6 +29,8 @@ import logging
 import os
 import time
 
+from utils.markdown_utils import safe_code_span as _safe_code_span
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -950,7 +952,10 @@ class SessionHealthChecker:
             "",
             f"{status_emoji} Status: `{'Alive' if result.get('alive') else 'Unhealthy'}`",
             f"\u23f1 Latency: `{result.get('latency_ms', 'N/A')} ms`",
-            f"\u26a0 Error: `{result.get('error', 'None')}`",
+            # Exception text can contain a literal backtick that would break
+            # the code span -- neutralize it (safe_code_span, not
+            # escape_markdown: _/* are safe inside backticks).
+            f"\u26a0 Error: `{_safe_code_span(result.get('error', 'None'))}`",
         ]
         phone = self._mask_phone(result.get("phone"))
         if phone:
@@ -1015,7 +1020,7 @@ class SessionHealthChecker:
             if r.get("dc_id"):
                 lines.append(f"   DC: `{r['dc_id']}`")
             if r.get("error"):
-                lines.append(f"   Error: `{r['error']}`")
+                lines.append(f"   Error: `{_safe_code_span(r['error'])}`")
             lines.append("")
 
         lines.append(

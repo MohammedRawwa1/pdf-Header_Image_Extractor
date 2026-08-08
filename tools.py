@@ -74,6 +74,19 @@ def is_supported_format(filename: str, mime: str = "") -> bool:
         _, ext = os.path.splitext(filename.lower().strip())
         if ext in SUPPORTED_EXTENSIONS:
             return True
+        # 2b) Book-conversion formats (from ALLOWED_FORMATS env) are also
+        # accepted — they route through the convert flow instead of the
+        # PDF/image thumbnail pipeline.
+        try:
+            import config as _cfg
+
+            if (
+                _cfg.ENABLE_BOOK_CONVERSION
+                and ext.lstrip(".") in _cfg.ALLOWED_FORMATS
+            ):
+                return True
+        except Exception:  # nosec B110 - config is always present
+            pass
 
     # 3) Unknown format — reject
     return False

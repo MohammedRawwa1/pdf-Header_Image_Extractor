@@ -14,3 +14,5 @@ telethon>=1.28.0
 pyrogram>=2.0.0
 tgcrypto>=1.2.5
 motor>=3.3.0
+pytesseract>=0.3.10
+ocrmypdf>=16.0.0

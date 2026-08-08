@@ -17,6 +17,7 @@ global-rate-limit responses instead of failing the job).
 
 import atexit
 import io
+import json
 import logging
 import os
 import time
@@ -25,6 +26,8 @@ from typing import Any, Protocol
 
 import requests
 
+from utils.markdown_utils import escape_markdown
+from utils.ocr import is_ocr_source, ocr_enabled
 from utils.progress_tracker import _build_progress_bar, _format_size
 
 logger = logging.getLogger(__name__)
@@ -145,6 +148,9 @@ def _tg_send_document(
     thumb_fileobj: _BinaryFile | None = None,
     caption: str | None = None,
     progress_callback: _ProgressCallback | None = None,
+    compress_user_id: int | None = None,
+    convert_user_id: int | None = None,
+    ocr_user_id: int | None = None,
 ) -> dict:
     """Send a document via the Bot API ``sendDocument`` endpoint.
 
@@ -175,6 +181,15 @@ def _tg_send_document(
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
+    attach_compress = bool(
+        compress_user_id and filename and filename.lower().endswith(".pdf")
+    )
+    attach_convert = bool(
+        convert_user_id and filename and not filename.lower().endswith(".pdf")
+    )
+    attach_ocr = bool(
+        ocr_user_id and is_ocr_source(filename) and ocr_enabled()
+    )
     # Retry on transient 429/5xx (Telegram flood control) with backoff — the
     # worker shares the bot token with the web process, so sends must tolerate
     # global-rate-limit responses instead of failing the job.
@@ -214,7 +229,55 @@ def _tg_send_document(
                     continue
                 raise last_exc
             r.raise_for_status()
-            return r.json()
+            _res = r.json()
+            # Attach the Compress-PDF button to delivered PDF results (one
+            # tap -> compress_pdf_job).  Uses the DELIVERED file_id so the
+            # user compresses exactly what they received.
+            if _res and _res.get("ok"):
+                try:
+                    _result = _res.get("result") or {}
+                    _msg_id = _result.get("message_id")
+                    _doc = _result.get("document") or {}
+                    _actions: list[tuple[str, str, str]] = []
+                    if attach_compress:
+                        # 🗜 Compress on delivered PDFs (thumb/convert/compress
+                        # results — one tap -> compress_pdf_job).
+                        _actions.append(
+                            (
+                                COMPRESS_PDF_ACTION[0],
+                                COMPRESS_PDF_ACTION[1],
+                                COMPRESS_PDF_ACTION[2],
+                            )
+                        )
+                    if attach_convert:
+                        # 🔁 Convert on delivered e-books (its own interface —
+                        # never mixed with the thumbnail flow).
+                        _actions.append(
+                            (
+                                BOOK_CONVERT_ACTION[0],
+                                BOOK_CONVERT_ACTION[1],
+                                BOOK_CONVERT_ACTION[2],
+                            )
+                        )
+                    if attach_ocr:
+                        # 🔎 OCR on delivered PDFs/images (scanned text).
+                        _actions.append(
+                            (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
+                        )
+                    if _actions:
+                        _attach_pending_buttons(
+                            chat_id,
+                            _msg_id,
+                            _doc.get("file_id"),
+                            _doc.get("file_unique_id"),
+                            filename,
+                            compress_user_id or convert_user_id or ocr_user_id,
+                            _doc.get("file_size"),
+                            tuple(_actions),
+                        )
+                except Exception:  # nosec B110 - best-effort button
+                    pass
+            return _res
         except (
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
@@ -237,12 +300,18 @@ def _tg_send_message(
     chat_id: int,
     text: str,
     reply_markup: dict | None = None,
+    parse_mode: str | None = None,
 ):
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {"chat_id": str(chat_id), "text": text}
     if reply_markup is not None:
-        data["reply_markup"] = reply_markup
+        # The Bot API expects reply_markup as a JSON-serialized form value;
+        # passing the dict raw makes requests urlencode it as a mangled
+        # Python repr (and mypy flags the assignment).
+        data["reply_markup"] = json.dumps(reply_markup)
+    if parse_mode:
+        data["parse_mode"] = parse_mode
     # Retry on transient 429/5xx (Telegram flood control) with backoff —
     # mirrors the sendDocument helper so background workers survive bursts.
     last_exc: Exception | None = None
@@ -317,7 +386,8 @@ def _tg_edit_message_text(
             "parse_mode": parse_mode,
         }
         if reply_markup is not None:
-            data["reply_markup"] = reply_markup
+            # JSON-serialized form value — see _tg_send_message.
+            data["reply_markup"] = json.dumps(reply_markup)
         r = _SESSION.post(url, data=data, timeout=15)
         r.raise_for_status()
         return r.json()
@@ -326,12 +396,15 @@ def _tg_edit_message_text(
 
 
 def _tg_edit_message_reply_markup(
-    chat_id: int, message_id: int | None
+    chat_id: int, message_id: int | None, reply_markup: dict | None = None
 ) -> bool:
-    """Remove the inline keyboard from a message (editMessageReplyMarkup).
+    """Set (or clear) the inline keyboard on a message (editMessageReplyMarkup).
 
-    Used to strip a stale cancel button once a job hands off to a different
-    pipeline, so a file never shows two cancel controls. Best-effort.
+    ``reply_markup=None`` sends an empty keyboard (removes the buttons) — used
+    to strip a stale cancel button once a job hands off to a different
+    pipeline, so a file never shows two cancel controls.  Pass a keyboard dict
+    to attach a new set of buttons (e.g. the Compress-PDF button on a
+    delivered result). Best-effort.
     """
     if not message_id:
         return False
@@ -345,7 +418,10 @@ def _tg_edit_message_reply_markup(
             data={
                 "chat_id": str(chat_id),
                 "message_id": message_id,
-                "reply_markup": {"inline_keyboard": []},
+                # JSON-serialized form value — see _tg_send_message.
+                "reply_markup": json.dumps(
+                    reply_markup or {"inline_keyboard": []}
+                ),
             },
             timeout=15,
         )
@@ -353,6 +429,225 @@ def _tg_edit_message_reply_markup(
         return True
     except Exception:
         return False
+
+
+def _attach_pending_buttons(
+    chat_id: int,
+    message_id: int | None,
+    file_id: str | None,
+    file_unique_id: str | None,
+    filename: str | None,
+    user_id: int | None,
+    file_size: int | None,
+    actions: tuple[tuple[str, str, str], ...],
+) -> None:
+    """Store pending records and attach ONE combined keyboard to a result.
+
+    ``actions`` is a sequence of ``(record_prefix, button_text,
+    callback_prefix)`` — e.g. (Compress, OCR) on a delivered PDF.  Each action
+    gets its own token + pending record; all buttons land on a single keyboard
+    via one edit (two sequential edits would overwrite each other).  Best-
+    effort: any failure just leaves the message without buttons.
+    """
+    if not message_id or not file_id or not actions:
+        return
+    try:
+        import secrets
+
+        kb_rows: list[list[dict]] = []
+        for prefix, text, cb in actions:
+            token = secrets.token_hex(4)
+            _store_pending_record(
+                prefix,
+                token,
+                chat_id=chat_id,
+                message_id=message_id,
+                file_id=file_id,
+                file_unique_id=file_unique_id,
+                filename=filename,
+                user_id=user_id,
+                file_size=file_size,
+            )
+            kb_rows.append(
+                [
+                    {
+                        "text": text,
+                        "callback_data": f"{cb}:{user_id or 0}:{token}",
+                    }
+                ]
+            )
+        _tg_edit_message_reply_markup(
+            chat_id, message_id, {"inline_keyboard": kb_rows}
+        )
+    except Exception:  # nosec B110 - best-effort button attach
+        pass
+
+
+# ── Pending-action button configs ──────────────────────────────────────────
+# ``(record_prefix, button_text, callback_prefix, prompt_text)`` — defined once
+# so the attach helpers (tg_http.py) and the worker prompt call sites
+# (tasks.py) can never drift apart on labels, prefixes or user-facing text.
+BOOK_CONVERT_ACTION: tuple[str, str, str, str] = (
+    "bookconvert",
+    "\U0001f501 Convert",
+    "bookconvert",
+    "\U0001f4da Your book was large, so it was delivered via the "
+    "userbot. Tap **Convert** to re-format it to another format.",
+)
+COMPRESS_PDF_ACTION: tuple[str, str, str, str] = (
+    "bookcompress",
+    "\U0001f5dc\ufe0f Compress PDF",
+    "compresspdf",
+    "\U0001f5dc\ufe0f Your PDF was delivered via the userbot. "
+    "Tap **Compress PDF** to shrink it.",
+)
+OCR_ACTION: tuple[str, str, str, str] = (
+    "bookocr",
+    "\U0001f50e OCR",
+    "ocr",
+    "\U0001f50e Your file was delivered via the userbot. "
+    "Tap **OCR** to make it a searchable PDF (selectable text) "
+    "or extract plain text.",
+)
+
+
+def _store_pending_record(
+    prefix: str,
+    token: str,
+    *,
+    chat_id: int | str,
+    message_id: int | None,
+    file_id: str | None,
+    file_unique_id: str | None,
+    filename: str | None,
+    user_id: int | None,
+    file_size: int | None = None,
+    mime: str = "",
+    source_chat_id: int | str | None = None,
+) -> None:
+    """Persist a pending button record under ``<prefix>:<token>`` (best-effort).
+
+    Shared by the Convert (``bookconvert``) and Compress-PDF (``bookcompress``)
+    buttons.  ``chat_id`` is where the user tapped the button (the delivery
+    target for the result).  ``source_chat_id``/``message_id`` describe where
+    the file currently lives so the job can re-download it — for bot-sent
+    results that is the same chat as the button (source_chat_id left None),
+    for userbot-delivered (large) copies it is the DM/Saved Messages where the
+    copy landed.  Records expire after ``BOOK_ASK_TTL_SECONDS``.
+    """
+    try:
+        from utils.redis_client import get_sync_redis
+
+        r = get_sync_redis()
+        if r:
+            try:
+                import config as _cfg
+
+                _ttl = getattr(_cfg, "BOOK_ASK_TTL_SECONDS", 600)
+            except Exception:  # nosec B110
+                _ttl = 600
+            r.setex(
+                f"{prefix}:{token}",
+                _ttl,
+                json.dumps(
+                    {
+                        "file_id": file_id,
+                        "file_unique_id": file_unique_id,
+                        "filename": filename,
+                        "mime": mime,
+                        "chat_id": chat_id,
+                        "source_chat_id": source_chat_id,
+                        "message_id": message_id,
+                        "file_size": file_size,
+                        "user_id": user_id,
+                    }
+                ),
+            )
+    except Exception:  # nosec B110
+        pass
+
+
+
+
+
+def _tg_send_pending_prompt(
+    record_prefix: str,
+    button_text: str,
+    callback_prefix: str,
+    prompt_text: str,
+    *,
+    chat_id: int,
+    filename: str,
+    user_id: int | None,
+    file_size: int | None,
+    src_chat_id: int | str,
+    src_message_id: int | None,
+    file_unique_id: str | None = None,
+    mime: str = "",
+    extra_action: tuple[str, str, str] | None = None,
+) -> None:
+    """Post a bot-API Compress/Convert prompt for a userbot-delivered file.
+
+    The bot cannot edit the userbot's delivered message, so it sends its own
+    prompt message in the user's chat.  The pending record (keyed under
+    ``<record_prefix>:<token>``) points at the delivered copy (``src_chat_id``
+    + ``src_message_id``) so the corresponding job can re-download it via the
+    userbot chat-based pipe.  Best-effort: any failure leaves the file
+    delivered without the button.
+    """
+    if not src_message_id:
+        return
+    try:
+        import secrets
+
+        def _store(src_prefix: str) -> str:
+            _t = secrets.token_hex(4)
+            _store_pending_record(
+                src_prefix,
+                _t,
+                chat_id=chat_id,
+                source_chat_id=src_chat_id,
+                message_id=src_message_id,
+                file_id=None,
+                file_unique_id=file_unique_id,
+                filename=filename,
+                user_id=user_id,
+                file_size=file_size,
+                mime=mime,
+            )
+            return _t
+
+        kb_rows: list[list[dict]] = [
+            [
+                {
+                    "text": button_text,
+                    "callback_data": (
+                        f"{callback_prefix}:{user_id or 0}:{_store(record_prefix)}"
+                    ),
+                }
+            ]
+        ]
+        if extra_action:
+            _extra_prefix, _extra_text, _extra_cb = extra_action
+            kb_rows.append(
+                [
+                    {
+                        "text": _extra_text,
+                        "callback_data": (
+                            f"{_extra_cb}:{user_id or 0}:{_store(_extra_prefix)}"
+                        ),
+                    }
+                ]
+            )
+        _tg_send_message(
+            None,
+            chat_id,
+            prompt_text,
+            reply_markup={"inline_keyboard": kb_rows},
+            parse_mode="Markdown",
+        )
+    except Exception:  # nosec B110 - best-effort prompt
+        pass
 
 
 def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
@@ -614,6 +909,7 @@ _PROGRESS_STAGES = {
     "downloading": 25,
     "downloaded": 50,
     "thumbnailing": 65,
+    "ocr": 70,
     "compressing": 80,
     "sending": 90,
     "done": 100,
@@ -659,6 +955,7 @@ def _tg_send_progress(
         "downloading": "\U0001f4e5",
         "downloaded": "\u2705",
         "thumbnailing": "\U0001f5bc\ufe0f",
+        "ocr": "\U0001f50e",
         "compressing": "\U0001f5dc\ufe0f",
         "sending": "\U0001f4e4",
         "done": "\u2705",
@@ -666,7 +963,10 @@ def _tg_send_progress(
     emoji = emojis.get(stage, "\u2753")
 
     lines = [
-        f"\U0001f4c1 **{filename}**",
+        # filename is user-controlled: entities ARE parsed inside **bold** in
+        # legacy Markdown, so a raw ``_``/``*``/``[`` would render mangled or
+        # crash the send with "Can't parse entities" -- escape it first.
+        f"\U0001f4c1 **{escape_markdown(filename)}**",
         f"{bar} `{pct}%`",
     ]
     if size_str:
@@ -684,7 +984,16 @@ def _tg_send_progress(
             return message_id
         else:
             res = _tg_send_message(
-                None, chat_id, text, reply_markup=reply_markup
+                None,
+                chat_id,
+                text,
+                reply_markup=reply_markup,
+                # Mirror the edit branch (and the web process's
+                # send_progress_update) so the FIRST progress message renders
+                # Markdown exactly like every subsequent live edit — otherwise
+                # the **bold**/`code` markers show literally on the initial
+                # post and only render once the first edit lands.
+                parse_mode="Markdown",
             )
             if res and "result" in res and "message_id" in res["result"]:
                 return res["result"]["message_id"]

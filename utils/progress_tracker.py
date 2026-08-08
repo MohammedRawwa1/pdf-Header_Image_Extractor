@@ -13,6 +13,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from utils.markdown_utils import safe_code_span
+
 logger = logging.getLogger(__name__)
 
 PREFIX_PROGRESS = "progress:"
@@ -62,21 +64,23 @@ class TaskProgress:
 
     def update_progress(self, processed_size: int):
         self.processed_size = processed_size
+        self._last_update = time.time()
 
     def start(self):
         self.start_time = time.time()
         self.status = "processing"
         # Clear any terminal-state leftovers so a REUSED tracker (e.g. a
         # completed/failed download tracker handed to the upload phase) can
-        # never show frozen speed/ETA (elapsed_time reads end_time), a stale
-        # error message from its previous lifecycle, or a throttled first edit
-        # from the previous phase's update cadence.
+        # never show frozen speed/ETA (elapsed_time reads end_time) or a stale
+        # error message from its previous lifecycle.
         # NOTE: processed_size is deliberately NOT reset here - callers that
         # want a fresh bar (e.g. the upload phase) reset it explicitly, while
         # resume-from-progress paths rely on it surviving.
         self.end_time = None
         self.error_message = None
-        self._last_update = None
+        # Fresh activity timestamp so the stale-task watchdog counts this
+        # (possibly reused) tracker as active, never as already-zombie.
+        self._last_update = time.time()
 
     def complete(self):
         self.end_time = time.time()
@@ -105,6 +109,7 @@ class TaskProgress:
             "elapsed_time": self.elapsed_time,
             "estimated_time_remaining": self.estimated_time_remaining,
             "error_message": self.error_message,
+            "_last_update": self._last_update,
         }
 
 
@@ -138,6 +143,7 @@ class ProgressTracker:
             file_name=file_name,
             total_size=total_size,
         )
+        task._last_update = time.time()
         self.tasks[task_id] = task
         self._persist_to_redis(task)
         logger.info("Created task tracker: %s", task_id)
@@ -165,6 +171,7 @@ class ProgressTracker:
                         start_time=data.get("start_time"),
                         end_time=data.get("end_time"),
                         error_message=data.get("error_message"),
+                        _last_update=data.get("_last_update"),
                     )
                     self.tasks[task_id] = task
                     return task
@@ -321,6 +328,41 @@ class ProgressTracker:
             self.remove_task(task_id)
         return len(tasks_to_remove)
 
+    async def watchdog_stale_tasks(
+        self, max_stale_seconds: int = 1800
+    ) -> list[str]:
+        """Auto-fail tasks stuck mid-flight with no recent activity.
+
+        Zombie guard for the /status surface: a task left in a non-terminal
+        state (a crashed worker, an aborted inline download, a lost progress
+        callback) is marked failed after ``max_stale_seconds`` without any
+        progress, so it can never show as an eternal "processing" task.
+        Tasks with no timing info at all are skipped (never auto-fail blind),
+        and only in-memory tasks are scanned (orphans from a previous process
+        instance live in Redis and self-clean via their 1h TTL).  Returns the
+        ids of the auto-failed tasks.
+        """
+        now = time.time()
+        failed: list[str] = []
+        # Snapshot the keys: fail_task -> _notify_callbacks can (in theory)
+        # remove a task from self.tasks, which would break live iteration.
+        for task_id in list(self.tasks):
+            task = self.tasks[task_id]
+            if task.status in ("completed", "failed", "cancelled"):
+                continue
+            last = task._last_update or task.start_time
+            if last is None:
+                continue
+            if now - last <= max_stale_seconds:
+                continue
+            await self.fail_task(
+                task_id,
+                "auto-failed by watchdog: no progress for "
+                f"{max_stale_seconds // 60} min",
+            )
+            failed.append(task_id)
+        return failed
+
 
 # Global progress tracker instance
 progress_tracker = ProgressTracker()
@@ -421,7 +463,7 @@ async def send_progress_update(
 
         message_text = (
             f"\U0001f4ca **File Processing Progress**\n\n"
-            f"\U0001f4c1 File: `{task.file_name}`\n"
+            f"\U0001f4c1 File: `{safe_code_span(task.file_name)}`\n"
             f"\U0001f4cf Size: {processed} / {total}\n"
             f"\U0001f4c8 Progress: `{total_progress:.1f}%`\n"
             f"`{bar}`\n\n"

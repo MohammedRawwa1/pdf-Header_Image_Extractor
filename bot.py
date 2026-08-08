@@ -80,11 +80,21 @@ from tools import (  # noqa: E402
     is_valid_pdf,
 )
 from utils.bigfile_pipeline import BigFilePipeline  # noqa: E402
+from utils.ebook_converter import (  # noqa: E402
+    calibre_available,
+    conversion_targets_for,
+    is_book_format,
+)
 from utils.error_handler import (  # noqa: E402
     get_error_handler,
     handle_bot_error,
 )
-from utils.markdown_utils import escape_markdown  # noqa: E402
+from utils.markdown_utils import escape_markdown, safe_code_span  # noqa: E402
+from utils.ocr import (  # noqa: E402
+    is_ocr_source,
+    ocr_enabled,
+    ocr_pdf_available,
+)
 from utils.progress_tracker import (  # noqa: E402
     _format_size,
     progress_tracker,
@@ -102,10 +112,18 @@ from utils.session_healthcheck import (  # noqa: E402
     stop_session_healthcheck,
 )
 from utils.tg_http import (  # noqa: E402
+    COMPRESS_PDF_ACTION,
+    OCR_ACTION,
+    _attach_pending_buttons,
     _tg_forward_message,
     _tg_send_document,
+    _tg_send_pending_prompt,
 )
 from utils.url_validation import _validate_url_safe  # noqa: E402
+from utils.user_settings import (  # noqa: E402
+    get_user_setting,
+    set_user_setting,
+)
 from utils.userbot_downloader import _get_bot_user_id  # noqa: E402
 from utils.userbot_uploader import (  # noqa: E402
     send_file_via_userbot_with_fallback,
@@ -359,7 +377,7 @@ async def _send_with_upload_progress(
         # Shared helper: retries to the userbot's Saved Messages ('me') when
         # the send to the preferred target fails (e.g. the userbot can't
         # resolve the bot's entity — a known production failure).
-        success = await send_file_via_userbot_with_fallback(
+        _sent_msg, _used_chat = await send_file_via_userbot_with_fallback(
             chat_id=_upload_target,
             file_path=file_path,
             caption=caption,
@@ -367,7 +385,55 @@ async def _send_with_upload_progress(
             progress_callback=_cb,
             user_id=user_id,
         )
-        if success:
+        if _sent_msg:
+            # The bot cannot edit the userbot's delivered message, so oversized
+            # results get a bot-API prompt pointing at the delivered copy —
+            # web-process parity with the worker flow.  PDFs: [🗜 Compress PDF]
+            # + [🔎 OCR]; raster images: [🔎 OCR].  Best-effort by contract:
+            # _tg_send_pending_prompt never raises.
+            _name = filename or ""
+            _is_pdf = _name.lower().endswith(".pdf")
+            _has_ocr = is_ocr_source(_name) and ocr_enabled()
+            if _is_pdf or _has_ocr:
+                _msg_chat = getattr(_sent_msg, "chat_id", None)
+                if _msg_chat is None:
+                    _msg_chat = getattr(
+                        getattr(_sent_msg, "chat", None), "id", None
+                    )
+                _src_chat = (
+                    "me"
+                    if str(_used_chat) == "me"
+                    else (_msg_chat if _msg_chat is not None else _used_chat)
+                )
+                _sent_id = getattr(_sent_msg, "id", None)
+                if _sent_id:
+                    if _is_pdf:
+                        await asyncio.to_thread(
+                            _tg_send_pending_prompt,
+                            *COMPRESS_PDF_ACTION,
+                            chat_id=chat_id,
+                            filename=filename,
+                            user_id=user_id,
+                            file_size=file_size,
+                            src_chat_id=_src_chat,
+                            src_message_id=_sent_id,
+                            extra_action=(
+                                (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
+                                if ocr_enabled()
+                                else None
+                            ),
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            _tg_send_pending_prompt,
+                            *OCR_ACTION,
+                            chat_id=chat_id,
+                            filename=filename,
+                            user_id=user_id,
+                            file_size=file_size,
+                            src_chat_id=_src_chat,
+                            src_message_id=_sent_id,
+                        )
             await progress_tracker.complete_task(task.task_id)
             # Auto-remove the transient progress message after delivery.
             if progress_msg_id:
@@ -412,6 +478,7 @@ async def _send_document_via_bot_api(
     caption: str,
     task=None,
     progress_msg_id: int | None = None,
+    user_id: int | None = None,
 ) -> None:
     """Send a document via the Bot API with LIVE upload progress.
 
@@ -430,12 +497,43 @@ async def _send_document_via_bot_api(
     """
     if task is None or progress_msg_id is None:
         with open(file_path, "rb") as f_doc, open(thumb_path, "rb") as f_thumb:
-            await bot.send_document(
+            _sent = await bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(f_doc, filename=filename),
                 thumbnail=f_thumb,
                 caption=caption,
             )
+        # Attach the result buttons (🗜 Compress + 🔎 OCR for PDFs, 🔎 OCR for
+        # images) — parity with the raw-HTTP path in _tg_send_document.
+        if user_id:
+            try:
+                _doc = getattr(_sent, "document", None)
+                _actions: list[tuple[str, str, str]] = []
+                if filename.lower().endswith(".pdf"):
+                    _actions.append(
+                        (
+                            COMPRESS_PDF_ACTION[0],
+                            COMPRESS_PDF_ACTION[1],
+                            COMPRESS_PDF_ACTION[2],
+                        )
+                    )
+                if is_ocr_source(filename) and ocr_enabled():
+                    _actions.append(
+                        (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
+                    )
+                if _actions:
+                    _attach_pending_buttons(
+                        chat_id,
+                        getattr(_sent, "message_id", None),
+                        getattr(_doc, "file_id", None),
+                        getattr(_doc, "file_unique_id", None),
+                        filename,
+                        user_id,
+                        None,
+                        tuple(_actions),
+                    )
+            except Exception:  # nosec B110 - best-effort button
+                pass
         return
 
     # Switch the (possibly merged download->upload) tracker to the upload phase
@@ -454,6 +552,8 @@ async def _send_document_via_bot_api(
             f_thumb,
             caption,
             _cb,
+            user_id,
+            ocr_user_id=user_id,
         )
 
 
@@ -861,10 +961,15 @@ def _store_queued_message(job_id, chat_id, message_id) -> None:
         pass
 
 
-def enqueue_job(func_name: str, *args, **kwargs):
+def enqueue_job(func_name: str, *args, job_timeout: int | None = None, **kwargs):
     """Enqueue a job on the RQ 'default' queue.
 
     Returns the RQ job id (so /canceljob can cancel it) or None on failure.
+
+    ``job_timeout`` overrides RQ's default 180s job timeout — pass a value
+    larger than the job's own long-running phase (e.g. Calibre conversions)
+    so the death penalty can't kill it mid-work.  Defaults to RQ's 180s when
+    None.
 
     Uses a NON-decoding Redis connection (same as ``_cancel_rq_job`` and the
     RQ worker): RQ stores job payloads pickled as raw bytes, so the
@@ -884,7 +989,7 @@ def enqueue_job(func_name: str, *args, **kwargs):
         q = Queue("default", connection=redis_conn)
         # lookup function from tasks
         func = getattr(tasks, func_name)
-        job = q.enqueue(func, *args, **kwargs)
+        job = q.enqueue(func, *args, **kwargs, job_timeout=job_timeout)
         return getattr(job, "id", None)
     except Exception:
         logger.exception("Failed to enqueue job for %s", func_name)
@@ -1056,7 +1161,8 @@ async def handle_document(
         )
         await msg.reply_text(
             "\u274c Unsupported file format.\n\n"
-            "This bot only processes **PDF documents** and **images** (JPEG, PNG, WEBP, GIF).\n"
+            "I work with **PDFs, images** (JPEG, PNG, WEBP, GIF) and **e-books** "
+            "(EPUB, MOBI, AZW3, FB2, DOCX, TXT, RTF, HTML, ODT and more).\n"
             "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported."
         )
         return
@@ -1134,11 +1240,96 @@ async def handle_document(
                 logger.exception("Failed to notify user about large file")
             return
 
+    # ── E-books: conversion has its own clean interface ──
+    # Routed before the Redis/userbot gates so books of every size are handled
+    # by the conversion-only flow — never the thumbnail pipeline.
+    if is_book_format(filename) and not filename.lower().endswith(".pdf"):
+        if not getattr(config, "ENABLE_BOOK_CONVERSION", False):
+            # Feature disabled → pre-feature behavior: reject e-books clearly
+            # instead of sending them into the image-thumbnail pipeline.
+            try:
+                await msg.reply_text(
+                    "\U0001f4d5 E-book conversion is currently disabled on this "
+                    "instance.\nSend a **PDF** or **image** to get a thumbnail "
+                    "cover.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify about disabled book conversion"
+                )
+            return
+        if not config.REDIS_URL:
+            # The Convert button needs the Redis token store; without a queue
+            # backend there is no clean conversion path — reject clearly.
+            try:
+                await msg.reply_text(
+                    "\u274c Book conversion needs the job queue (Redis), which "
+                    "isn't configured on this instance.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify about missing Redis for book conversion"
+                )
+            return
+        # Deliver the book back with a 🔁 Convert button (its own interface);
+        # nothing is processed until a target is picked.
+        _ok = await asyncio.to_thread(
+            enqueue_job,
+            "deliver_book_job",
+            chat_id,
+            doc.file_id,
+            filename,
+            mime,
+            user_id,
+            getattr(doc, "file_unique_id", None),
+            msg.message_id,
+            forward_info,
+            file_size,
+            # job_timeout > RQ's 180s default: a large book's userbot
+            # download + echo back can legitimately outlive the death penalty
+            # (conversion itself runs under its own, even larger timeout).
+            job_timeout=1800,
+        )
+        _q_msg = None
+        if _ok:
+            try:
+                _q_msg = await msg.reply_text(
+                    f"\U0001f4da `{safe_code_span(filename)}` received — "
+                    "I'll send it back with a **Convert** button so you "
+                    "can re-format it.\n"
+                    f"Job ID: `{_ok}` — use /canceljob {_ok} to cancel it.",
+                    reply_markup=_queued_cancel_kb(user_id, _ok),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to reply for deliver_book_job"
+                )
+        else:
+            try:
+                await msg.reply_text(
+                    "\u274c Couldn't queue the job. Try again in a moment."
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to reply for deliver_book_job"
+                )
+        if _ok and _q_msg is not None:
+            _store_queued_message(
+                _ok,
+                chat_id,
+                getattr(_q_msg, "message_id", None),
+            )
+        return
+
     if config.REDIS_URL:
         # When file is too large (>20MB) and userbot is available, route through
         # userbot/BigFilePipeline instead. process_document_job uses the Bot API
         # (getFile) which cannot handle files >20MB and will fail with "file is too big".
         if not use_userbot_download:
+            # PDFs & images: normal auto-thumbnail pipeline (no ask menu).
             # Pass message_id + forward_info + file_size so the worker has context for userbot fallback
             ok = await asyncio.to_thread(
                 enqueue_job,
@@ -1158,6 +1349,7 @@ async def handle_document(
                     "Queued your file for background processing; I'll send the result when ready.\n"
                     f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
                     reply_markup=_queued_cancel_kb(user_id, ok),
+                    parse_mode="Markdown",
                 )
                 _store_queued_message(
                     ok,
@@ -1309,6 +1501,7 @@ async def handle_document(
                 caption=caption,
                 task=task,
                 progress_msg_id=progress_msg_id,
+                user_id=user_id,
             )
         if task:
             await progress_tracker.complete_task(task.task_id)
@@ -1420,6 +1613,7 @@ async def handle_document(
                             caption="Here is your file (downloaded via userbot) with an auto-generated cover preview.",
                             task=_dl_task,
                             progress_msg_id=_dl_msg_id,
+                            user_id=user_id,
                         )
                         # Auto-remove the transient download progress message
                         # now that the output was delivered.
@@ -1550,6 +1744,7 @@ async def handle_photo(
                 "Queued your photo for background processing; I'll send the result when ready.\n"
                 f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
                 reply_markup=_queued_cancel_kb(user_id, ok),
+                parse_mode="Markdown",
             )
             _store_queued_message(
                 ok,
@@ -1660,6 +1855,7 @@ async def handle_photo(
                 caption="Here is your image with an auto-generated thumbnail.",
                 task=task,
                 progress_msg_id=progress_msg_id,
+                user_id=user_id,
             )
         if task:
             await progress_tracker.complete_task(task.task_id)
@@ -1757,6 +1953,7 @@ async def handle_photo(
                             caption="Here is your image (downloaded via userbot) with an auto-generated thumbnail.",
                             task=_dl_task,
                             progress_msg_id=_dl_msg_id,
+                            user_id=user_id,
                         )
                         # Auto-remove the transient download progress message
                         # now that the output was delivered.
@@ -1822,13 +2019,20 @@ async def cmd_start(
         user_name = getattr(_eff_user, "first_name", None) or "there"
     await update.effective_message.reply_text(
         f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
-        "📄 Send me a **PDF** or **image** and I'll return a thumbnail "
-        "(PDF first page used as cover).\n\n"
+        "📄 Send a **PDF** or **image** and I'll auto-generate its **thumbnail** "
+        "cover — nothing to click.\n\n"
+        "📖 Send an **e-book** (EPUB, MOBI, AZW3, FB2, DOCX, TXT…) and I'll "
+        "send it back with a **Convert** button to re-format it — conversion "
+        "has its own button, never mixed with thumbnails.\n\n"
+        "🗜 Delivered PDFs carry a **Compress PDF** button to shrink them, "
+        "and PDFs/images carry a **🔎 OCR** button — make a **searchable "
+        "PDF** (text selectable, same look) or extract plain text.\n\n"
         "⚡ **Quick commands:**\n"
         "• /help — all commands\n"
         "• /login — connect **your** Telethon account (large files)\n"
         "• /loginpyro — connect **your** Pyrogram account (large files)\n"
         "• /loginstatus — check **your** session health\n"
+        "• /ocr [pdf|txt|picker] — pick your **OCR output default** (skip the picker)\n"
         "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n"
         "• /startbatch + /endbatch — process multiple files at once\n\n"
         "_Sessions are per-user: nobody else can use your account._",
@@ -1871,6 +2075,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /setwebhook <url> — set webhook (owner)\n"
         "• /delwebhook — delete webhook (owner)\n"
         "• /setcommands — push this list to Telegram (owner)\n\n"
+        "📖 Books\n"
+        "• Send a PDF/image → auto thumbnail (nothing to click)\n"
+        "• Send an e-book (EPUB, MOBI, AZW3, FB2, TXT…) → I send it back "
+        "with a **Convert** button to re-format it (PDF, EPUB, MOBI, FB2, …)\n"
+        "• 🗜 **Compress PDF** button on delivered PDFs — shrink before sending\n"
+        "• 🔎 **OCR** on delivered PDFs/images — **Searchable PDF** (invisible "
+        "text layer, same look) or plain text (.txt)\n"
+        "• /ocr [pdf|txt|picker] — pin your OCR output so the picker is skipped\n"
+        "\n"
         "Send a PDF or image any time to get its thumbnail."
     )
     await update.effective_message.reply_text(text)
@@ -1991,6 +2204,122 @@ def _cancel_status_reply(
     text = header + "\n\n" + summary
     kb = _cancel_all_kb() if has_jobs else None
     return text, kb
+
+# ── Book conversion: token-based Convert-button state ────────────────
+# Conversion has its own clean interface (delivered e-books carry a 🔁
+# Convert button that reveals ONLY format options).  The pending file record
+# is keyed by a short token stored with the button callback.
+BOOKCONVERT_KEY = "bookconvert:{}"
+
+
+def _peek_pending_record(key: str) -> str | None:
+    """Non-consuming peek at a pending button record (raw JSON).
+
+    Used by the OCR button reveal: the record is read so the picker can be
+    shown, but is only consumed atomically on the FINAL format tap (so a
+    double-tap can never enqueue the same job twice).
+    """
+    if not key:
+        return None
+    try:
+        r = get_sync_redis()
+        if not r:
+            return None
+        raw = r.get(key)
+        if raw is None:
+            return None
+        return raw if isinstance(raw, str) else raw.decode(errors="replace")
+    except Exception:  # nosec B110
+        return None
+
+
+def _consume_pending_record(key: str) -> str | None:
+    """Atomically fetch-and-delete a pending button record (raw JSON).
+
+    Uses Redis ``GETDEL`` (>= 6.2) with a Lua fallback, so a double-tap can
+    never read the same record twice — without this, two concurrent callbacks
+    (a fast double-tap, a webhook redelivery, or multiple bot instances)
+    could both GET before either DELETEs and enqueue the same job twice.
+    """
+    try:
+        r = get_sync_redis()
+        if not r:
+            return None
+        try:
+            raw = r.getdel(key)
+        except Exception:  # nosec B110 - older Redis: Lua fallback
+            try:
+                raw = r.eval(
+                    "local v = redis.call('get', KEYS[1]); "
+                    "if v then redis.call('del', KEYS[1]) end; "
+                    "return v",
+                    1,
+                    key,
+                )
+            except Exception:  # nosec B110
+                return None
+        if raw is None:
+            return None
+        return raw if isinstance(raw, str) else raw.decode(errors="replace")
+    except Exception:  # nosec B110
+        return None
+
+
+def _load_book_convert(token: str, consume: bool = True) -> dict | None:
+    """Load (and optionally consume) a pending book-convert record by token.
+
+    ``consume=False`` peeks the record (used when the Convert button reveals
+    the format picker); the record is consumed atomically once on the final
+    format tap so double-taps are inert.
+    """
+    if not token:
+        return None
+    key = BOOKCONVERT_KEY.format(token)
+    if consume:
+        raw = _consume_pending_record(key)
+        if raw is None:
+            return None
+    else:
+        try:
+            r = get_sync_redis()
+            if not r:
+                return None
+            raw = r.get(key)
+        except Exception:  # nosec B110
+            return None
+        if raw is None:
+            return None
+    try:
+        return json.loads(raw)
+    except Exception:  # nosec B110 - corrupt record = expired
+        return None
+
+
+def _book_conv_kb(
+    uid: int, token: str, filename: str
+) -> InlineKeyboardMarkup | None:
+    """Format-picker keyboard (conversion-only) for ``filename``.
+
+    Callback data ``bookconv:<uid>:<token>:<fmt>`` — same-user bound; the
+    token resolves the pending file record on the final tap.  Returns None
+    when there are no valid targets.
+    """
+    if not calibre_available():
+        return None
+    targets = conversion_targets_for(os.path.splitext(filename)[1])
+    if not targets:
+        return None
+    rows = [
+        [
+            InlineKeyboardButton(
+                fmt.upper(),
+                callback_data=f"bookconv:{uid}:{token}:{fmt}",
+            )
+            for fmt in targets[i : i + 3]
+        ]
+        for i in range(0, len(targets), 3)
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _queued_cancel_kb(user_id: int | None, job_id: str) -> InlineKeyboardMarkup | None:
@@ -2128,7 +2457,10 @@ def _build_status_summary(uid: int | None, is_owner: bool) -> str:
                     icon = "\U0001f4e5" if status == "queued" else "\U0001f504"
                     age = f" \u00b7 {_ago(ts)}" if ts else ""
                     lines.append(
-                        f"\u2022 {icon} {label} \u2014 {status}{age}"
+                        # Filenames can contain `_` (a Markdown italic
+                        # delimiter) — escape the raw-text label so the
+                        # summary is safe under parse_mode="Markdown".
+                        f"\u2022 {icon} {escape_markdown(label)} \u2014 {status}{age}"
                         f" \u00b7 `/canceljob {cid[:8]}`"
                     )
             else:
@@ -2184,9 +2516,13 @@ async def cmd_status(
     # Falls back to "Bot: active" if Redis is unreachable.
     summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
     if has_jobs:
-        await update.effective_message.reply_text(summary, reply_markup=_cancel_all_kb())
+        await update.effective_message.reply_text(
+            summary, reply_markup=_cancel_all_kb(), parse_mode="Markdown"
+        )
     else:
-        await update.effective_message.reply_text(summary)
+        await update.effective_message.reply_text(
+            summary, parse_mode="Markdown"
+        )
 
 
 async def cmd_setwebhook(
@@ -2312,6 +2648,7 @@ async def cmd_setcommands(
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
+        BotCommand("ocr", "Set OCR output default (pdf/txt/picker)"),
         BotCommand("canceljob", "Cancel a job (asks to confirm)"),
         BotCommand("cancelall", "Cancel all of your jobs"),
         BotCommand("cancel", "Cancel an active login flow"),
@@ -2390,7 +2727,11 @@ async def cmd_endbatch(
     # enqueue a single batch job which processes items in order
     if config.REDIS_URL:
         ok = await asyncio.to_thread(
-            enqueue_job, "process_document_batch_job", chat_id, items, user_id
+            enqueue_job, "process_document_batch_job", chat_id, items, user_id,
+            # job_timeout > RQ's 180s default: batches can contain large
+            # e-books whose inline deliver_book_job (download + echo) must not
+            # be killed by the death penalty mid-run.
+            job_timeout=1800,
         )
         if ok:
             await asyncio.to_thread(clear_forward_batch, chat_id, user_id)
@@ -2398,6 +2739,7 @@ async def cmd_endbatch(
                 f"Queued batch with {len(items)} items for processing.\n"
                 f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
                 reply_markup=_queued_cancel_kb(user_id, ok),
+                parse_mode="Markdown",
             )
             _store_queued_message(
                 ok,
@@ -3433,21 +3775,25 @@ async def cmd_canceljob(
             header = "✅ Cancelled: " + ", ".join(actions)
         else:
             header = (
-                f"No active job found for you with id `{job_id}`. "
+                f"No active job found for you with id "
+                f"`{safe_code_span(job_id)}`. "
                 "It may have already finished."
             )
         # Append the refreshed /status summary (mirrors the confirm callback
         # and cancel-all): the cancel-all button is offered when jobs remain.
         text, kb = _cancel_status_reply(uid, header)
-        await update.effective_message.reply_text(text, reply_markup=kb)
+        await update.effective_message.reply_text(
+            text, reply_markup=kb, parse_mode="Markdown"
+        )
         return
 
     job_id = args[0].strip()
     targets = _resolve_cancel_targets(job_id, uid, chat_id)
     if not targets:
         await update.effective_message.reply_text(
-            f"No active job found for you with id `{job_id}`. "
-            "It may have already finished."
+            f"No active job found for you with id `{safe_code_span(job_id)}`. "
+            "It may have already finished.",
+            parse_mode="Markdown",
         )
         return
     # Same-user-bound confirm/abort buttons (well under the 64-byte callback
@@ -3471,6 +3817,7 @@ async def cmd_canceljob(
         + "\n• ".join(targets)
         + "\n\nReply with /canceljob <id> confirm, or tap the button below.",
         reply_markup=confirm_kb,
+        parse_mode="Markdown",
     )
 
 
@@ -3723,6 +4070,7 @@ async def handle_cancelall_confirm_callback(
         await query.edit_message_text(
             text,
             reply_markup=kb if kb is not None else InlineKeyboardMarkup([]),
+            parse_mode="Markdown",
         )
     except Exception:
         logger.exception("cancelall: failed to edit refreshed status message")
@@ -3855,7 +4203,9 @@ async def handle_canceljob_arm_callback(
     try:
         if query.message is not None:
             await query.message.reply_text(
-                f"⚠️ Cancel job `{job_id[:8]}`?", reply_markup=confirm_kb
+                f"⚠️ Cancel job `{job_id[:8]}`?",
+                reply_markup=confirm_kb,
+                parse_mode="Markdown",
             )
     except Exception:
         logger.exception("canceljob: failed to show queue-cancel confirmation")
@@ -3919,6 +4269,7 @@ async def handle_canceljob_confirm_callback(
         await query.edit_message_text(
             text,
             reply_markup=kb if kb is not None else InlineKeyboardMarkup([]),
+            parse_mode="Markdown",
         )
     except Exception:
         logger.exception("canceljob: failed to edit confirmation result")
@@ -3957,6 +4308,661 @@ async def handle_canceljob_abort_callback(
         )
     except Exception:  # nosec B110
         pass
+
+
+async def handle_book_convert_button_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🔁 Convert button on a delivered e-book: reveals the format picker.
+
+    ``callback_data`` is ``bookconvert:<uid>:<token>`` — same-user bound, so a
+    tap in a group from anyone but the receiver is rejected.  The pending file
+    record (``bookconvert:<token>``) is peeked here and consumed on the final
+    format tap, keeping conversion a single-purpose interface.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "bookconvert":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who received the book can convert it.",
+            show_alert=True,
+        )
+        return
+    rec = _load_book_convert(token, consume=False)
+    if not rec:
+        try:
+            await query.edit_message_text(
+                "⏰ This Convert button has expired. Send the book again.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    await _track_user_session(update, "book_convert")
+    filename = rec.get("filename") or "file"
+    kb = _book_conv_kb(armer, token, filename)
+    if not kb:
+        try:
+            await query.edit_message_text(
+                f"\u274c No convertible target formats for `{safe_code_span(filename)}`.",
+                reply_markup=InlineKeyboardMarkup([]),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    try:
+        await query.edit_message_text(
+            f"\U0001f501 Convert `{safe_code_span(filename)}` to:",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_book_convert_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Format-picker buttons: ``bookconv:<uid>:<token>:<target>``.
+
+    Enqueues ``convert_book_job`` for the token's file.  Same-user bound; the
+    pending record is consumed once, so double-taps are inert.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "bookconv":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    target = parts[3].lower()
+    if uid != armer:
+        await query.answer(
+            "Only the person who received the book can convert it.",
+            show_alert=True,
+        )
+        return
+    pending = _load_book_convert(token, consume=True)
+    if not pending:
+        try:
+            await query.edit_message_text(
+                "⏰ This choice expired. Send the book again.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    await _track_user_session(update, "book_convert")
+    chat_id = pending.get("chat_id")
+    filename = pending.get("filename") or "file"
+    # job_timeout caps the ENTIRE RQ job — download + convert + deliver — so
+    # it must exceed RQ's 180s default AND cover a slow userbot re-download
+    # of a large book on top of the Calibre conversion window.
+    _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
+    ok = await asyncio.to_thread(
+        enqueue_job,
+        "convert_book_job",
+        chat_id,
+        pending.get("file_id"),
+        filename,
+        pending.get("mime", ""),
+        target,
+        armer,
+        pending.get("file_unique_id"),
+        pending.get("message_id"),
+        pending.get("forward_info"),
+        pending.get("file_size"),
+        pending.get("source_chat_id"),
+        job_timeout=int(_conv_timeout) + 600,
+    )
+    if ok:
+        try:
+            await query.edit_message_text(
+                f"\U0001f501 Converting `{safe_code_span(filename)}` to "
+                f"**{target.upper()}**...\nJob ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(armer, ok),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        _store_queued_message(
+            ok,
+            chat_id,
+            getattr(query.message, "message_id", None),
+        )
+    else:
+        try:
+            await query.edit_message_text(
+                "\u274c Couldn't queue the conversion. Try again in a moment.",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:  # nosec B110
+            pass
+
+
+async def handle_compress_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🗜 Compress PDF button on a delivered result: ``compresspdf:<uid>:<token>``.
+
+    Looks up the delivered file in Redis (``bookcompress:<token>``), verifies
+    ownership, and enqueues ``compress_pdf_job``.  Same-user bound.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "compresspdf":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who received the file can compress it.",
+            show_alert=True,
+        )
+        return
+    rec = None
+    raw = _consume_pending_record(f"bookcompress:{token}")
+    if raw:
+        try:
+            rec = json.loads(raw)
+        except Exception:  # nosec B110 - corrupt record = expired
+            rec = None
+    if not rec:
+        await query.answer(
+            "This compress link has expired. Send the file again.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "compress_pdf")
+    chat_id = rec.get("chat_id")
+    filename = rec.get("filename") or "file.pdf"
+    if not chat_id:
+        await query.answer(
+            "This compress link is invalid. Send the file again.",
+            show_alert=True,
+        )
+        return
+    # job_timeout > RQ's 180s default: gs compression of a large PDF can
+    # legitimately outlive the death penalty (mirrors convert_book_job).
+    ok = await asyncio.to_thread(
+        enqueue_job,
+        "compress_pdf_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        armer,
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        rec.get("file_size"),
+        source_chat_id=rec.get("source_chat_id"),
+        job_timeout=1800,
+    )
+    if ok:
+        try:
+            await query.answer("\U0001f5dc\ufe0f Compression queued")
+        except Exception:  # nosec B110
+            pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+        except Exception:  # nosec B110
+            pass
+        _queued_msg = None
+        try:
+            _queued_msg = await query.message.reply_text(
+                f"\U0001f5dc\ufe0f Compressing `{safe_code_span(filename)}`...\n"
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(armer, ok),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        _store_queued_message(
+            ok,
+            chat_id,
+            getattr(_queued_msg, "message_id", None),
+        )
+    else:
+        try:
+            await query.answer(
+                "\u274c Couldn't queue the compression.", show_alert=True
+            )
+        except Exception:  # nosec B110
+            pass
+
+
+def _ocr_pick_kb(uid: int, token: str) -> InlineKeyboardMarkup:
+    """OCR output picker: 📄 Searchable PDF (primary) + 📝 Plain text.
+
+    Callback data ``ocrpick:<uid>:<token>:<fmt>`` — same-user bound; the token
+    resolves the pending file record, which is consumed atomically on the
+    final tap so double-taps are inert.
+    """
+    rows = []
+    if ocr_pdf_available():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f4c4 Searchable PDF",
+                    callback_data=f"ocrpick:{uid}:{token}:pdf",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f4dd Plain text (.txt)",
+                callback_data=f"ocrpick:{uid}:{token}:txt",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+_OCR_TARGET_LABELS = {
+    "": "\U0001f500 Always ask (picker)",
+    "pdf": "\U0001f4c4 Searchable PDF",
+    "txt": "\U0001f4dd Plain text (.txt)",
+}
+
+
+def _ocr_settings_kb(uid: int) -> InlineKeyboardMarkup:
+    """One-tap OCR default picker for ``/ocr`` (same-user bound)."""
+    _cur = (get_user_setting(uid, "ocr_target", "") or "").lower()
+    rows = []
+    for _val, _label in (
+        ("pdf", _OCR_TARGET_LABELS["pdf"]),
+        ("txt", _OCR_TARGET_LABELS["txt"]),
+        ("", _OCR_TARGET_LABELS[""]),
+    ):
+        if _val == "pdf" and not ocr_pdf_available():
+            continue  # engine missing → don't offer the PDF default
+        _mark = " ✅" if _cur == _val else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{_label}{_mark}",
+                    callback_data=f"ocrset:{uid}:{_val or 'picker'}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ocr [pdf|txt|picker] — set your per-user OCR output default.
+
+    With no argument, shows the current default plus one-tap buttons.  With an
+    argument, pins the output so the 🔎 OCR button skips the picker and runs
+    directly (Searchable PDF for ``pdf``, plain text for ``txt``, always ask
+    for ``picker``).
+    """
+    await _track_user_session(update, "/ocr")
+    uid = getattr(update.effective_user, "id", None)
+    if not config.is_user_allowed(uid):
+        await update.effective_message.reply_text(
+            "Access denied. This bot is private."
+        )
+        return
+    if not ocr_enabled():
+        try:
+            await update.effective_message.reply_text(
+                "\u274c OCR is currently disabled on this instance.",
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    _arg = ((context.args or [""])[0] or "").lower()
+    if _arg in ("pdf", "txt", "picker"):
+        _val = "" if _arg == "picker" else _arg
+        if _val == "pdf" and not ocr_pdf_available():
+            try:
+                await update.effective_message.reply_text(
+                    "\u274c Searchable PDF isn't available on this instance "
+                    "(ocrmypdf not installed).",
+                    parse_mode="Markdown",
+                )
+            except Exception:  # nosec B110
+                pass
+            return
+        set_user_setting(uid, "ocr_target", _val)
+        _label = _OCR_TARGET_LABELS.get(_val, _OCR_TARGET_LABELS[""])
+        try:
+            await update.effective_message.reply_text(
+                f"\u2705 OCR default set to **{_label}** \u2014 the \U0001f50e OCR "
+                "button will now run it directly (no picker).\n"
+                "Change it any time with /ocr or the buttons below.",
+                reply_markup=_ocr_settings_kb(uid),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        return
+    # No/invalid arg → show the current default + one-tap buttons.
+    _cur = (get_user_setting(uid, "ocr_target", "") or "").lower()
+    _cur_label = _OCR_TARGET_LABELS.get(_cur, _OCR_TARGET_LABELS[""])
+    try:
+        await update.effective_message.reply_text(
+            f"\U0001f50e **OCR output default**\n\n"
+            f"Current: **{_cur_label}**\n\n"
+            "Tap a button to pin it (the \U0001f50e OCR button then skips the "
+            "picker), or use `/ocr pdf`, `/ocr txt`, `/ocr picker`.",
+            reply_markup=_ocr_settings_kb(uid),
+            parse_mode="Markdown",
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_ocr_set_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """One-tap OCR default buttons: ``ocrset:<uid>:<pdf|txt|picker>``."""
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "ocrset":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    _arg = parts[2].lower()
+    if uid != armer:
+        await query.answer(
+            "Only you can change your OCR default.", show_alert=True
+        )
+        return
+    if _arg not in ("pdf", "txt", "picker"):
+        await query.answer("Invalid action", show_alert=True)
+        return
+    _val = "" if _arg == "picker" else _arg
+    if _val == "pdf" and not ocr_pdf_available():
+        await query.answer(
+            "Searchable PDF isn't available on this instance.", show_alert=True
+        )
+        return
+    set_user_setting(armer, "ocr_target", _val)
+    await _track_user_session(update, "ocr_set")
+    _label = _OCR_TARGET_LABELS.get(_val, _OCR_TARGET_LABELS[""])
+    try:
+        await query.edit_message_text(
+            f"\u2705 OCR default set to **{_label}** \u2014 the \U0001f50e OCR "
+            "button will now run it directly (no picker).",
+            reply_markup=_ocr_settings_kb(armer),
+            parse_mode="Markdown",
+        )
+    except Exception:  # nosec B110
+        pass
+
+
+async def handle_ocr_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🔎 OCR button on a delivered result: ``ocr:<uid>:<token>``.
+
+    Verifies ownership, PEEKS the pending record (``bookocr:<token>``), and
+    reveals the output picker (📄 Searchable PDF / 📝 Plain text).  The record
+    is consumed atomically only on the final pick, so a double-tap can never
+    enqueue the same job twice.  Same-user bound.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "ocr":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who received the file can OCR it.",
+            show_alert=True,
+        )
+        return
+    rec = None
+    raw = _peek_pending_record(f"bookocr:{token}")
+    if raw:
+        try:
+            rec = json.loads(raw)
+        except Exception:  # nosec B110 - corrupt record = expired
+            rec = None
+    if not rec:
+        await query.answer(
+            "This OCR link has expired. Send the file again.", show_alert=True
+        )
+        return
+    if not ocr_enabled():
+        await query.answer(
+            "OCR is currently disabled on this instance.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "ocr")
+    # Per-user default (set via /ocr or the settings buttons): when the user
+    # pinned an output, skip the picker entirely and run it in one tap.  The
+    # record is consumed atomically here so a double-tap can't double-enqueue.
+    _default = (get_user_setting(armer, "ocr_target", "") or "").lower()
+    if _default in ("pdf", "txt"):
+        if _default == "pdf" and not ocr_pdf_available():
+            # Pinned to PDF but the engine is missing → tell the user why the
+            # picker is reappearing, then fall through to it (record still
+            # peeked, never consumed).
+            try:
+                await query.answer(
+                    "Searchable PDF isn't available on this instance — "
+                    "showing the picker instead.",
+                    show_alert=False,
+                )
+            except Exception:  # nosec B110
+                pass
+            _default = ""
+        else:
+            _rec2 = None
+            _raw2 = _consume_pending_record(f"bookocr:{token}")
+            if _raw2:
+                try:
+                    _rec2 = json.loads(_raw2)
+                except Exception:  # nosec B110 - corrupt record = expired
+                    _rec2 = None
+            if not _rec2:
+                await query.answer(
+                    "This OCR link has expired. Send the file again.",
+                    show_alert=True,
+                )
+                return
+            await _enqueue_ocr_job(query, _rec2, armer, _default)
+            return
+    filename = rec.get("filename") or "file"
+    try:
+        await query.edit_message_text(
+            f"\U0001f50e OCR `{safe_code_span(filename)}` as:",
+            reply_markup=_ocr_pick_kb(armer, token),
+            parse_mode="Markdown",
+        )
+    except Exception:  # nosec B110 - reveal failed (expired/edited elsewhere)
+        try:
+            await query.answer(
+                "This OCR link has expired. Send the file again.",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+
+
+async def handle_ocr_pick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """OCR output picker: ``ocrpick:<uid>:<token>:<fmt>`` (fmt = pdf|txt).
+
+    Consumes the pending record atomically (``bookocr:<token>``) and enqueues
+    ``ocr_job`` with ``target=<fmt>`` — 📄 Searchable PDF (ocrmypdf text
+    layer) or 📝 plain text (.txt).  Same-user bound; double-taps are inert
+    because the record is GETDEL'd on the first tap.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "ocrpick":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    target = parts[3].lower()
+    if uid != armer:
+        await query.answer(
+            "Only the person who received the file can OCR it.",
+            show_alert=True,
+        )
+        return
+    if target not in ("pdf", "txt"):
+        await query.answer("Invalid action", show_alert=True)
+        return
+    rec = None
+    raw = _consume_pending_record(f"bookocr:{token}")
+    if raw:
+        try:
+            rec = json.loads(raw)
+        except Exception:  # nosec B110 - corrupt record = expired
+            rec = None
+    if not rec:
+        await query.answer(
+            "This OCR link has expired. Send the file again.", show_alert=True
+        )
+        return
+    if not ocr_enabled():
+        await query.answer(
+            "OCR is currently disabled on this instance.", show_alert=True
+        )
+        return
+    if target == "pdf" and not ocr_pdf_available():
+        await query.answer(
+            "Searchable PDF isn't available on this instance. Use Plain text.",
+            show_alert=True,
+        )
+        return
+    await _track_user_session(update, "ocr_pick")
+    await _enqueue_ocr_job(query, rec, armer, target)
+
+
+async def _enqueue_ocr_job(
+    query, rec: dict, uid: int, target: str
+) -> bool:
+    """Enqueue ``ocr_job`` for an already-validated pending record.
+
+    Shared by the format-picker tap and the direct (default-skip) path so both
+    post the identical queued reply + cancel button.  ``target`` is "pdf" or
+    "txt".  Returns True when the job was queued.
+    """
+    chat_id = rec.get("chat_id")
+    filename = rec.get("filename") or "file"
+    if not chat_id:
+        try:
+            await query.answer(
+                "This OCR link is invalid. Send the file again.",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+        return False
+    # job_timeout > RQ's 180s default: OCR of a multi-page PDF at 200-300 DPI
+    # (and ocrmypdf's text-layer pass) can legitimately outlive the death
+    # penalty (mirrors convert_book_job).
+    ok = await asyncio.to_thread(
+        enqueue_job,
+        "ocr_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        uid,
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        None,  # forward_info is not stored in the pending record
+        rec.get("file_size"),
+        source_chat_id=rec.get("source_chat_id"),
+        target=target,
+        job_timeout=3600,
+    )
+    if ok:
+        try:
+            await query.answer("\U0001f50e OCR queued")
+        except Exception:  # nosec B110
+            pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+        except Exception:  # nosec B110
+            pass
+        _queued_msg = None
+        try:
+            _label = (
+                "building the searchable PDF"
+                if target == "pdf"
+                else "extracting the text"
+            )
+            _queued_msg = await query.message.reply_text(
+                f"\U0001f50e OCR started — {_label} on "
+                f"`{safe_code_span(filename)}`...\n"
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(uid, ok),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        _store_queued_message(
+            ok,
+            chat_id,
+            getattr(_queued_msg, "message_id", None),
+        )
+    else:
+        try:
+            await query.answer(
+                "\u274c Couldn't queue the OCR.", show_alert=True
+            )
+        except Exception:  # nosec B110
+            pass
+    return bool(ok)
 
 
 # ── Register per-user login + auth commands ────────────────────
@@ -4009,6 +5015,46 @@ application.add_handler(
         pattern=r"^canceljob_abort:\d+:\S+$",
     )
 )
+# Book conversion: the 🔁 Convert button on delivered e-books, the format
+# picker it reveals, and the 🗜 Compress PDF button on delivered results —
+# all same-user bound, and conversion never mixes with the thumbnail flow.
+application.add_handler(
+    CallbackQueryHandler(
+        handle_book_convert_button_callback,
+        pattern=r"^bookconvert:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_book_convert_callback,
+        pattern=r"^bookconv:\d+:\S+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_compress_callback,
+        pattern=r"^compresspdf:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_ocr_callback,
+        pattern=r"^ocr:\d+:\S+$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_ocr_pick_callback,
+        pattern=r"^ocrpick:\d+:\S+:(pdf|txt)$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_ocr_set_callback,
+        pattern=r"^ocrset:\d+:(pdf|txt|picker)$",
+    )
+)
+application.add_handler(CommandHandler("ocr", cmd_ocr))
 
 
 @asynccontextmanager
@@ -4077,6 +5123,7 @@ _worker_task = None
 _worker_proc = None  # subprocess.Popen handle for the RQ worker
 _cleanup_task = None
 _longpoll_task = None
+_watchdog_task = None
 _shutdown_event = asyncio.Event()
 
 
@@ -4087,6 +5134,7 @@ async def on_startup() -> None:
         _worker_proc, \
         _cleanup_task, \
         _longpoll_task, \
+        _watchdog_task, \
         _shc_task
     # Ensure storage directories exist
     for d in (
@@ -4454,6 +5502,58 @@ async def on_startup() -> None:
     except Exception as _ka_err:
         logger.warning("Failed to start keep-alive heartbeat: %s", _ka_err)
 
+    # ── Stale-task watchdog: auto-fail zombie progress trackers ──
+    try:
+        _wd_interval = int(
+            os.getenv("PROGRESS_WATCHDOG_INTERVAL_SECONDS", "300")
+        )
+        _wd_stale = int(
+            os.getenv("PROGRESS_WATCHDOG_STALE_SECONDS", "1800")
+        )
+        # 0 disables the watchdog; otherwise enforce a sane floor so a
+        # misconfigured tiny interval can't hammer Redis/Mongo.
+        if _wd_interval > 0:
+            _wd_interval = max(60, _wd_interval)
+
+            async def _progress_watchdog_loop():
+                logger.info(
+                    "Progress watchdog started (interval=%ss, stale=%ss)",
+                    _wd_interval,
+                    _wd_stale,
+                )
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            _shutdown_event.wait(), timeout=_wd_interval
+                        )
+                        break
+                    except TimeoutError:
+                        pass
+                    except asyncio.CancelledError:
+                        break
+                    try:
+                        _failed = (
+                            await progress_tracker.watchdog_stale_tasks(
+                                _wd_stale
+                            )
+                        )
+                        if _failed:
+                            logger.warning(
+                                "Progress watchdog auto-failed %d stale "
+                                "task(s): %s",
+                                len(_failed),
+                                _failed,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Progress watchdog iteration failed"
+                        )
+                logger.info("Progress watchdog stopped")
+
+            _watchdog_task = asyncio.create_task(_progress_watchdog_loop())
+    except Exception as _wd_err:
+        logger.warning("Failed to start progress watchdog: %s", _wd_err)
+
 
 async def on_shutdown() -> None:
     _shutdown_event.set()
@@ -4464,6 +5564,7 @@ async def on_shutdown() -> None:
             (_worker_task, "worker-supervisor"),
             (_cleanup_task, "cleanup"),
             (_longpoll_task, "long-poller"),
+            (_watchdog_task, "progress-watchdog"),
         ]:
             if task and not task.done():
                 task.cancel()
@@ -4599,219 +5700,218 @@ async def handle_text_with_url(
 
     user_id = getattr(update.effective_user, "id", None)
     _loop = asyncio.get_running_loop()
+    _seen: set[str] = set()
+    # Confirmation labels for URLs successfully enqueued this message — sent
+    # as ONE summary reply after the loop instead of one reply per URL.
+    _queued_labels: list[str] = []
 
     for url in urls:
         url = url.rstrip(".,;!?)]")
-        # quick check by extension
-        if url.lower().endswith(".pdf"):
-            # If redis available, enqueue background job to download and process URL
-            chat_id = (
-                msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
-            )
-            parsed = urlparse(url)
-            base = os.path.basename(parsed.path) or "download.pdf"
-            if not base.lower().endswith(".pdf"):
-                base = base + ".pdf"
-            if config.REDIS_URL:
-                # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
-                try:
-                    await telegram_api_limiter.wait_if_needed(
-                        str(getattr(update.effective_user, "id", 0))
-                    )
-                except Exception:  # nosec B110 - throttling is best-effort
-                    pass
-                ok = await asyncio.to_thread(
-                    enqueue_job,
-                    "process_url_job",
-                    chat_id,
-                    url,
-                    base,
-                    user_id,
-                )
-                if ok:
-                    await msg.reply_text(
-                        "Queued your PDF URL for background processing; I'll send the result when ready."
-                    )
-                    return
-                # fall back to inline processing on enqueue failure
-
-            tmpdir = (
-                tempfile.mkdtemp(dir=config.TMP_DIR)
-                if config.TMP_DIR
-                else tempfile.mkdtemp()
-            )
+        if url in _seen:
+            continue  # the same URL listed twice in one message
+        _seen.add(url)
+        # quick check by extension — PDFs and e-books only
+        parsed = urlparse(url)
+        base = os.path.basename(parsed.path) or "download"
+        _url_ext = os.path.splitext(base)[1].lower()
+        if not _url_ext:
+            base = base + ".pdf"
+            _url_ext = ".pdf"
+        _is_pdf_url = _url_ext == ".pdf"
+        _is_ebook_url = (not _is_pdf_url) and is_book_format(base)
+        if not (_is_pdf_url or _is_ebook_url):
+            continue  # silently ignore non-book URLs (unchanged behavior)
+        if _is_ebook_url and not getattr(
+            config, "ENABLE_BOOK_CONVERSION", False
+        ):
             try:
-                file_path = os.path.join(tmpdir, base)
-                await download_url_to_file(url, file_path)
-                thumb_path = os.path.join(tmpdir, "thumb.jpg")
-                create_thumbnail_from_pdf(file_path, thumb_path)
-                _url_file_size = os.path.getsize(file_path)
-                _url_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
-                if _url_file_size > _url_limit and _check_userbot_available(user_id):
+                await msg.reply_text(
+                    "\U0001f4d5 E-book conversion is currently disabled on this "
+                    "instance.\nSend a **PDF** or **image** to get a thumbnail "
+                    "cover.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify about disabled book conversion"
+                )
+            continue  # keep processing the other URLs in the message
+        chat_id = (
+            msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
+        )
+        if config.REDIS_URL:
+            # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
+            try:
+                await telegram_api_limiter.wait_if_needed(
+                    str(getattr(update.effective_user, "id", 0))
+                )
+            except Exception:  # nosec B110 - throttling is best-effort
+                pass
+            ok = await asyncio.to_thread(
+                enqueue_job,
+                "process_url_job",
+                chat_id,
+                url,
+                base,
+                user_id,
+                # job_timeout > RQ's 180s default: large URL downloads (PDF or
+                # e-book echo) can legitimately outlive the death penalty.
+                job_timeout=1800,
+            )
+            if ok:
+                # Truncate pathological URL basenames so a long filename can't
+                # balloon the batched confirmation reply.
+                _label_base = base if len(base) <= 60 else base[:57] + "..."
+                _queued_labels.append(
+                    f"`{safe_code_span(_label_base)}` \u2014 "
+                    + ("PDF URL" if _is_pdf_url else "e-book URL")
+                )
+                continue  # process the remaining URLs in the message
+            # fall back to inline processing on enqueue failure
+
+        tmpdir = (
+            tempfile.mkdtemp(dir=config.TMP_DIR)
+            if config.TMP_DIR
+            else tempfile.mkdtemp()
+        )
+        try:
+            file_path = os.path.join(tmpdir, base)
+            await download_url_to_file(url, file_path)
+            _url_file_size = os.path.getsize(file_path)
+            _url_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
+            if _is_ebook_url:
+                # Conversion-only interface: echo the book back with a
+                # 🔁 Convert button — never the thumbnail pipeline.
+                _convert_uid = user_id if calibre_available() else None
+                _book_caption = (
+                    "\U0001f4da Here's your book. Tap the Convert button "
+                    "to re-format it."
+                    if _convert_uid
+                    else "\U0001f4da Here's your book."
+                )
+                if (
+                    _url_file_size > _url_limit
+                    and _check_userbot_available(user_id)
+                ):
                     await _send_with_upload_progress(
                         bot=context.bot,
-                        chat_id=msg.chat.id
-                        if getattr(msg, "chat", None)
-                        else msg.chat_id,
+                        chat_id=chat_id,
                         file_path=file_path,
-                        caption="Generated thumbnail from URL",
-                        thumb_path=thumb_path,
-                        user_id=getattr(update.effective_user, "id", None),
+                        caption=_book_caption,
+                        thumb_path=None,
+                        user_id=getattr(
+                            update.effective_user, "id", None
+                        ),
                         filename=base,
                         file_size=_url_file_size,
                         loop=_loop,
                         target_chat_id=BOT_USER_ID or "me",
                     )
                 else:
-                    _url_task = None
-                    _url_msg_id = None
-                    if _url_file_size and _url_file_size > 1024 * 1024:
-                        _url_task = progress_tracker.create_task(
-                            uuid.uuid4().hex[:12],
-                            user_id or 0,
+                    with open(file_path, "rb") as f_doc:
+                        await asyncio.to_thread(
+                            _tg_send_document,
+                            config.BOT_TOKEN,
+                            chat_id,
+                            f_doc,
                             base,
-                            _url_file_size,
+                            None,
+                            _book_caption,
+                            None,
+                            None,
+                            _convert_uid,
                         )
-                        _url_msg_id = await send_progress_update(
-                            chat_id, context.bot, _url_task
-                        )
-                    try:
-                        await _send_document_via_bot_api(
-                            bot=context.bot,
-                            chat_id=chat_id,
-                            file_path=file_path,
-                            filename=base,
-                            thumb_path=thumb_path,
-                            caption="Generated thumbnail from URL",
-                            task=_url_task,
-                            progress_msg_id=_url_msg_id,
-                        )
-                    except Exception:
-                        if _url_task:
-                            await progress_tracker.fail_task(
-                                _url_task.task_id, "Telegram send failed"
-                            )
-                        raise
-                    else:
-                        if _url_task:
-                            await progress_tracker.complete_task(
-                                _url_task.task_id
-                            )
-                    finally:
-                        if _url_msg_id:
-                            try:
-                                await context.bot.delete_message(
-                                    chat_id=chat_id,
-                                    message_id=_url_msg_id,
-                                )
-                            except Exception:  # nosec B110
-                                pass
-            except Exception as e:
-                error_info = await handle_bot_error(
-                    e, "URL PDF Processing", update=update
+                continue  # next URL in the message (finally cleans tmpdir)
+            thumb_path = os.path.join(tmpdir, "thumb.jpg")
+            create_thumbnail_from_pdf(file_path, thumb_path)
+            if _url_file_size > _url_limit and _check_userbot_available(user_id):
+                await _send_with_upload_progress(
+                    bot=context.bot,
+                    chat_id=chat_id,
+                    file_path=file_path,
+                    caption="Generated thumbnail from URL",
+                    thumb_path=thumb_path,
+                    user_id=getattr(update.effective_user, "id", None),
+                    filename=base,
+                    file_size=_url_file_size,
+                    loop=_loop,
+                    target_chat_id=BOT_USER_ID or "me",
                 )
+            else:
+                _url_task = None
+                _url_msg_id = None
+                if _url_file_size and _url_file_size > 1024 * 1024:
+                    _url_task = progress_tracker.create_task(
+                        uuid.uuid4().hex[:12],
+                        user_id or 0,
+                        base,
+                        _url_file_size,
+                    )
+                    _url_msg_id = await send_progress_update(
+                        chat_id, context.bot, _url_task
+                    )
                 try:
-                    await msg.reply_text(error_info["user_message"])
-                except Exception:  # nosec B110
-                    pass
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            return
-        else:
-            # HEAD to detect content-type (disabled redirects for SSRF prevention)
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.head(
-                        url, allow_redirects=False
-                    ) as resp:
-                        ctype = resp.headers.get("Content-Type", "")
-                        if "pdf" in ctype.lower():
-                            tmpdir = (
-                                tempfile.mkdtemp(dir=config.TMP_DIR)
-                                if config.TMP_DIR
-                                else tempfile.mkdtemp()
+                    await _send_document_via_bot_api(
+                        bot=context.bot,
+                        chat_id=chat_id,
+                        file_path=file_path,
+                        filename=base,
+                        thumb_path=thumb_path,
+                        caption="Generated thumbnail from URL",
+                        task=_url_task,
+                        progress_msg_id=_url_msg_id,
+                        user_id=user_id,
+                    )
+                except Exception:
+                    if _url_task:
+                        await progress_tracker.fail_task(
+                            _url_task.task_id, "Telegram send failed"
+                        )
+                    raise
+                else:
+                    if _url_task:
+                        await progress_tracker.complete_task(
+                            _url_task.task_id
+                        )
+                finally:
+                    if _url_msg_id:
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=chat_id,
+                                message_id=_url_msg_id,
                             )
-                            try:
-                                parsed = urlparse(url)
-                                base = (
-                                    os.path.basename(parsed.path)
-                                    or "download.pdf"
-                                )
-                                if not base.lower().endswith(".pdf"):
-                                    base = base + ".pdf"
-                                file_path = os.path.join(tmpdir, base)
-                                await download_url_to_file(url, file_path)
-                                thumb_path = os.path.join(tmpdir, "thumb.jpg")
-                                create_thumbnail_from_pdf(
-                                    file_path, thumb_path
-                                )
-                                chat_id = (
-                                    msg.chat.id
-                                    if getattr(msg, "chat", None)
-                                    else msg.chat_id
-                                )
-                                _url_file_size = os.path.getsize(file_path)
-                                _url_task = None
-                                _url_msg_id = None
-                                if _url_file_size > 1024 * 1024:
-                                    _url_task = progress_tracker.create_task(
-                                        uuid.uuid4().hex[:12],
-                                        user_id or 0,
-                                        base,
-                                        _url_file_size,
-                                    )
-                                    _url_msg_id = await send_progress_update(
-                                        chat_id, context.bot, _url_task
-                                    )
-                                try:
-                                    await _send_document_via_bot_api(
-                                        bot=context.bot,
-                                        chat_id=chat_id,
-                                        file_path=file_path,
-                                        filename=base,
-                                        thumb_path=thumb_path,
-                                        caption="Generated thumbnail from URL",
-                                        task=_url_task,
-                                        progress_msg_id=_url_msg_id,
-                                    )
-                                except Exception:
-                                    if _url_task:
-                                        await progress_tracker.fail_task(
-                                            _url_task.task_id,
-                                            "Telegram send failed",
-                                        )
-                                    raise
-                                else:
-                                    if _url_task:
-                                        await progress_tracker.complete_task(
-                                            _url_task.task_id
-                                        )
-                                finally:
-                                    if _url_msg_id:
-                                        try:
-                                            await context.bot.delete_message(
-                                                chat_id=chat_id,
-                                                message_id=_url_msg_id,
-                                            )
-                                        except Exception:  # nosec B110
-                                            pass
-                            except Exception as e:
-                                error_info = await handle_bot_error(
-                                    e,
-                                    "URL PDF Processing (HEAD detect)",
-                                    update=update,
-                                )
-                                try:
-                                    await msg.reply_text(
-                                        error_info["user_message"]
-                                    )
-                                except Exception:  # nosec B110
-                                    pass
-                            finally:
-                                shutil.rmtree(tmpdir, ignore_errors=True)
-                            return
-            except Exception:  # nosec B112
-                continue
+                        except Exception:  # nosec B110
+                            pass
+        except Exception as e:
+            error_info = await handle_bot_error(
+                e, "URL PDF Processing", update=update
+            )
+            try:
+                await msg.reply_text(error_info["user_message"])
+            except Exception:  # nosec B110
+                pass
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        # Continue with the remaining URLs in the message.
+        continue
+
+    # One summary confirmation for every successfully queued URL instead of
+    # one reply per URL (avoids spam on multi-URL messages).  Best-effort: a
+    # failed reply must not surface as an error.
+    if _queued_labels:
+        _n = len(_queued_labels)
+        _plural = "s" if _n != 1 else ""
+        _summary = (
+            f"\U0001f4e5 Queued {_n} URL{_plural} for background processing; "
+            f"I'll send the result{_plural} when ready."
+        )
+        _summary += "\n\n" + "\n".join(
+            f"\u2022 {label}" for label in _queued_labels
+        )
+        try:
+            await msg.reply_text(_summary, parse_mode="Markdown")
+        except Exception:  # nosec B110 - confirmation is best-effort
+            logger.exception("Failed to send batched URL confirmation")
 
 
 application.add_handler(

@@ -258,14 +258,20 @@ def _deliver_result_via_userbot(
     caption: str,
     thumb_path: str | None,
     user_id: int | None,
-) -> bool:
+) -> tuple | None:
     """Deliver a too-large result via the userbot using the user's session.
 
     Sends to the bot's user ID so the file lands in the requesting user's DM
     with the bot (mirroring the web process's big-file delivery); falls back
     to the userbot's Saved Messages ('me') when the bot entity can't be
-    resolved.  Returns True on delivery, False when no userbot session is
-    available (caller then falls back to S3 URL / error message).
+    resolved.
+
+    Returns ``(sent_message, source_chat)`` on delivery, where
+    ``sent_message`` is the userbot's sent message (carries the delivered
+    copy's id) and ``source_chat`` is the chat the copy landed in (the DM as
+    the userbot sees it, or ``'me'`` for Saved Messages) — enough for a later
+    chat-based download of the delivered copy.  ``None`` when no userbot
+    session is available (caller then falls back to S3 URL / error message).
     """
     import asyncio as _asyncio
 
@@ -275,10 +281,10 @@ def _deliver_result_via_userbot(
             send_file_via_userbot_with_fallback,
         )
     except Exception:
-        return False
+        return None
     target = _get_bot_user_id() or "me"
     try:
-        return _asyncio.run(
+        _sent, _used = _asyncio.run(
             send_file_via_userbot_with_fallback(
                 chat_id=target,
                 file_path=file_path,
@@ -297,7 +303,20 @@ def _deliver_result_via_userbot(
             target,
             user_id,
         )
-        return False
+        return None
+    if not _sent:
+        return None
+    # Where the copy actually landed, as the userbot resolves it: Saved
+    # Messages when the 'me' fallback fired, else the sent message's own chat
+    # (the DM with the bot for the primary target).
+    if str(_used) == "me":
+        _src = "me"
+    else:
+        _msg_chat = getattr(_sent, "chat_id", None)
+        if _msg_chat is None:
+            _msg_chat = getattr(getattr(_sent, "chat", None), "id", None)
+        _src = _msg_chat if _msg_chat is not None else target
+    return (_sent, _src)
 
 
 def _cleanup_after_success(
@@ -384,9 +403,42 @@ from tools import (  # noqa: E402
     extract_pdf_metadata,
     is_supported_format,
 )
+from utils.ebook_converter import (  # noqa: E402
+    ConversionCancelledError,
+    calibre_available,
+    convert_book_to_pdf_with_thumbnail,
+    convert_ebook,
+    is_book_format,
+    safe_target_name,
+)
+from utils.ocr import (  # noqa: E402
+    OCRCancelledError,
+    is_ocr_source,
+    ocr_enabled,
+    run_ocr,
+    run_ocr_pdf,
+)
+
+
+def _is_ebook(filename: str | None) -> bool:
+    """True for non-PDF book formats — the conversion-only interface.
+
+    PDFs stay on the thumbnail flow; every other allowed book format gets the
+    deliver-back-with-Convert-button treatment, uniformly across the document,
+    batch and URL entry points.
+    """
+    return bool(filename) and is_book_format(filename) and not filename.lower().endswith(".pdf")
+
+
+def _book_conversion_enabled() -> bool:
+    """The ENABLE_BOOK_CONVERSION master switch (default on)."""
+    return bool(getattr(config, "ENABLE_BOOK_CONVERSION", False))
 from utils.progress_tracker import _format_size  # noqa: E402
 from utils.storage import _TransferProgress  # noqa: E402,F401
 from utils.tg_http import (  # noqa: E402
+    BOOK_CONVERT_ACTION,
+    COMPRESS_PDF_ACTION,
+    OCR_ACTION,
     _tg_delete_message,
     _tg_download_to_bytes,
     _tg_download_to_file,
@@ -395,8 +447,64 @@ from utils.tg_http import (  # noqa: E402
     _tg_get_file_path,
     _tg_send_document,
     _tg_send_message,
+    _tg_send_pending_prompt,
     _tg_send_progress,
 )
+
+
+def _maybe_attach_result_prompt(
+    chat_id: int,
+    file_path: str,
+    filename: str,
+    user_id: int | None,
+    src_chat: int | str,
+    src_message: int | None,
+) -> None:
+    """Post one-tap result prompts after a userbot-delivered file.
+
+    The bot cannot edit the userbot's delivered message, so oversized results
+    delivered through the userbot get a bot-API prompt pointing at the
+    delivered copy (mirrors the book/convert fallback).  PDFs get
+    [🗜 Compress PDF] + [🔎 OCR]; raster images get [🔎 OCR]; everything else
+    is skipped.  Best-effort.
+    """
+    if not src_message:
+        return
+    _name = filename or ""
+    _is_pdf = _name.lower().endswith(".pdf")
+    if not (_is_pdf or is_ocr_source(_name)):
+        return
+    _size = 0
+    try:
+        if file_path:
+            _size = os.path.getsize(file_path)
+    except Exception:  # nosec B110
+        _size = 0
+    if _is_pdf:
+        _tg_send_pending_prompt(
+            *COMPRESS_PDF_ACTION,
+            chat_id=chat_id,
+            filename=filename,
+            user_id=user_id,
+            file_size=_size,
+            src_chat_id=src_chat,
+            src_message_id=src_message,
+            extra_action=(
+                (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
+                if ocr_enabled()
+                else None
+            ),
+        )
+    elif ocr_enabled():
+        _tg_send_pending_prompt(
+            *OCR_ACTION,
+            chat_id=chat_id,
+            filename=filename,
+            user_id=user_id,
+            file_size=_size,
+            src_chat_id=src_chat,
+            src_message_id=src_message,
+        )
 
 try:
     from rq import get_current_job
@@ -830,14 +938,27 @@ def process_input_key_job(job: dict) -> dict:
                 )
             except Exception:  # nosec B110
                 pass
-            if _deliver_result_via_userbot(
+            _ub_res = _deliver_result_via_userbot(
                 chat_id,
                 upload_path,
                 filename,
                 "Here is your file with an auto-generated cover preview.",
                 thumb_path,
                 user_id,
-            ):
+            )
+            if _ub_res:
+                _sent, _src_chat = _ub_res
+                # Oversized PDFs delivered via the userbot get a one-tap
+                # 🗜 Compress prompt pointing at the delivered copy (mirrors
+                # the book/convert fallback).
+                _maybe_attach_result_prompt(
+                    chat_id,
+                    upload_path,
+                    filename,
+                    user_id,
+                    _src_chat,
+                    getattr(_sent, "id", None),
+                )
                 try:
                     out_meta.setdefault("status", "done")
                     out_meta.setdefault("delivery", "userbot")
@@ -958,6 +1079,8 @@ def process_input_key_job(job: dict) -> dict:
                 thumb_fileobj=f_thumb,
                 caption="Here is your file with an auto-generated cover preview.",
                 progress_callback=_live_send_cb,
+                compress_user_id=user_id,
+                ocr_user_id=user_id,
             )
         send_elapsed = time.time() - send_start
         out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -1167,8 +1290,12 @@ def process_document_job(
                 None,
                 chat_id,
                 "\u274c Unsupported file format.\n\n"
-                "This bot only processes **PDF documents** and **images** (JPEG, PNG, WEBP, GIF).\n"
+                "I work with **PDFs, images** (JPEG, PNG, WEBP, GIF) and **e-books** "
+                "(EPUB, MOBI, AZW3, FB2, DOCX, TXT, RTF, HTML, ODT and more).\n"
                 "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported.",
+                # Static text with **bold** markers -- no user input, so
+                # Markdown parsing is safe (matches the other formatted sends).
+                parse_mode="Markdown",
             )
         except Exception:  # nosec B110
             pass
@@ -1852,14 +1979,27 @@ def process_document_job(
                     )
                 except Exception:  # nosec B110
                     pass
-                if _deliver_result_via_userbot(
+                _ub_res = _deliver_result_via_userbot(
                     chat_id,
                     upload_path,
                     filename,
                     "Here is your file with an auto-generated cover preview.",
                     thumb_path,
                     user_id,
-                ):
+                )
+                if _ub_res:
+                    _sent, _src_chat = _ub_res
+                    # Oversized PDFs delivered via the userbot get a one-tap
+                    # 🗜 Compress prompt pointing at the delivered copy (mirrors
+                    # the book/convert fallback).
+                    _maybe_attach_result_prompt(
+                        chat_id,
+                        upload_path,
+                        filename,
+                        user_id,
+                        _src_chat,
+                        getattr(_sent, "id", None),
+                    )
                     try:
                         out_meta.setdefault("status", "done")
                         out_meta.setdefault("delivery", "userbot")
@@ -1983,6 +2123,8 @@ def process_document_job(
                     filename,
                     thumb_fileobj=f_thumb,
                     caption="Here is your file with an auto-generated cover preview.",
+                    compress_user_id=user_id,
+                    ocr_user_id=user_id,
                 )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -2151,14 +2293,28 @@ def process_document_job(
                         _ub_thumb = os.path.join(td, "userbot_thumb.jpg")
                         with open(_ub_thumb, "wb") as _ub_th:
                             _ub_th.write(thumb_bytes)
-                        if _deliver_result_via_userbot(
+                        _ub_res = _deliver_result_via_userbot(
                             chat_id,
                             _ub_tmp,
                             filename,
                             "Here is your file with an auto-generated cover preview.",
                             _ub_thumb,
                             user_id,
-                        ):
+                        )
+                        if _ub_res:
+                            _sent, _src_chat = _ub_res
+                            # Oversized PDFs delivered via the userbot get a
+                            # one-tap 🗜 Compress prompt pointing at the
+                            # delivered copy (mirrors the book/convert
+                            # fallback).
+                            _maybe_attach_result_prompt(
+                                chat_id,
+                                _ub_tmp,
+                                filename,
+                                user_id,
+                                _src_chat,
+                                getattr(_sent, "id", None),
+                            )
                             try:
                                 out_meta.setdefault("status", "done")
                                 out_meta.setdefault("delivery", "userbot")
@@ -2274,6 +2430,8 @@ def process_document_job(
                 filename,
                 thumb_fileobj=thumb_buf,
                 caption="Here is your file with an auto-generated cover preview.",
+                compress_user_id=user_id,
+                ocr_user_id=user_id,
             )
             send_elapsed = time.time() - send_start
             out_meta.setdefault("durations", {})["tg_send_ms"] = int(
@@ -2400,6 +2558,43 @@ def process_document_batch_job(
             )
             results.append({"skipped": "unsupported format", "filename": filename, "mime": mime})
             continue
+        # ── E-books: conversion has its own clean interface, even in batch ──
+        if _is_ebook(filename):
+            if not _book_conversion_enabled():
+                logger.info(
+                    "process_document_batch_job: skipping e-book (conversion disabled): %s (user_id=%s)",
+                    filename,
+                    user_id,
+                )
+                results.append(
+                    {
+                        "skipped": "book conversion disabled",
+                        "filename": filename,
+                    }
+                )
+                continue
+            try:
+                res = deliver_book_job(
+                    chat_id,
+                    file_id,
+                    filename,
+                    mime,
+                    user_id,
+                    file_unique_id=item.get("file_unique_id"),
+                    message_id=item.get("message_id"),
+                    forward_info=item.get("forward_info"),
+                    file_size=item.get("file_size"),
+                    _skip_queued_delete=True,
+                )
+                results.append(res)
+            except Exception:
+                logger.exception(
+                    "Failed processing batch e-book item %s (user_id=%s)",
+                    filename,
+                    user_id,
+                )
+                results.append({"error": f"failed: {filename}"})
+            continue
         try:
             res = process_document_job(
                 chat_id,
@@ -2444,6 +2639,1258 @@ def process_document_batch_job(
     return results
 
 
+def _download_progress_cb(
+    chat_id: int,
+    filename: str,
+    recv: int,
+    total: int,
+    state: dict[str, float],
+) -> None:
+    """Throttled live 'Downloading...' progress reporter for conversion jobs.
+
+    ``state`` is a mutable dict (``{"msg_id": ..., "last_pct": -1.0,
+    "last_t": 0.0}``) reused across calls so the Telegram progress message
+    isn't spammed per chunk.  The live message id is tracked inside ``state``
+    because ``_tg_send_progress`` recreates the message when an edit fails.
+    """
+    if not total or not state.get("msg_id"):
+        return
+    pct = int(recv * 100 / total)
+    now = time.time()
+    if pct - state["last_pct"] < 2 and now - state["last_t"] < 2.0:
+        return
+    state["last_pct"] = float(pct)
+    state["last_t"] = now
+    try:
+        new_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "downloading",
+            detail=(
+                f"\U0001f4e5 Downloading: "
+                f"{_format_size(recv)} / {_format_size(total)} ({pct}%)"
+            ),
+            message_id=int(state["msg_id"]),
+            progress_pct=pct,
+        )
+        if new_id:
+            state["msg_id"] = float(new_id)
+    except Exception:  # nosec B110 - progress is best-effort
+        pass
+
+
+def _download_job_file(
+    file_id: str | None,
+    dest_path: str,
+    filename: str,
+    file_size: int | None = None,
+    user_id: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+    file_unique_id: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
+    """Download a job's source file, chaining the Bot API + userbot pipes.
+
+    Mirrors ``process_document_job``'s fallback chain so conversion/compression
+    jobs work for files of every size:
+
+    1. Bot API ``getFile`` -- streamed to disk; skipped entirely when the size
+       is already known to exceed ``BOT_API_DOWNLOAD_LIMIT_BYTES``.
+    2. Userbot file-id download (``download_bytes_by_file_id_via_userbot``) --
+       in-memory, works with only a ``file_id``.
+    3. Userbot chat-based disk download (``download_forward_via_userbot``:
+       Telethon, then Pyrogram) -- the reliable path for large files, used
+       when ``chat_id``/``message_id`` are known.
+    4. Relay-group fallback (forward via Bot API to ``RELAY_CHAT_ID``, then
+       userbot download there) -- mirrors fallback (d) of the main pipeline.
+
+    ``progress_callback(recv, total)`` (optional) is forwarded to every leg for
+    LIVE progress.  ``cancel_check()`` (optional) is polled before each leg and
+    raises ``_JobCancelledError`` so a /canceljob can abort mid-download.
+
+    Returns True when ``dest_path`` exists and is non-empty.
+    """
+    import asyncio as _asyncio
+    import os as _os
+
+    _fails: list[str] = []
+
+    def _raise_if_cancelled() -> None:
+        if cancel_check and cancel_check():
+            raise _JobCancelledError("download cancelled")
+
+    # ── Pipe 1: Bot API getFile (capped by the getFile download limit; files
+    # above it would 400 "file is too big", so route straight to the userbot).
+    _bot_dl_limit = getattr(config, "BOT_API_DOWNLOAD_LIMIT_BYTES", 0)
+    if file_size is None or not _bot_dl_limit or file_size <= _bot_dl_limit:
+        try:
+            _raise_if_cancelled()
+            _path = _tg_get_file_path(None, file_id)
+            if _path:
+                _tg_download_to_file(
+                    None,
+                    _path,
+                    dest_path,
+                    total=file_size or 0,
+                    progress_callback=progress_callback,
+                )
+                if _os.path.exists(dest_path) and _os.path.getsize(dest_path) > 0:
+                    return True
+                _fails.append("bot api: empty file")
+            else:
+                _fails.append("bot api: getFile returned empty")
+        except _JobCancelledError:
+            raise
+        except Exception as exc:
+            _fails.append(f"bot api: {exc}")
+            logger.warning("_download_job_file: Bot API download failed: %s", exc)
+    else:
+        logger.info(
+            "_download_job_file: size %s above Bot API getFile cap, using userbot pipes",
+            _format_size(file_size),
+        )
+
+    # ── Pipe 2a: userbot file-id download (in-memory; works with file_id
+    # only).  Skipped for very large files so a 100MB+ book is never fully
+    # buffered in RAM before the streaming disk pipe below is tried.
+    _in_mem_max = 200 * 1024 * 1024
+    try:
+        from utils.bigfile_pipeline import (
+            IN_MEMORY_MAX_BYTES as _IMM,  # noqa: N814
+        )
+
+        _in_mem_max = int(_IMM)
+    except Exception:  # nosec B110 - fall back to a sane default
+        pass
+    # Only skip the in-memory pipe when a streaming alternative actually
+    # exists (chat context present); otherwise attempt it rather than fail.
+    _skip_file_id = bool(
+        chat_id
+        and message_id
+        and file_size
+        and _in_mem_max
+        and file_size > _in_mem_max
+    )
+    if _skip_file_id:
+        logger.info(
+            "_download_job_file: size %s above in-memory threshold, skipping file_id pipe",
+            _format_size(file_size),
+        )
+    else:
+        try:
+            _raise_if_cancelled()
+            from utils.userbot_downloader import (
+                download_bytes_by_file_id_via_userbot,
+            )
+
+            _data = _asyncio.run(
+                download_bytes_by_file_id_via_userbot(
+                    file_id, progress_callback=progress_callback, user_id=user_id
+                )
+            )
+            if _data:
+                with open(dest_path, "wb") as _fh:
+                    _fh.write(_data)
+                if _os.path.getsize(dest_path) > 0:
+                    return True
+            _fails.append("userbot file_id: empty")
+        except _JobCancelledError:
+            raise
+        except Exception as exc:
+            _fails.append(f"userbot file_id: {exc}")
+            logger.warning("_download_job_file: file_id download failed: %s", exc)
+
+    # ── Pipe 2b: userbot chat-based disk download (Telethon -> Pyrogram).
+    if chat_id and message_id:
+        try:
+            _raise_if_cancelled()
+            from utils.userbot_downloader import download_forward_via_userbot
+
+            _ok = _asyncio.run(
+                download_forward_via_userbot(
+                    chat_id,
+                    message_id,
+                    dest_path,
+                    file_unique_id=file_unique_id,
+                    progress_callback=progress_callback,
+                    file_id=file_id,
+                    user_id=user_id,
+                )
+            )
+            if _ok and _os.path.exists(dest_path) and _os.path.getsize(dest_path) > 0:
+                return True
+            _fails.append("userbot chat: empty")
+        except _JobCancelledError:
+            raise
+        except Exception as exc:
+            _fails.append(f"userbot chat: {exc}")
+            logger.warning(
+                "_download_job_file: chat-based download failed (%s/%s): %s",
+                chat_id,
+                message_id,
+                exc,
+            )
+
+    # ── Pipe 2c: relay-group fallback (forward via Bot API, download there).
+    if chat_id and message_id:
+        try:
+            _raise_if_cancelled()
+            _relay = getattr(config, "RELAY_CHAT_ID", None)
+            if _relay:
+                _relay_id = int(_relay)
+                _fwd_id = _tg_forward_message(
+                    config.BOT_TOKEN, _relay_id, chat_id, message_id
+                )
+                if _fwd_id:
+                    from utils.userbot_downloader import (
+                        download_forward_via_userbot,
+                    )
+
+                    _ok = _asyncio.run(
+                        download_forward_via_userbot(
+                            _relay_id,
+                            _fwd_id,
+                            dest_path,
+                            progress_callback=progress_callback,
+                            user_id=user_id,
+                        )
+                    )
+                    if _ok and (
+                        _os.path.exists(dest_path)
+                        and _os.path.getsize(dest_path) > 0
+                    ):
+                        return True
+                    _fails.append("relay: empty")
+                else:
+                    _fails.append("relay: forwardMessage failed")
+            else:
+                _fails.append("relay: RELAY_CHAT_ID not configured")
+        except _JobCancelledError:
+            raise
+        except Exception as exc:
+            _fails.append(f"relay: {exc}")
+            logger.warning("_download_job_file: relay download failed: %s", exc)
+
+    logger.warning(
+        "_download_job_file: all download pipes failed for %s: %s",
+        filename,
+        "; ".join(_fails) or "no attempts",
+    )
+    return False
+
+
+def _deliver_converted_file(
+    chat_id: int,
+    file_path: str,
+    filename: str,
+    thumb_path: str | None,
+    caption: str,
+    user_id: int | None,
+    progress_msg_id: int | None = None,
+    convert_user_id: int | None = None,
+    ocr_user_id: int | None = None,
+) -> None:
+    """Send a converted/compressed result with live progress + cancel respect.
+
+    Streams the file via ``_tg_send_document`` (with the Compress-PDF button
+    for PDF outputs and the 🔁 Convert button for e-books when
+    ``convert_user_id`` is set) and deletes the transient progress message
+    when done.  Results too large for the Bot API upload cap fall back to
+    userbot delivery with a bot-API Compress/Convert prompt pointing at the
+    delivered copy, so conversion/compression results of ANY size arrive.
+    Raises when delivery fails entirely so callers can notify the user.
+    """
+    _cb_state = {"last_pct": -1, "last_t": 0.0}
+
+    def _live_cb(recv: int, total: int) -> None:
+        if not total:
+            return
+        pct = int(recv * 100 / total)
+        if pct - _cb_state["last_pct"] < 2 and time.time() - _cb_state["last_t"] < 2.0:
+            return
+        _cb_state["last_pct"] = pct
+        _cb_state["last_t"] = time.time()
+        try:
+            _tg_send_progress(
+                chat_id,
+                filename,
+                "sending",
+                detail=(
+                    f"\U0001f4e4 Sending to Telegram: "
+                    f"{_format_size(recv)} / {_format_size(total)}"
+                ),
+                file_size=total,
+                message_id=progress_msg_id,
+                progress_pct=pct,
+            )
+        except Exception:  # nosec B110 - progress is best-effort
+            pass
+
+    _thumb = None
+    try:
+        try:
+            if thumb_path and os.path.exists(thumb_path):
+                _thumb = open(thumb_path, "rb")
+            with open(file_path, "rb") as _doc:
+                _tg_send_document(
+                    None,
+                    chat_id,
+                    _doc,
+                    filename,
+                    thumb_fileobj=_thumb,
+                    caption=caption,
+                    progress_callback=_live_cb,
+                    compress_user_id=user_id,
+                    convert_user_id=convert_user_id,
+                    ocr_user_id=ocr_user_id or user_id,
+                )
+        except Exception:
+            # Too large for a Bot API upload (sendDocument cap): deliver via
+            # the userbot and post a bot-API prompt pointing at the delivered
+            # copy, so the Compress/Convert interface survives big results too.
+            logger.warning(
+                "_deliver_converted_file: Bot API send failed for %s, "
+                "trying userbot",
+                filename,
+            )
+            _res = _deliver_result_via_userbot(
+                chat_id, file_path, filename, caption, thumb_path, user_id
+            )
+            if not _res:
+                raise
+            _sent, _src_chat = _res
+            try:
+                _dl_size = 0
+                try:
+                    _dl_size = os.path.getsize(file_path)
+                except Exception:  # nosec B110
+                    pass
+                _sent_id = getattr(_sent, "id", None)
+                _name = filename or ""
+                _is_pdf = _name.lower().endswith(".pdf")
+                if _is_pdf:
+                    _tg_send_pending_prompt(
+                        *COMPRESS_PDF_ACTION,
+                        chat_id=chat_id,
+                        filename=filename,
+                        user_id=user_id,
+                        file_size=_dl_size,
+                        src_chat_id=_src_chat,
+                        src_message_id=_sent_id,
+                        extra_action=(
+                            (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
+                            if ocr_enabled()
+                            else None
+                        ),
+                    )
+                elif is_ocr_source(_name):
+                    if ocr_enabled():
+                        _tg_send_pending_prompt(
+                            *OCR_ACTION,
+                            chat_id=chat_id,
+                            filename=filename,
+                            user_id=user_id,
+                            file_size=_dl_size,
+                            src_chat_id=_src_chat,
+                            src_message_id=_sent_id,
+                        )
+                elif convert_user_id:
+                    _tg_send_pending_prompt(
+                        *BOOK_CONVERT_ACTION,
+                        chat_id=chat_id,
+                        filename=filename,
+                        user_id=user_id,
+                        file_size=_dl_size,
+                        src_chat_id=_src_chat,
+                        src_message_id=_sent_id,
+                    )
+            except Exception:  # nosec B110 - the prompt is best-effort
+                logger.exception(
+                    "_deliver_converted_file: failed to attach prompt for %s",
+                    filename,
+                )
+        # Delivery done: remove the transient progress bar (mirrors
+        # _cleanup_after_success in the other worker flows).
+        try:
+            _tg_delete_message(chat_id, progress_msg_id)
+        except Exception:  # nosec B110
+            pass
+    finally:
+        try:
+            if _thumb:
+                _thumb.close()
+        except Exception:  # nosec B110
+            pass
+
+
+def _deliver_book_echo(
+    chat_id: int,
+    file_path: str,
+    filename: str,
+    user_id: int | None,
+    progress_msg_id: int | None = None,
+) -> bool:
+    """Echo a local e-book back with a one-tap 🔁 Convert button.
+
+    Shared by ``deliver_book_job`` and the URL flow so every entry point uses
+    the same conversion-only delivery.  The Convert button is only attached
+    when Calibre is installed; oversized books fall back to userbot delivery
+    (a bot-API Convert prompt still follows, so big books keep the full
+    conversion interface).  Returns True on delivery.
+    """
+    _convert_uid = user_id if calibre_available() else None
+    _caption = (
+        "\U0001f4da Here's your book. Tap the Convert button to re-format it."
+        if _convert_uid
+        else "\U0001f4da Here's your book."
+    )
+    try:
+        _deliver_converted_file(
+            chat_id=chat_id,
+            file_path=file_path,
+            filename=filename,
+            thumb_path=None,
+            caption=_caption,
+            user_id=user_id,
+            progress_msg_id=progress_msg_id,
+            convert_user_id=_convert_uid,
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "_deliver_book_echo: delivery failed for %s", filename
+        )
+        return False
+
+
+def deliver_book_job(
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    mime: str | None = "",
+    user_id: int | None = None,
+    file_unique_id: str | None = None,
+    message_id: int | None = None,
+    forward_info: dict | None = None,
+    file_size: int | None = None,
+    _skip_queued_delete: bool = False,
+) -> dict:
+    """RQ job: echo an e-book back with a one-tap 🔁 Convert button.
+
+    Conversion deliberately has its own clean interface, separate from the
+    thumbnail flow: the book is downloaded (shared Bot-API <20MB / userbot
+    pipe), sent back with a Convert button, and nothing else is processed
+    until the user picks a target format.  ``_skip_queued_delete`` keeps the
+    caller's "Queued..." confirmation (batch items) from being deleted.
+    Returns a result dict.
+    """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "deliver_book_job: start chat_id=%s user_id=%s file=%s size=%s",
+        chat_id,
+        user_id,
+        filename,
+        file_size,
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "mime": mime,
+                    "file_size": file_size,
+                    "message_id": message_id,
+                    "forward_info": forward_info,
+                    "enqueued_at": int(time.time()),
+                },
+            )
+            out_meta = {
+                "status": "processing",
+                "timestamps": {"start": int(time.time())},
+                "user_id": user_id,
+            }
+            _set_io_keys(_rq_job_id, output_meta=out_meta)
+        except Exception:
+            logger.exception(
+                "Failed to write io:in for deliver job %s", _rq_job_id
+            )
+    _cancel_check_id = _rq_job_id or file_id
+    if _job_cancelled(_cancel_check_id):
+        return {"status": "cancelled"}
+
+    tmpdir = (
+        tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
+        if getattr(config, "TMP_DIR", None)
+        else tempfile.mkdtemp()
+    )
+    _progress_msg_id = None
+    try:
+        _progress_msg_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "downloading",
+            detail="\U0001f4e5 Downloading book...",
+            file_size=file_size or 0,
+        )
+        _src = os.path.join(tmpdir, filename)
+        _dl_state: dict[str, float] = {
+            "msg_id": float(_progress_msg_id or 0),
+            "last_pct": -1.0,
+            "last_t": 0.0,
+        }
+
+        def _dl_cb(recv: int, total: int) -> None:
+            _download_progress_cb(chat_id, filename, recv, total, _dl_state)
+
+        try:
+            _ok = _download_job_file(
+                file_id,
+                _src,
+                filename,
+                file_size,
+                user_id,
+                progress_callback=_dl_cb,
+                chat_id=chat_id,
+                message_id=message_id,
+                file_unique_id=file_unique_id,
+                cancel_check=lambda: _job_cancelled(_cancel_check_id),
+            )
+        except _JobCancelledError:
+            _cleanup_after_failure(
+                chat_id,
+                _rq_job_id,
+                int(_dl_state["msg_id"]) or _progress_msg_id,
+                skip_queued_delete=_skip_queued_delete,
+            )
+            return {"status": "cancelled"}
+        _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
+        if not _ok:
+            try:
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\u274c Failed to download the book. "
+                    "Try again in a moment.",
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(
+                chat_id,
+                _rq_job_id,
+                _progress_msg_id,
+                skip_queued_delete=_skip_queued_delete,
+            )
+            return {"error": "download_failed"}
+
+        # Deliver to the original chat (the user's DM with the bot) — same
+        # place the progress message lives, so live edits and cleanup line up
+        # (mirrors convert_book_job).  The userbot fallback inside the echo
+        # helper targets the bot DM internally.
+        if not _deliver_book_echo(
+            chat_id, _src, filename, user_id, _progress_msg_id
+        ):
+            raise RuntimeError("book echo delivery failed")
+        _cleanup_after_success(
+            chat_id,
+            _rq_job_id,
+            _progress_msg_id,
+            skip_queued_delete=_skip_queued_delete,
+        )
+        try:
+            if _rq_job_id:
+                _set_io_keys(
+                    _rq_job_id,
+                    output_meta={
+                        "status": "done",
+                        "delivery": "bot_api",
+                        "timestamps": {"finished": int(time.time())},
+                        "user_id": user_id,
+                    },
+                )
+        except Exception:  # nosec B110
+            pass
+        return {"status": "done", "delivery": "bot_api"}
+    except Exception as exc:
+        logger.exception(
+            "deliver_book_job: failed for %s (chat=%s user_id=%s)",
+            filename,
+            chat_id,
+            user_id,
+        )
+        _cleanup_after_failure(
+            chat_id,
+            _rq_job_id,
+            _progress_msg_id,
+            skip_queued_delete=_skip_queued_delete,
+        )
+        try:
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error delivering the book: "
+                f"{_short_error(exc)}\nCheck server logs for details.",
+            )
+        except Exception:  # nosec B110
+            pass
+        return {"error": "deliver_failed"}
+    finally:
+        try:
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:  # nosec B110
+            pass
+
+
+def convert_book_job(
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    mime: str | None = "",
+    target_fmt: str = "pdf",
+    user_id: int | None = None,
+    file_unique_id: str | None = None,
+    message_id: int | None = None,
+    forward_info: dict | None = None,
+    file_size: int | None = None,
+    source_chat_id: int | str | None = None,
+) -> dict:
+    """RQ job: convert an e-book to ``target_fmt`` and deliver it.
+
+    Downloads the file (Bot API, userbot fallback for large files), converts
+    with Calibre's ``ebook-convert``, attaches a cover thumbnail for PDF
+    outputs, and streams the result back with live progress.  The delivered
+    PDF carries a one-tap Compress button.  ``source_chat_id`` overrides the
+    chat used for the download when the book was delivered elsewhere (e.g. a
+    large book re-downloaded from the userbot's DM/Saved Messages copy);
+    delivery still targets ``chat_id``.  Returns a result dict.
+    """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "convert_book_job: start chat_id=%s user_id=%s file=%s target=%s",
+        chat_id,
+        user_id,
+        filename,
+        target_fmt,
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "target_fmt": target_fmt,
+                    "enqueued_at": int(time.time()),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to write io:in for convert job %s", _rq_job_id)
+    _cancel_check_id = _rq_job_id or file_id
+    if _job_cancelled(_cancel_check_id):
+        return {"status": "cancelled"}
+
+    tmpdir = (
+        tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
+        if getattr(config, "TMP_DIR", None)
+        else tempfile.mkdtemp()
+    )
+    _progress_msg_id = None
+    try:
+        _progress_msg_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "downloading",
+            detail="\U0001f4e5 Downloading...",
+            file_size=file_size or 0,
+        )
+        _src = os.path.join(tmpdir, filename)
+        _dl_state: dict[str, float] = {
+            "msg_id": float(_progress_msg_id or 0),
+            "last_pct": -1.0,
+            "last_t": 0.0,
+        }
+
+        def _dl_cb(recv: int, total: int) -> None:
+            _download_progress_cb(chat_id, filename, recv, total, _dl_state)
+
+        try:
+            _ok = _download_job_file(
+                file_id,
+                _src,
+                filename,
+                file_size,
+                user_id,
+                progress_callback=_dl_cb,
+                # Large books are re-downloaded from the delivered copy's chat
+                # (userbot DM/Saved Messages), not the original chat.
+                chat_id=source_chat_id or chat_id,
+                message_id=message_id,
+                file_unique_id=file_unique_id,
+                cancel_check=lambda: _job_cancelled(_cancel_check_id),
+            )
+        except _JobCancelledError:
+            _cleanup_after_failure(
+                chat_id,
+                _rq_job_id,
+                int(_dl_state["msg_id"]) or _progress_msg_id,
+            )
+            return {"status": "cancelled"}
+        # Sync the live (possibly recreated) progress message id back so the
+        # follow-up phase-switch edit and failure cleanup target the right msg.
+        _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
+        if not _ok:
+            _tg_send_progress(
+                chat_id, filename, "failed",
+                detail="\u274c Failed to download the file.",
+                message_id=_progress_msg_id,
+            )
+            return {"error": "download_failed"}
+
+        if _job_cancelled(_cancel_check_id):
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "cancelled"}
+
+        _tg_send_progress(
+            chat_id, filename, "compressing",
+            detail=f"\u2699\ufe0f Converting to {target_fmt.upper()}...",
+            message_id=_progress_msg_id,
+        )
+        _out_name = safe_target_name(filename, target_fmt)
+        _out = os.path.join(tmpdir, _out_name)
+        _timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
+        _thumb = None
+        _thumb_path = None
+        try:
+            if target_fmt.lower() == "pdf":
+                _conv_ok = convert_book_to_pdf_with_thumbnail(
+                    _src, _out, os.path.join(tmpdir, "thumb.jpg"),
+                    timeout=_timeout,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+                _thumb_path = os.path.join(tmpdir, "thumb.jpg")
+            else:
+                _conv_ok = convert_ebook(
+                    _src, _out, timeout=_timeout,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+        except ConversionCancelledError:
+            logger.info(
+                "convert_book_job: cancelled mid-conversion for %s", filename
+            )
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "cancelled"}
+        if not _conv_ok or not os.path.exists(_out):
+            _tg_send_progress(
+                chat_id, filename, "failed",
+                detail=(
+                    f"\u274c Conversion to {target_fmt.upper()} failed. "
+                    "The file may be DRM-protected or corrupt."
+                ),
+                message_id=_progress_msg_id,
+            )
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"error": "conversion_failed"}
+
+        if _job_cancelled(_cancel_check_id):
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "cancelled"}
+
+        _caption = f"Here is your file converted to {target_fmt.upper()}."
+        _deliver_converted_file(
+            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
+            progress_msg_id=_progress_msg_id,
+        )
+        out_meta = {
+            "status": "done",
+            "filename": _out_name,
+            "target_fmt": target_fmt,
+            "timestamps": {"finished": int(time.time())},
+        }
+        try:
+            _set_io_keys(_rq_job_id, output_meta=out_meta)
+        except Exception:  # nosec B110
+            pass
+        _delete_queued_messages(_rq_job_id)
+        return {"status": "done", "converted_to": target_fmt}
+    except Exception as exc:
+        logger.exception("convert_book_job: error for %s", filename)
+        _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+        try:
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error converting the file: "
+                f"{_short_error(exc)}\nCheck server logs for details.",
+            )
+        except Exception:  # nosec B110
+            pass
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                output_meta={"status": "error", "error": str(exc)},
+            )
+        except Exception:  # nosec B110
+            pass
+        return {"error": str(exc)}
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:  # nosec B110
+            pass
+
+
+def compress_pdf_job(
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    user_id: int | None = None,
+    file_unique_id: str | None = None,
+    message_id: int | None = None,
+    file_size: int | None = None,
+    forward_info: dict | None = None,
+    source_chat_id: int | str | None = None,
+) -> dict:
+    """RQ job: compress a delivered PDF and send the smaller version back.
+
+    Triggered by the 🗜 Compress PDF button on a delivered result.  Downloads
+    via the shared Bot-API + userbot pipe chain (so any delivered size works),
+    compresses with ``compress_pdf`` (Ghostscript with PyMuPDF fallback) and
+    streams the result back with live progress.
+    """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "compress_pdf_job: start chat_id=%s user_id=%s file=%s size=%s",
+        chat_id, user_id, filename, file_size,
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "file_size": file_size,
+                    "message_id": message_id,
+                    "forward_info": forward_info,
+                    "enqueued_at": int(time.time()),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to write io:in for compress job %s", _rq_job_id)
+    _cancel_check_id = _rq_job_id or file_id
+    if _job_cancelled(_cancel_check_id):
+        return {"status": "cancelled"}
+
+    tmpdir = (
+        tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
+        if getattr(config, "TMP_DIR", None)
+        else tempfile.mkdtemp()
+    )
+    _progress_msg_id = None
+    try:
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "downloading",
+            detail="\U0001f4e5 Downloading PDF...",
+        )
+        _src = os.path.join(tmpdir, filename)
+        _dl_state: dict[str, float] = {
+            "msg_id": float(_progress_msg_id or 0),
+            "last_pct": -1.0,
+            "last_t": 0.0,
+        }
+
+        def _dl_cb(recv: int, total: int) -> None:
+            _download_progress_cb(chat_id, filename, recv, total, _dl_state)
+
+        try:
+            _ok = _download_job_file(
+                file_id,
+                _src,
+                filename,
+                file_size,
+                user_id,
+                progress_callback=_dl_cb,
+                # Large PDFs are re-downloaded from the delivered copy's chat
+                # (userbot DM/Saved Messages), not the original chat.
+                chat_id=source_chat_id or chat_id,
+                message_id=message_id,
+                file_unique_id=file_unique_id,
+                cancel_check=lambda: _job_cancelled(_cancel_check_id),
+            )
+        except _JobCancelledError:
+            _cleanup_after_failure(
+                chat_id,
+                _rq_job_id,
+                int(_dl_state["msg_id"]) or _progress_msg_id,
+            )
+            return {"status": "cancelled"}
+        # Sync the live (possibly recreated) progress message id back so the
+        # follow-up phase-switch edit and failure cleanup target the right msg.
+        _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
+        if not _ok:
+            try:
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\u274c Failed to download the PDF. "
+                    "Try again in a moment.",
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"error": "download_failed"}
+
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "compressing",
+            detail="\U0001f5dc\ufe0f Compressing PDF...",
+            message_id=_progress_msg_id,
+        )
+
+        _out_name = safe_target_name(filename, "pdf")
+        _out = os.path.join(tmpdir, _out_name)
+        _gs = getattr(config, "PDF_COMPRESS_QUALITY", "/ebook")
+        if not compress_pdf(_src, _out, gs_quality=_gs):
+            try:
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\u274c PDF compression failed. The file may be "
+                    "corrupt or password-protected.",
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"error": "compression_failed"}
+        if not os.path.exists(_out) or not os.path.getsize(_out):
+            try:
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\u274c PDF compression produced an empty file. "
+                    "Try again in a moment.",
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"error": "compression_failed"}
+
+        _orig = os.path.getsize(_src)
+        _comp = os.path.getsize(_out)
+        _saved = max(0, int((1 - _comp / _orig) * 100)) if _orig else 0
+        _thumb_path = os.path.join(tmpdir, "thumb.jpg")
+        try:
+            create_thumbnail_from_pdf(_out, _thumb_path)
+        except Exception:  # nosec B110 - thumbnail best-effort
+            _thumb_path = None
+
+        _caption = f"Here is your compressed PDF ({_saved}% smaller)."
+        _deliver_converted_file(
+            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
+            progress_msg_id=_progress_msg_id,
+        )
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                output_meta={
+                    "status": "done",
+                    "orig_bytes": _orig,
+                    "compressed_bytes": _comp,
+                    "saved_pct": _saved,
+                    "timestamps": {"finished": int(time.time())},
+                },
+            )
+        except Exception:  # nosec B110
+            pass
+        _delete_queued_messages(_rq_job_id)
+        return {"status": "done", "saved_pct": _saved}
+    except Exception as exc:
+        logger.exception("compress_pdf_job: error for %s", filename)
+        _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+        try:
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error compressing the PDF: "
+                f"{_short_error(exc)}\nCheck server logs for details.",
+            )
+        except Exception:  # nosec B110
+            pass
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                output_meta={"status": "error", "error": str(exc)},
+            )
+        except Exception:  # nosec B110
+            pass
+        return {"error": str(exc)}
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:  # nosec B110
+            pass
+
+
+def ocr_job(
+    chat_id: int,
+    file_id: str,
+    filename: str,
+    user_id: int | None = None,
+    file_unique_id: str | None = None,
+    message_id: int | None = None,
+    forward_info: dict | None = None,
+    file_size: int | None = None,
+    source_chat_id: int | str | None = None,
+    target: str = "txt",
+) -> dict:
+    """RQ job: OCR a delivered PDF/image and send the result back.
+
+    Triggered by the 🔎 OCR button (then a format pick) on a delivered result.
+    Downloads via the shared Bot-API + userbot pipe chain (so any delivered
+    size works), then either:
+
+    - ``target="txt"`` (default): Tesseract via PyMuPDF/pytesseract → ``.txt``;
+    - ``target="pdf"``: ocrmypdf sandwiches an INVISIBLE text layer over the
+      ORIGINAL page rendering → searchable PDF that looks identical to the
+      input but has selectable/copyable text.
+
+    ``source_chat_id`` overrides the download chat when the file was
+    userbot-delivered elsewhere.  Returns a result dict.
+    """
+    _rq_job_id = _attach_job_user_meta(user_id)
+    logger.info(
+        "ocr_job: start chat_id=%s user_id=%s file=%s size=%s",
+        chat_id, user_id, filename, file_size,
+    )
+    if _rq_job_id:
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                input_meta={
+                    "job_id": _rq_job_id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "file_size": file_size,
+                    "message_id": message_id,
+                    "forward_info": forward_info,
+                    "enqueued_at": int(time.time()),
+                },
+            )
+        except Exception:
+            logger.exception("Failed to write io:in for ocr job %s", _rq_job_id)
+    _cancel_check_id = _rq_job_id or file_id
+    if _job_cancelled(_cancel_check_id):
+        return {"status": "cancelled"}
+
+    tmpdir = (
+        tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
+        if getattr(config, "TMP_DIR", None)
+        else tempfile.mkdtemp()
+    )
+    _progress_msg_id = None
+    try:
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "downloading",
+            detail="\U0001f4e5 Downloading file...",
+            file_size=file_size or 0,
+        )
+        _src = os.path.join(tmpdir, filename)
+        _dl_state: dict[str, float] = {
+            "msg_id": float(_progress_msg_id or 0),
+            "last_pct": -1.0,
+            "last_t": 0.0,
+        }
+
+        def _dl_cb(recv: int, total: int) -> None:
+            _download_progress_cb(chat_id, filename, recv, total, _dl_state)
+
+        try:
+            _ok = _download_job_file(
+                file_id,
+                _src,
+                filename,
+                file_size,
+                user_id,
+                progress_callback=_dl_cb,
+                # Large files are re-downloaded from the delivered copy's chat
+                # (userbot DM/Saved Messages), not the original chat.
+                chat_id=source_chat_id or chat_id,
+                message_id=message_id,
+                file_unique_id=file_unique_id,
+                cancel_check=lambda: _job_cancelled(_cancel_check_id),
+            )
+        except _JobCancelledError:
+            _cleanup_after_failure(
+                chat_id,
+                _rq_job_id,
+                int(_dl_state["msg_id"]) or _progress_msg_id,
+            )
+            return {"status": "cancelled"}
+        _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
+        if not _ok:
+            try:
+                _tg_send_message(
+                    None,
+                    chat_id,
+                    "\u274c Failed to download the file. Try again in a moment.",
+                )
+            except Exception:  # nosec B110
+                pass
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"error": "download_failed"}
+
+        if _job_cancelled(_cancel_check_id):
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "cancelled"}
+
+        _is_pdf_out = target == "pdf"
+        _progress_msg_id = _tg_send_progress(
+            chat_id, filename, "ocr",
+            detail=(
+                "\U0001f4c4 Building searchable PDF (text layer)..."
+                if _is_pdf_out
+                else "\U0001f50e Extracting text with OCR..."
+            ),
+            message_id=_progress_msg_id,
+        )
+        _lang = getattr(config, "OCR_LANG", "eng")
+        _dpi = int(getattr(config, "OCR_DPI", 200) or 200)
+        _ocr_to = int(getattr(config, "OCR_TIMEOUT_SECONDS", 600) or 0)
+        try:
+            if _is_pdf_out:
+                # Searchable PDF: invisible text layer over the ORIGINAL pages.
+                _out_name = safe_target_name(filename, "pdf")
+                _out = os.path.join(tmpdir, _out_name)
+                # Never overwrite the downloaded input when it is already a
+                # .pdf with the same basename (ocrmypdf needs distinct paths).
+                if os.path.abspath(_out) == os.path.abspath(_src):
+                    _base = os.path.splitext(_out_name)[0]
+                    _out_name = f"{_base}_ocr.pdf"
+                    _out = os.path.join(tmpdir, _out_name)
+                _pdf_text = run_ocr_pdf(
+                    _src,
+                    filename,
+                    _out,
+                    lang=_lang,
+                    dpi=_dpi,
+                    timeout=_ocr_to,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+                if _pdf_text is None:
+                    _tg_send_progress(
+                        chat_id, filename, "failed",
+                        detail=(
+                            "\u274c OCR failed to build the searchable PDF. "
+                            "The file may be corrupt/DRM-protected, or the OCR "
+                            "engine timed out (see server logs)."
+                        ),
+                        message_id=_progress_msg_id,
+                    )
+                    _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                    return {"error": "ocr_failed"}
+                text = _pdf_text or ""
+            else:
+                _out_name = safe_target_name(filename, "txt")
+                _out = os.path.join(tmpdir, _out_name)
+                text = run_ocr(
+                    _src,
+                    filename,
+                    lang=_lang,
+                    dpi=_dpi,
+                    timeout=_ocr_to,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+        except OCRCancelledError:
+            logger.info("ocr_job: cancelled mid-OCR for %s", filename)
+            _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+            return {"status": "cancelled"}
+
+        if _is_pdf_out:
+            # The searchable PDF EXISTS and is delivered regardless of whether
+            # any text was recognized (a blank scan still yields the user's
+            # file, just without a text layer).
+            if text.strip():
+                _caption = (
+                    "\U0001f50e Here is your searchable PDF — it looks exactly "
+                    "like the original, but the text is now selectable and "
+                    "searchable."
+                )
+            else:
+                _caption = (
+                    "\U0001f50e Here is your PDF — no text was recognized, "
+                    "so it was returned unchanged (blank pages / unreadable "
+                    "scan)."
+                )
+        else:
+            if not text or not text.strip():
+                _tg_send_progress(
+                    chat_id, filename, "failed",
+                    detail=(
+                        "\u274c No text was found. The file may contain no "
+                        "text (e.g. a blank page or a DRM-protected PDF), or "
+                        "the OCR engine timed out / is misconfigured (see "
+                        "server logs)."
+                    ),
+                    message_id=_progress_msg_id,
+                )
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                return {"error": "no_text_found"}
+            with open(_out, "w", encoding="utf-8") as _fh:
+                _fh.write(text)
+            _caption = "\U0001f50e Here is the extracted text."
+        _deliver_converted_file(
+            chat_id, _out, _out_name, None, _caption, user_id,
+            progress_msg_id=_progress_msg_id,
+        )
+        out_meta = {
+            "status": "done",
+            "filename": _out_name,
+            "chars": len(text),
+            "timestamps": {"finished": int(time.time())},
+        }
+        try:
+            _set_io_keys(_rq_job_id, output_meta=out_meta)
+        except Exception:  # nosec B110
+            pass
+        _delete_queued_messages(_rq_job_id)
+        return {"status": "done"}
+    except Exception as exc:
+        logger.exception("ocr_job: error for %s", filename)
+        _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+        try:
+            _tg_send_message(
+                None,
+                chat_id,
+                "\u274c Error running OCR: "
+                f"{_short_error(exc)}\nCheck server logs for details.",
+            )
+        except Exception:  # nosec B110
+            pass
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                output_meta={"status": "error", "error": str(exc)},
+            )
+        except Exception:  # nosec B110
+            pass
+        return {"error": str(exc)}
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:  # nosec B110
+            pass
+
+
 def process_url_job(
     chat_id: int, url: str, filename: str, user_id: int | None = None
 ) -> None:
@@ -2474,6 +3921,25 @@ def process_url_job(
             )
         except Exception:
             logger.exception("Failed to write io:in for URL job %s", _rq_job_id)
+
+    def _write_out(status: str, **extra) -> None:
+        """Persist io:out for this URL job (best-effort)."""
+        if not _rq_job_id:
+            return
+        try:
+            _set_io_keys(
+                _rq_job_id,
+                output_meta={
+                    "status": status,
+                    "filename": filename,
+                    "user_id": user_id,
+                    "timestamps": {"finished": int(time.time())},
+                    **extra,
+                },
+            )
+        except Exception:  # nosec B110
+            pass
+
     # SSRF prevention: validate the URL before making any requests
     if not _validate_url_safe(url):
         logger.warning(
@@ -2489,14 +3955,35 @@ def process_url_job(
             )
         except Exception:  # nosec B110
             pass
+        _write_out("blocked", reason="invalid_url")
         return
 
     tmpdir = None
+    _progress_msg_id = None
     try:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None) or None)
         file_path = os.path.join(tmpdir, filename)
 
-        # download
+        # Live download progress (throttled edits on the same message).
+        _progress_msg_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "downloading",
+            detail="\U0001f4e5 Downloading from URL...",
+        )
+        _dl_state: dict[str, float] = {
+            "msg_id": float(_progress_msg_id or 0),
+            "last_pct": -1.0,
+            "last_t": 0.0,
+        }
+        try:
+            with requests.head(
+                url, allow_redirects=False, timeout=30
+            ) as _hr:
+                _total = int(_hr.headers.get("Content-Length") or 0)
+        except Exception:  # nosec B110 - unknown size still shows bytes
+            _total = 0
+        _seen = 0
         # Disable redirects to prevent SSRF bypass via redirect chains
         with requests.get(
             url, stream=True, allow_redirects=False, timeout=120
@@ -2506,12 +3993,78 @@ def process_url_job(
                 for chunk in r.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         fh.write(chunk)
+                        _seen += len(chunk)
+                        _download_progress_cb(
+                            chat_id, filename, _seen, _total, _dl_state
+                        )
+        _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
 
+        # ── E-books via URL: the conversion-only interface ──
+        if _is_ebook(filename):
+            if not _book_conversion_enabled():
+                try:
+                    _tg_send_message(
+                        None,
+                        chat_id,
+                        "\U0001f4d5 E-book conversion is currently disabled "
+                        "on this instance.",
+                    )
+                except Exception:  # nosec B110
+                    pass
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                _write_out("skipped", reason="book conversion disabled")
+                return
+            _ebook_ok = _deliver_book_echo(
+                chat_id, file_path, filename, user_id, _progress_msg_id
+            )
+            if _ebook_ok:
+                _write_out("done")
+            else:
+                _write_out("error", error="book echo failed")
+            if _ebook_ok:
+                _cleanup_after_success(
+                    chat_id, _rq_job_id, _progress_msg_id
+                )
+            else:
+                _cleanup_after_failure(
+                    chat_id, _rq_job_id, _progress_msg_id
+                )
+                try:
+                    _tg_send_message(
+                        None,
+                        chat_id,
+                        "\u274c Failed to deliver the e-book from the URL.",
+                    )
+                except Exception:  # nosec B110
+                    pass
+            logger.info(
+                "process_url_job: e-book complete chat_id=%s user_id=%s url=%s",
+                chat_id,
+                user_id,
+                url[:100],
+            )
+            return
+
+        _progress_msg_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "thumbnailing",
+            detail="\U0001f5bc\ufe0f Creating cover preview...",
+            message_id=_progress_msg_id,
+        )
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         if filename.lower().endswith(".pdf"):
             create_thumbnail_from_pdf(file_path, thumb_path)
         else:
             create_thumbnail_from_image(file_path, thumb_path)
+
+        _progress_msg_id = _tg_send_progress(
+            chat_id,
+            filename,
+            "sending",
+            detail="\U0001f4e4 Sending result to Telegram...",
+            message_id=_progress_msg_id,
+        )
 
         # Oversized result (> Bot API upload cap): deliver via userbot into
         # the user's DM with the bot instead of failing the Bot API send.
@@ -2524,14 +4077,29 @@ def process_url_job(
             and config.BOT_API_UPLOAD_LIMIT_BYTES
             and _dl_size > config.BOT_API_UPLOAD_LIMIT_BYTES
         ):
-            if _deliver_result_via_userbot(
+            _ub_res = _deliver_result_via_userbot(
                 chat_id,
                 file_path,
                 filename,
                 "Here is your file with an auto-generated cover preview.",
                 thumb_path,
                 user_id,
-            ):
+            )
+            if _ub_res:
+                _sent, _src_chat = _ub_res
+                # Oversized PDFs delivered via the userbot get a one-tap
+                # 🗜 Compress prompt pointing at the delivered copy (mirrors
+                # the book/convert fallback).
+                _maybe_attach_result_prompt(
+                    chat_id,
+                    file_path,
+                    filename,
+                    user_id,
+                    _src_chat,
+                    getattr(_sent, "id", None),
+                )
+                _write_out("done")
+                _cleanup_after_success(chat_id, _rq_job_id, _progress_msg_id)
                 logger.info(
                     "process_url_job: complete chat_id=%s user_id=%s url=%s",
                     chat_id,
@@ -2548,17 +4116,23 @@ def process_url_job(
                 filename,
                 thumb_fileobj=f_thumb,
                 caption="Here is your file with an auto-generated cover preview.",
+                compress_user_id=user_id,
+                ocr_user_id=user_id,
             )
+        _write_out("done")
+        _cleanup_after_success(chat_id, _rq_job_id, _progress_msg_id)
         logger.info(
             "process_url_job: complete chat_id=%s user_id=%s url=%s",
             chat_id,
             user_id,
             url[:100],
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Failed processing URL job: %s (user_id=%s)", url, user_id
         )
+        _write_out("error", error=str(exc))
+        _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
         try:
             _tg_send_message(
                 None,

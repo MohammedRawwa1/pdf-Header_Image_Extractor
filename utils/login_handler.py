@@ -38,7 +38,12 @@ import time
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
-from utils.markdown_utils import escape_markdown as _escape_markdown
+from utils.markdown_utils import (
+    escape_markdown as _escape_markdown,
+)
+from utils.markdown_utils import (
+    safe_code_span as _safe_code_span,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -737,7 +742,7 @@ async def _run_login_task(
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
-                msg_text += f"\nPassword hint: `{pwd_hint.replace('`', '')}`"
+                msg_text += f"\nPassword hint: `{_safe_code_span(pwd_hint)}`"
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:
@@ -1150,7 +1155,7 @@ async def _run_pyro_login_task(
 
             msg_text = "🔐 Two-step verification is enabled. Please enter your account password:"
             if pwd_hint:
-                msg_text += f"\nPassword hint: `{pwd_hint.replace('`', '')}`"
+                msg_text += f"\nPassword hint: `{_safe_code_span(pwd_hint)}`"
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:

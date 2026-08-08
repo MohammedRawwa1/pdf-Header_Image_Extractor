@@ -134,6 +134,54 @@ TMP_DIR: str = os.getenv("TMP_DIR", "")
 # PDF compression quality preset (used by tools.compress_pdf)
 PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
 
+# ── Book conversion (Calibre) ────────────────────────────────────────────────
+# ALLOWED_FORMATS: comma-separated extensions the bot accepts for book
+# conversion (e-reader + document formats). When empty, a curated default set
+# is used (pdf, epub, mobi, azw3, azw, fb2, lit, prc, pdb, docx, rtf, txt,
+# html, odt, snb, tcr). Calibre capability is enforced per-format at runtime.
+ALLOWED_FORMATS_RAW: str = os.getenv("ALLOWED_FORMATS", "")
+ALLOWED_FORMATS: set[str] = {
+    p.strip().lower().lstrip(".")
+    for p in ALLOWED_FORMATS_RAW.split(",")
+    if p.strip()
+}
+if not ALLOWED_FORMATS:
+    try:
+        from utils.ebook_converter import DEFAULT_ALLOWED_FORMATS
+
+        ALLOWED_FORMATS = set(DEFAULT_ALLOWED_FORMATS)
+    except Exception:  # pragma: no cover - ebook_converter is always present
+        ALLOWED_FORMATS = set()
+
+# Master switch for the book-conversion feature (buttons, jobs, formats).
+ENABLE_BOOK_CONVERSION: bool = os.getenv(
+    "ENABLE_BOOK_CONVERSION", "true"
+).lower() in ("1", "true", "yes")
+# Per-conversion timeout for Calibre's ebook-convert (large books can be slow).
+BOOK_CONVERT_TIMEOUT_SECONDS: int = int(
+    os.getenv("BOOK_CONVERT_TIMEOUT_SECONDS", "600")
+)
+# How long a pending "What should I do with this file?" choice stays valid.
+BOOK_ASK_TTL_SECONDS: int = int(os.getenv("BOOK_ASK_TTL_SECONDS", "600"))
+
+# ── OCR (Tesseract) ─────────────────────────────────────────────────────────
+# Master switch for the 🔎 OCR button (scanned PDFs + raster images).
+ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Tesseract language code(s), e.g. "eng", "eng+fra" (packs must be installed
+# in the image: tesseract-ocr-<lang>).
+OCR_LANG: str = os.getenv("OCR_LANG", "eng")
+# Per-OCR timeout for Tesseract, applied to EACH page/image invocation (a
+# multi-page PDF can legitimately take N_pages x this; the whole job is bounded
+# by the RQ job_timeout of 1800s set at enqueue time).
+OCR_TIMEOUT_SECONDS: int = int(os.getenv("OCR_TIMEOUT_SECONDS", "600"))
+# DPI used to rasterize PDF pages before OCR — higher is more accurate but
+# slower and more memory-hungry (200 is a good balance).
+OCR_DPI: int = int(os.getenv("OCR_DPI", "200"))
+
 # ── Storage backend ────────────────────────────────────────────────────────────
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_BACKEND: str = os.getenv(

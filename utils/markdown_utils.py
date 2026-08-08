@@ -7,6 +7,18 @@ in one place so callers can't drift apart.
 """
 
 
+def safe_code_span(text: str) -> str:
+    """Sanitize text for embedding inside a Markdown backtick code span.
+
+    Telegram does not parse entities inside a code span, so ``_``/``*`` are
+    safe there -- only a literal backtick would terminate the span early.
+    Strip them so a user-supplied id can't break out of the span (unlike
+    :func:`escape_markdown`, which must never be used inside backticks: its
+    ``\\``-escapes render literally there).
+    """
+    return str(text).replace("`", "'")
+
+
 def escape_markdown(text: str) -> str:
     """Escape Telegram legacy-Markdown special chars in user-supplied text.
 
