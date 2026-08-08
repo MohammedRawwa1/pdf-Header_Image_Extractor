@@ -29,6 +29,7 @@ Design rules:
   blank checks) are importable and testable without WeasyPrint installed.
 """
 
+import html
 import logging
 import os
 import posixpath
@@ -45,6 +46,8 @@ from defusedxml import ElementTree
 
 from utils.ebook_converter import (
     ConversionCancelledError,
+    DRMProtectedError,
+    epub_is_drm_protected,
     finalize_cover_thumbnail,
 )
 
@@ -330,6 +333,104 @@ def _resolve_ref(href: str, chapter_dir: str, opf_dir: str) -> str:
         return href
 
 
+# Fallback salvage for chapters that defeat BOTH the HTML5 parser and the
+# strict XML parser (e.g. severely mangled markup).  Regex-grab the raw
+# ``<body>...</body>`` region and hand it to WeasyPrint verbatim — its own
+# HTML5 parser tolerates far more than the tree builders above.
+_RAW_BODY_RE = re.compile(
+    rb"<body[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL
+)
+_TAG_RE = re.compile(rb"<[^>]+>")
+# head/style/script/title blocks must never count as book content during
+# the no-body salvage (titles, CSS, and JS are not the book's text).
+_SKIP_REGION_RE = re.compile(
+    rb"<(head|style|script|title)[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+# Mangled chapters sometimes NEVER close a region — treat any unclosed
+# head/style/script/title as running to end-of-content so its CSS/JS/title
+# text still can't fake a salvage.
+_UNCLOSED_REGION_RE = re.compile(
+    rb"<(head|style|script|title)[^>]*>(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# src/href attributes inside SALVAGED raw-body markup (the parsed path
+# rebases refs via _resolve_ref; salvaged markup needs the same pass).
+_SALVAGED_REF_RE = re.compile(
+    rb"(?P<attr>\b(?:src|href)\s*=\s*)(?P<quote>['\"])(?P<url>[^'\"]+)",
+    re.IGNORECASE,
+)
+
+
+def _rebase_salvaged_refs(markup: str, chapter_dir: str, opf_dir: str) -> str:
+    """Rebase src/href refs inside salvaged body markup (chapter→OPF).
+
+    The parsed path rewrites image refs so they resolve when the merged
+    document is served from the OPF directory; the raw-body salvage returns
+    markup verbatim, so broken image refs would silently render in the PDF.
+    Same rules as :func:`_resolve_ref`: fragments, data:/scheme, absolute
+    paths and URLs pass through untouched.
+    """
+
+    def _sub(m: re.Match[bytes]) -> bytes:
+        url = m.group("url")
+        if (
+            url.startswith((b"#", b"data:", b"/"))
+            or b"://" in url
+            or not url
+        ):
+            return m.group(0)
+        rebased = _resolve_ref(
+            url.decode("utf-8", errors="replace"), chapter_dir, opf_dir
+        ).encode("utf-8", errors="replace")
+        return m.group("attr") + m.group("quote") + rebased + m.group("quote")
+
+    return _SALVAGED_REF_RE.sub(_sub, markup.encode("utf-8")).decode(
+        "utf-8", errors="replace"
+    )
+
+
+def _salvage_raw_body(raw: bytes) -> str | None:
+    """Extract a chapter's raw content when both parsers fail.
+
+    First tries the raw ``<body>`` region (kept as markup, so WeasyPrint's
+    own tolerant HTML5 parser handles it).  Fragmented XHTML — common in
+    iBookZZ-era EPUBs — often has NO usable ``<body>`` region (missing,
+    empty, or content spilled past ``</body>``), so when the region is
+    empty we fall back to stripping head/style/script blocks and ALL tags
+    from the whole chapter and returning the plain text (entity-unescaped,
+    re-escaped, wrapped in ``<p>``) — a plain-text page beats a silently
+    dropped chapter, but CSS/JS/titles can't fake a salvage.  Returns None
+    only when nothing meaningful can be salvaged.
+    """
+    m = _RAW_BODY_RE.search(raw)
+    if m:
+        inner = m.group(1)
+        if inner.strip():
+            decoded = _decode_chapter(inner)
+            if isinstance(decoded, bytes):
+                return decoded.decode("utf-8", errors="replace")
+            return decoded
+        # Empty <body> region — fall through to the whole-document salvage
+        # (with head/style/script removed) so content spilled AFTER
+        # ``</body>`` is still rescued, while ``<title>`` never is.
+    stripped = _UNCLOSED_REGION_RE.sub(
+        b"", _SKIP_REGION_RE.sub(b"", raw)
+    )
+    stripped = _TAG_RE.sub(b"", stripped)
+    if not stripped.strip():
+        return None
+    decoded = _decode_chapter(stripped)
+    if isinstance(decoded, bytes):
+        decoded = decoded.decode("utf-8", errors="replace")
+    text = html.unescape(decoded).strip()
+    if not text:
+        return None
+    # Re-escape: stray < > left behind by the tag-strip must not be parsed
+    # as markup when the text is injected into the merged document.
+    return f"<p>{html.escape(text)}</p>"
+
+
 def _build_merged_html(
     epub_path: str,
     content_paths: list[str],
@@ -341,26 +442,46 @@ def _build_merged_html(
     Only each chapter's ``<body>`` is kept (head ``<style>`` blocks are merged
     into the output head) so pagination flows continuously through the book
     instead of restarting per chapter.  Image refs are rebased to the OPF
-    directory (``opf_dir``).  Chapters whose body can't be parsed are skipped;
-    a completely empty result is an empty document (callers detect this with
+    directory (``opf_dir``).  Chapters whose body can't be parsed are skipped
+    — but only after a raw-``<body>`` salvage attempt, so a book with a few
+    mangled chapters still merges the rest instead of silently dropping them.
+    A completely empty result is an empty document (callers detect this with
     :func:`_merged_html_is_blank` and fall back to Calibre).
     """
     bodies: list[str] = []
+    parsed = 0
+    salvaged = 0
+    failed = 0
     with zipfile.ZipFile(epub_path) as zf:
         for content_path in content_paths:
             try:
                 raw = zf.read(content_path)
             except KeyError:
+                failed += 1
                 continue
             ctree = _parse_content_html(raw)
-            if ctree is None:
-                continue
-            body = ctree.find(".//{*}body")
+            body = ctree.find(".//{*}body") if ctree is not None else None
             if body is None:
+                # Both parsers failed on this chapter — try the raw body
+                # region before giving up on it.
+                raw_body = _salvage_raw_body(raw)
+                if raw_body is not None:
+                    bodies.append(
+                        _rebase_salvaged_refs(
+                            raw_body,
+                            posixpath.dirname(content_path),
+                            opf_dir,
+                        )
+                    )
+                    salvaged += 1
+                else:
+                    failed += 1
                 continue
+            parsed += 1
             chapter_dir = posixpath.dirname(content_path)
             clean = _strip_ns(body)
             if clean is None:
+                failed += 1
                 continue
             for elem in clean.iter():
                 tag = elem.tag
@@ -377,6 +498,16 @@ def _build_merged_html(
                             "href", _resolve_ref(src, chapter_dir, opf_dir)
                         )
             bodies.append(ET.tostring(clean, encoding="unicode"))
+    if failed:
+        logger.warning(
+            "weasyprint: merge for %s: %d parsed, %d salvaged, %d failed "
+            "(of %d spine chapters)",
+            os.path.basename(epub_path),
+            parsed,
+            salvaged,
+            failed,
+            len(content_paths),
+        )
     style_block = f"<style>{styles}</style>" if styles else ""
     return (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -397,8 +528,15 @@ def _merged_html_is_blank(html: str) -> bool:
     if len(text) >= _MIN_MERGE_TEXT_CHARS:
         return False
     lowered = html.lower()
+    # Media counts as content: an image-only book (or one whose chapters are
+    # <picture>-based or use CSS background-image) is NOT "empty" and must
+    # keep the full Calibre budget, not the unreadable-content cap.
     return not (
-        "<img" in lowered or "<image" in lowered or "<svg" in lowered
+        "<img" in lowered
+        or "<image" in lowered
+        or "<svg" in lowered
+        or "<picture" in lowered
+        or "url(" in lowered
     )
 
 
@@ -537,6 +675,15 @@ def convert_epub_to_pdf_fast(
     """
     import config as _cfg
 
+    # DRM-protected EPUBs can't be read by EITHER converter here (WeasyPrint
+    # sees empty chapters, Calibre has no decryption plugin and would burn
+    # the full timeout).  Fail fast with a clear error so the user isn't left
+    # staring at a frozen progress bar for 10 minutes.
+    if epub_is_drm_protected(input_path):
+        raise DRMProtectedError(
+            f"DRM-protected EPUB: {os.path.basename(input_path)}"
+        )
+
     if not weasyprint_available():
         return _calibre_fallback(
             input_path, pdf_path, thumb_path, timeout, cancel_check
@@ -566,6 +713,11 @@ def convert_epub_to_pdf_fast(
         )
 
     tmp = tempfile.mkdtemp(prefix="wp_epub_")
+    # Set when the fast path gave up because the CONTENT was unreadable
+    # (empty merge or blank render) rather than because rendering itself
+    # failed/timed out.  Such books get a BOUNDED Calibre fallback (see the
+    # tail) so an unreadable file can't burn the full caller timeout.
+    _unreadable = False
     try:
         if cancel_check is not None and cancel_check():
             # /canceljob fired between the heuristic and the render — abort
@@ -580,7 +732,13 @@ def convert_epub_to_pdf_fast(
         base_url = os.path.join(tmp, opf_dir)
         if _merged_html_is_blank(html):
             # All chapters were unparseable → WeasyPrint would emit a blank
-            # PDF.  Fall back to Calibre (which has a tolerant parser).
+            # PDF.  When the cause is DRM encryption, Calibre can't read it
+            # either — fail fast instead of falling into the timeout trap.
+            if epub_is_drm_protected(input_path):
+                raise DRMProtectedError(
+                    f"DRM-protected EPUB: {os.path.basename(input_path)}"
+                )
+            _unreadable = True
             logger.warning(
                 "weasyprint: merged content for %s is empty; using Calibre",
                 os.path.basename(input_path),
@@ -589,6 +747,7 @@ def convert_epub_to_pdf_fast(
             html, base_url, pdf_path, timeout, cancel_check
         ):
             if _pdf_is_degenerate(pdf_path):
+                _unreadable = True
                 logger.warning(
                     "weasyprint: rendered a blank %s-byte PDF for %s; "
                     "using Calibre",
@@ -617,6 +776,8 @@ def convert_epub_to_pdf_fast(
             )
     except ConversionCancelledError:
         raise
+    except DRMProtectedError:
+        raise
     except Exception as exc:  # nosec B110 - any failure falls back
         logger.warning(
             "weasyprint: fast path failed (%s) for %s; using Calibre",
@@ -629,6 +790,20 @@ def convert_epub_to_pdf_fast(
     # budget, so Calibre gets the REMAINDER (never a fresh full timeout on top
     # of a timed-out render — that would blow the RQ job timeout).
     _remain = timeout - int(time.monotonic() - _render_start)
+    if _unreadable:
+        # The content itself was unreadable (empty merge / blank render): a
+        # fresh conversion is a long shot, so cap the fallback budget instead
+        # of inheriting the caller's full timeout.  The merge-side salvage
+        # above already rescued whatever was parseable, so what remains is
+        # genuinely broken — a few minutes of Calibre is a fair shake.
+        _cap = getattr(_cfg, "EPUB_EMPTY_MERGE_FALLBACK_SECONDS", 240)
+        logger.warning(
+            "weasyprint: capping Calibre fallback for %s at %ss "
+            "(content was unreadable)",
+            os.path.basename(input_path),
+            min(_cap, max(60, _remain)),
+        )
+        _remain = min(_cap, max(60, _remain))
     return _calibre_fallback(
         input_path, pdf_path, thumb_path, max(60, _remain), cancel_check
     )

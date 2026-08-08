@@ -184,6 +184,15 @@ EPUB_FAST_CONVERT_ENABLED: bool = os.getenv(
 EPUB_FAST_IMAGE_BYTES_LIMIT: int = int(
     os.getenv("EPUB_FAST_IMAGE_BYTES_LIMIT", str(8 * 1024 * 1024))
 )
+# When the fast path gives up because the content was unreadable (an empty
+# merge or a blank render — usually a structurally-broken book, not DRM),
+# the Calibre fallback is capped at this budget instead of inheriting the
+# full caller timeout (which historically burned 600s on unreadable books).
+# Books that parse fine but merely time out during render keep the full
+# remainder.
+EPUB_EMPTY_MERGE_FALLBACK_SECONDS: int = int(
+    os.getenv("EPUB_EMPTY_MERGE_FALLBACK_SECONDS", str(240))
+)
 
 # ── OCR (Tesseract) ─────────────────────────────────────────────────────────
 # Master switch for the 🔎 OCR button (scanned PDFs + raster images).

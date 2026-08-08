@@ -17,12 +17,16 @@ Key entry points:
 
 import logging
 import os
+import re
 import shutil
 import subprocess  # nosec B404 - intentional, needed for Calibre conversions
 import tempfile
 import threading
 import time
+import zipfile
 from collections.abc import Callable
+
+from defusedxml import ElementTree as _DefusedET
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,77 @@ class ConversionCancelledError(Exception):
     Distinct from failure so callers can report "cancelled" (and clean up)
     rather than a generic conversion error after /canceljob fires mid-run.
     """
+
+
+class DRMProtectedError(Exception):
+    """Raised when a book is DRM-encrypted and cannot be converted.
+
+    DRM-encrypted e-books (Adobe ADEPT, etc.) are unreadable to BOTH
+    converters in the container: WeasyPrint's chapter merge comes back empty
+    (the content is encrypted), and Calibre has no Adobe DRM plugin, so
+    ``ebook-convert`` just churns until its timeout.  Raising this error lets
+    callers fail FAST with a clear user message instead of burning the full
+    Calibre timeout on content that can never convert.
+    """
+
+
+# DefusedXML rejects ANY doctype; ADEPT encryption.xml may carry one.  It
+# carries no parsing value, so strip it (internal subset included) before the
+# security-hardened parser.
+_DRM_DOCTYPE_RE = re.compile(
+    rb"<!DOCTYPE(?:\s+[^>\[\]]*)?(?:\[[^\]]*\])?[^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def epub_is_drm_protected(epub_path: str) -> bool:
+    """True when an EPUB encrypts its CONTENT (Adobe-ADEPT-style DRM).
+
+    Font obfuscation (IDPF) also uses ``META-INF/encryption.xml`` but
+    encrypts ONLY font files — that is NOT DRM and must not be flagged.
+    A book counts as DRM-protected when its encryption manifest references
+    content documents (``.xhtml``/``.html``/``.htm``, fragments/query
+    stripped) — the ADEPT signature.  ``rights.xml`` alone is not treated
+    as proof (some non-DRM books carry a rights declaration); it only
+    corroborates when an encryption manifest is also present.
+    """
+    has_rights = False
+    try:
+        with zipfile.ZipFile(epub_path) as zf:
+            names = {n.lower() for n in zf.namelist()}
+            has_rights = "meta-inf/rights.xml" in names
+            if "meta-inf/encryption.xml" not in names:
+                return False
+            try:
+                raw = zf.read("META-INF/encryption.xml")
+            except KeyError:
+                return False
+    except Exception:  # nosec B110 - unreadable zip is not proof of DRM
+        return False
+    try:
+        root = _DefusedET.fromstring(_DRM_DOCTYPE_RE.sub(b"", raw))
+        content_exts = (".xhtml", ".html", ".htm")
+        found_any_ref = False
+        for ref in root.findall(".//{*}CipherReference"):
+            uri = (ref.get("URI") or "").lower()
+            # Strip fragment/query so "chapter1.xhtml#p1" still matches.
+            uri = uri.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+            if not uri:
+                continue
+            found_any_ref = True
+            if uri.endswith(content_exts):
+                return True
+        # ADEPT always ships rights.xml alongside the encryption manifest;
+        # an encrypted manifest + rights.xml is the classic DRM signature
+        # even when the URI scheme is unconventional.
+        if has_rights and found_any_ref:
+            return True
+    except Exception:  # nosec B110 - unparseable manifest is not proof
+        logger.warning(
+            "epub_is_drm_protected: unparseable encryption.xml in %s",
+            os.path.basename(epub_path),
+        )
+    return False
 
 # ── Calibre format support (from Calibre's conversion docs) ──────────────
 # Input formats Calibre can READ.
@@ -170,6 +245,13 @@ def convert_ebook(
             output_path,
         )
         return False
+    # DRM-protected EPUBs are a guaranteed timeout: Calibre has no Adobe DRM
+    # plugin in the container, so ebook-convert churns until its timeout.
+    # Fail fast with a clear error instead of burning the whole budget.
+    if _normalize_ext(os.path.splitext(input_path)[1]) == "epub" and (
+        epub_is_drm_protected(input_path)
+    ):
+        raise DRMProtectedError(f"DRM-protected EPUB: {input_path}")
     exe = shutil.which("ebook-convert")
     if not exe:
         logger.warning("convert_ebook: ebook-convert not found on PATH")

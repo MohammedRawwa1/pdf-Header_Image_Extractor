@@ -469,6 +469,7 @@ from tools import (  # noqa: E402
 )
 from utils.ebook_converter import (  # noqa: E402
     ConversionCancelledError,
+    DRMProtectedError,
     calibre_available,
     convert_book_to_pdf_with_thumbnail,
     convert_ebook_robust,
@@ -4308,6 +4309,27 @@ def convert_book_job(
             )
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
+        except DRMProtectedError:
+            # DRM-encrypted books can't be decrypted by the converters — fail
+            # fast with a clear message instead of the 600s Calibre timeout.
+            _hb_stop.set()
+            if _hb_thread is not None:
+                _hb_thread.join(timeout=1.0)
+            _progress_msg_id = _hb_holder["msg_id"]
+            logger.warning(
+                "convert_book_job: %s is DRM-protected; cannot convert",
+                filename,
+            )
+            _tg_send_progress(
+                chat_id, filename, "failed",
+                detail=(
+                    "\u274c This book is DRM-protected and can't be "
+                    "converted. Provide a DRM-free copy."
+                ),
+                message_id=_progress_msg_id,
+            )
+            _delete_queued_messages(_rq_job_id)
+            return {"error": "drm_protected"}
         finally:
             _hb_stop.set()
         # Stop the heartbeat and sync the latest progress-message id: the
@@ -4978,6 +5000,20 @@ def ocr_job(
                 )
                 _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
                 return {"status": "cancelled"}
+            except DRMProtectedError:
+                logger.warning(
+                    "ocr_job: %s is DRM-protected; cannot convert", filename
+                )
+                _tg_send_progress(
+                    chat_id, filename, "failed",
+                    detail=(
+                        "\u274c This book is DRM-protected and can't be "
+                        "converted. Provide a DRM-free copy."
+                    ),
+                    message_id=_progress_msg_id,
+                )
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                return {"error": "drm_protected"}
             if not _conv_ok or not os.path.exists(_pdf_src):
                 _tg_send_progress(
                     chat_id, filename, "failed",
