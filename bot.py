@@ -1207,90 +1207,86 @@ async def handle_document(
         await msg.reply_text(f"Added forwarded file to batch: {filename}")
         return
 
-    # ── E-books: conversion has its own clean interface ──
-    # Routed BEFORE the size/userbot gates so books of every size are handled
-    # by the conversion-only flow — never the thumbnail pipeline (a large book
-    # is never rejected by the Bot API size gate before it reaches Convert).
+    # ── Media detection → context builder menu ─────────────────────────────
+    # Every supported file (PDF, image, e-book) is detected FIRST and an
+    # action menu is shown before ANY processing — nothing is downloaded,
+    # echoed, or piped until the user taps an option (Thumbnail / Compress /
+    # OCR / Convert).  This removes the old book echo-then-convert double pass
+    # and the auto-thumbnail pipeline: one file, one download, one result.
     file_size = getattr(doc, "file_size", None)
-    if is_book_format(filename) and not filename.lower().endswith(".pdf"):
-        if not getattr(config, "ENABLE_BOOK_CONVERSION", False):
-            # Feature disabled → pre-feature behavior: reject e-books clearly
-            # instead of sending them into the image-thumbnail pipeline.
+    if config.REDIS_URL:
+        _kind = _classify_media(filename, mime)
+        if _kind is None:
+            # Validated as supported above; treat an undetectable one as
+            # unsupported rather than silently dropping the file.
             try:
                 await msg.reply_text(
-                    "\U0001f4d5 E-book conversion is currently disabled on this "
-                    "instance.\nSend a **PDF** or **image** to get a thumbnail "
-                    "cover.",
-                    parse_mode="Markdown",
+                    "\u274c Couldn't detect what this file is. Try sending "
+                    "a PDF, image, or e-book."
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to notify about disabled book conversion"
-                )
+            except Exception:  # nosec B110
+                pass
             return
-        if not config.REDIS_URL:
-            # The Convert button needs the Redis token store; without a queue
-            # backend there is no clean conversion path — reject clearly.
-            try:
-                await msg.reply_text(
-                    "\u274c Book conversion needs the job queue (Redis), which "
-                    "isn't configured on this instance.",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to notify about missing Redis for book conversion"
-                )
-            return
-        # Deliver the book back with a 🔁 Convert button (its own interface);
-        # nothing is processed until a target is picked.
-        _ok = await asyncio.to_thread(
-            enqueue_job,
-            "deliver_book_job",
-            chat_id,
-            doc.file_id,
-            filename,
-            mime,
-            user_id,
-            getattr(doc, "file_unique_id", None),
-            msg.message_id,
-            forward_info,
-            file_size,
-            # job_timeout > RQ's 180s default: a large book's userbot
-            # download + echo back can legitimately outlive the death penalty
-            # (conversion itself runs under its own, even larger timeout).
-            job_timeout=1800,
+        _token = _store_ctx_record(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=msg.message_id,
+            file_id=doc.file_id,
+            file_unique_id=getattr(doc, "file_unique_id", None),
+            filename=filename,
+            mime=mime,
+            file_size=file_size,
+            forward_info=forward_info,
+            kind=_kind,
         )
-        _q_msg = None
-        if _ok:
-            try:
-                _q_msg = await msg.reply_text(
-                    f"\U0001f4da `{safe_code_span(filename)}` received — "
-                    "I'll send it back with a **Convert** button so you "
-                    "can re-format it.\n"
-                    f"Job ID: `{_ok}` — use /canceljob {_ok} to cancel it.",
-                    reply_markup=_queued_cancel_kb(user_id, _ok),
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to reply for deliver_book_job"
-                )
-        else:
+        if not _token:
             try:
                 await msg.reply_text(
-                    "\u274c Couldn't queue the job. Try again in a moment."
+                    "\u274c Couldn't start a processing session. "
+                    "Try again in a moment."
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to reply for deliver_book_job"
+            except Exception:  # nosec B110
+                pass
+            return
+        _kb = _ctx_menu_kb(user_id or 0, _token, filename, _kind)
+        _icon = {
+            "book": "\U0001f4d6",
+            "pdf": "\U0001f4c4",
+            "image": "\U0001f5bc\ufe0f",
+        }.get(_kind, "\U0001f4dd")
+        if not _kb:
+            try:
+                await msg.reply_text(
+                    f"{_icon} `{safe_code_span(filename)}` — no actions are "
+                    "available for this file right now (a required feature "
+                    "is disabled or not installed).",
+                    parse_mode="Markdown",
                 )
-        if _ok and _q_msg is not None:
-            _store_queued_message(
-                _ok,
-                chat_id,
-                getattr(_q_msg, "message_id", None),
+            except Exception:  # nosec B110
+                pass
+            return
+        try:
+            await msg.reply_text(
+                f"{_icon} `{safe_code_span(filename)}` — what would you like "
+                "to do?\n_Nothing is processed until you tap an option._",
+                reply_markup=_kb,
+                parse_mode="Markdown",
             )
+        except Exception:  # nosec B110
+            logger.exception("Failed to show context menu for %s", filename)
+        return
+    # ── No Redis: legacy inline pipeline (no persistent menu possible). ──
+    # E-books still need the queue (their Convert token lives in Redis), so
+    # reject them clearly instead of mis-routing them into thumbnails.
+    if is_book_format(filename) and not filename.lower().endswith(".pdf"):
+        try:
+            await msg.reply_text(
+                "\u274c Book conversion needs the job queue (Redis), which "
+                "isn't configured on this instance.",
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
         return
 
     # If Telegram reports a file_size on the Document, check it against the Bot API
@@ -1324,41 +1320,6 @@ async def handle_document(
             except Exception:
                 logger.exception("Failed to notify user about large file")
             return
-
-    if config.REDIS_URL:
-        # When file is too large (>20MB) and userbot is available, route through
-        # userbot/BigFilePipeline instead. process_document_job uses the Bot API
-        # (getFile) which cannot handle files >20MB and will fail with "file is too big".
-        if not use_userbot_download:
-            # PDFs & images: normal auto-thumbnail pipeline (no ask menu).
-            # Pass message_id + forward_info + file_size so the worker has context for userbot fallback
-            ok = await asyncio.to_thread(
-                enqueue_job,
-                "process_document_job",
-                chat_id,
-                doc.file_id,
-                filename,
-                mime,
-                getattr(doc, "file_unique_id", None),
-                msg.message_id,
-                forward_info,
-                file_size,
-                user_id,
-            )
-            if ok:
-                queued_msg = await msg.reply_text(
-                    "Queued your file for background processing; I'll send the result when ready.\n"
-                    f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
-                    reply_markup=_queued_cancel_kb(user_id, ok),
-                    parse_mode="Markdown",
-                )
-                _store_queued_message(
-                    ok,
-                    chat_id,
-                    getattr(queued_msg, "message_id", None),
-                )
-                return
-            # fall through to inline processing on enqueue failure
 
     tmpdir = (
         tempfile.mkdtemp(dir=config.TMP_DIR)
@@ -1724,35 +1685,54 @@ async def handle_photo(
         await msg.reply_text(f"Added forwarded photo to batch: {filename}")
         return
 
-    # Thumbnail caching disabled
-
+    # ── Media detection → context builder menu ─────────────────────────────
+    # Photos are detected as images and offered an action menu (Thumbnail /
+    # OCR) before anything is processed — nothing is piped until tapped.
     if config.REDIS_URL:
-        ok = await asyncio.to_thread(
-            enqueue_job,
-            "process_document_job",
-            chat_id,
-            photo.file_id,
-            filename,
-            "image/jpeg",
-            getattr(photo, "file_unique_id", None),
-            msg.message_id,
-            photo_forward_info,
-            photo_size,
-            user_id,
+        _token = _store_ctx_record(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=msg.message_id,
+            file_id=photo.file_id,
+            file_unique_id=getattr(photo, "file_unique_id", None),
+            filename=filename,
+            mime="image/jpeg",
+            file_size=photo_size,
+            forward_info=photo_forward_info,
+            kind="image",
         )
-        if ok:
-            queued_msg = await msg.reply_text(
-                "Queued your photo for background processing; I'll send the result when ready.\n"
-                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
-                reply_markup=_queued_cancel_kb(user_id, ok),
+        if not _token:
+            try:
+                await msg.reply_text(
+                    "\u274c Couldn't start a processing session. "
+                    "Try again in a moment."
+                )
+            except Exception:  # nosec B110
+                pass
+            return
+        _kb = _ctx_menu_kb(user_id or 0, _token, filename, "image")
+        if not _kb:
+            try:
+                await msg.reply_text(
+                    f"\U0001f5bc\ufe0f `{safe_code_span(filename)}` — no "
+                    "actions are available for this image right now.",
+                    parse_mode="Markdown",
+                )
+            except Exception:  # nosec B110
+                pass
+            return
+        try:
+            await msg.reply_text(
+                f"\U0001f5bc\ufe0f `{safe_code_span(filename)}` — what "
+                "would you like to do?\n_Nothing is processed until you tap "
+                "an option._",
+                reply_markup=_kb,
                 parse_mode="Markdown",
             )
-            _store_queued_message(
-                ok,
-                chat_id,
-                getattr(queued_msg, "message_id", None),
-            )
-            return
+        except Exception:  # nosec B110
+            logger.exception("Failed to show context menu for %s", filename)
+        return
+    # No Redis → legacy inline pipeline below.
 
     tmpdir = (
         tempfile.mkdtemp(dir=config.TMP_DIR)
@@ -2020,14 +2000,12 @@ async def cmd_start(
         user_name = getattr(_eff_user, "first_name", None) or "there"
     await update.effective_message.reply_text(
         f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
-        "📄 Send a **PDF** or **image** and I'll auto-generate its **thumbnail** "
-        "cover — nothing to click.\n\n"
-        "📖 Send an **e-book** (EPUB, MOBI, AZW3, FB2, DOCX, TXT…) and I'll "
-        "send it back with a **Convert** button to re-format it — conversion "
-        "has its own button, never mixed with thumbnails.\n\n"
-        "🗜 Delivered PDFs carry a **Compress PDF** button to shrink them, "
-        "and PDFs/images carry a **🔎 OCR** button — make a **searchable "
-        "PDF** (text selectable, same look) or extract plain text.\n\n"
+        "📄 Send a **PDF**, **image**, or **e-book** and I'll show you an "
+        "**action menu** — tap what you want and I process only that:\n"
+        "• 🖼 **Thumbnail** — cover preview (PDF page / image / book cover)\n"
+        "• 🗜 **Compress PDF** — shrink PDFs before sending\n"
+        "• 🔎 **OCR** — **searchable PDF** (selectable text, same look) or plain text\n"
+        "• 🔁 **Convert** — re-format e-books (EPUB → PDF, MOBI, FB2, …)\n\n"
         "⚡ **Quick commands:**\n"
         "• /help — all commands\n"
         "• /login — connect **your** Telethon account (large files)\n"
@@ -2076,16 +2054,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /setwebhook <url> — set webhook (owner)\n"
         "• /delwebhook — delete webhook (owner)\n"
         "• /setcommands — push this list to Telegram (owner)\n\n"
-        "📖 Books\n"
-        "• Send a PDF/image → auto thumbnail (nothing to click)\n"
-        "• Send an e-book (EPUB, MOBI, AZW3, FB2, TXT…) → I send it back "
-        "with a **Convert** button to re-format it (PDF, EPUB, MOBI, FB2, …)\n"
-        "• 🗜 **Compress PDF** button on delivered PDFs — shrink before sending\n"
-        "• 🔎 **OCR** on delivered PDFs/images — **Searchable PDF** (invisible "
-        "text layer, same look) or plain text (.txt)\n"
+        "📖 Media → action menu\n"
+        "• Send a PDF / image / e-book → I detect it and show an **action "
+        "menu**; nothing is processed until you tap an option\n"
+        "• 🖼 **Thumbnail** — cover preview (PDF first page / image / book cover)\n"
+        "• 🗜 **Compress PDF** — shrink PDFs\n"
+        "• 🔎 **OCR** — **Searchable PDF** (invisible text layer, same look) "
+        "or plain text (.txt); e-books are converted to PDF first\n"
+        "• 🔁 **Convert** — re-format e-books (PDF, EPUB, MOBI, FB2, …)\n"
         "• /ocr [pdf|txt|picker] — pin your OCR output so the picker is skipped\n"
         "\n"
-        "Send a PDF or image any time to get its thumbnail."
+        "Send any supported file to get its action menu."
     )
     await update.effective_message.reply_text(text)
 
@@ -2206,11 +2185,11 @@ def _cancel_status_reply(
     kb = _cancel_all_kb() if has_jobs else None
     return text, kb
 
-# ── Book conversion: token-based Convert-button state ────────────────
-# Conversion has its own clean interface (delivered e-books carry a 🔁
-# Convert button that reveals ONLY format options).  The pending file record
-# is keyed by a short token stored with the button callback.
-BOOKCONVERT_KEY = "bookconvert:{}"
+# ── Token-based pending-action state ───────────────────────────────────
+# Input context menus (``ctxfile:<token>``) and delivered-file buttons
+# (``bookconvert`` / ``bookcompress`` / ``bookocr``) share one model: a
+# pending file record keyed by a short token stored with the button callback,
+# consumed atomically on the final action so double-taps are inert.
 
 
 def _peek_pending_record(key: str) -> str | None:
@@ -2266,35 +2245,6 @@ def _consume_pending_record(key: str) -> str | None:
         return None
 
 
-def _load_book_convert(token: str, consume: bool = True) -> dict | None:
-    """Load (and optionally consume) a pending book-convert record by token.
-
-    ``consume=False`` peeks the record (used when the Convert button reveals
-    the format picker); the record is consumed atomically once on the final
-    format tap so double-taps are inert.
-    """
-    if not token:
-        return None
-    key = BOOKCONVERT_KEY.format(token)
-    if consume:
-        raw = _consume_pending_record(key)
-        if raw is None:
-            return None
-    else:
-        try:
-            r = get_sync_redis()
-            if not r:
-                return None
-            raw = r.get(key)
-        except Exception:  # nosec B110
-            return None
-        if raw is None:
-            return None
-    try:
-        return json.loads(raw)
-    except Exception:  # nosec B110 - corrupt record = expired
-        return None
-
 
 def _book_conv_kb(
     uid: int, token: str, filename: str
@@ -2321,6 +2271,175 @@ def _book_conv_kb(
         for i in range(0, len(targets), 3)
     ]
     return InlineKeyboardMarkup(rows)
+
+
+# ── Media detection → context builder menu ─────────────────────────────
+# Shown at INPUT time (before any processing): the bot detects the media
+# type, stores a pending record keyed by a short token, and offers
+# type-appropriate actions as inline buttons.  Nothing is downloaded or piped
+# until the user taps an option — one file, one download, one result.  This
+# kills the old book echo-then-convert double pass and the auto-thumbnail
+# pipeline for PDFs/images.
+CTX_KEY = "ctxfile:{}"
+
+
+def _classify_media(filename: str, mime: str) -> str | None:
+    """Detect the media kind: ``pdf`` | ``image`` | ``book`` | None."""
+    lower = (filename or "").lower()
+    if lower.endswith(".pdf") or (mime or "") == "application/pdf":
+        return "pdf"
+    if (mime or "").startswith("image/") or lower.endswith(
+        (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+    ):
+        return "image"
+    if is_book_format(filename):
+        return "book"
+    return None
+
+
+def _load_pending_token(
+    token: str, consume: bool, *prefixes: str
+) -> dict | None:
+    """Resolve a pending button record across record prefixes (best-effort).
+
+    The input context menu stores under ``ctxfile:<token>`` while the
+    delivered-file buttons store under their own prefixes (``bookconvert`` /
+    ``bookcompress`` / ``bookocr``).  Handlers try both so a single token
+    space serves input menus and delivered buttons alike.  ``consume=True``
+    GETDELs the FIRST matching record atomically, so double-taps can never
+    enqueue the same job twice.
+    """
+    if not token:
+        return None
+    for prefix in prefixes:
+        key = f"{prefix}:{token}"
+        if consume:
+            raw = _consume_pending_record(key)
+        else:
+            raw = _peek_pending_record(key)
+        if raw:
+            try:
+                rec = json.loads(raw)
+            except Exception:  # nosec B110 - corrupt record = expired
+                rec = None
+            if rec:
+                return rec
+    return None
+
+
+def _store_ctx_record(
+    *,
+    chat_id: int,
+    user_id: int | None,
+    message_id: int | None,
+    file_id: str,
+    file_unique_id: str | None,
+    filename: str,
+    mime: str,
+    file_size: int | None,
+    forward_info: dict | None,
+    kind: str,
+) -> str | None:
+    """Persist the pending input-file record; returns its token or None."""
+    token = uuid.uuid4().hex[:10]
+    try:
+        r = get_sync_redis()
+        if not r:
+            return None
+        try:
+            import config as _cfg
+
+            _ttl = getattr(_cfg, "BOOK_ASK_TTL_SECONDS", 600)
+        except Exception:  # nosec B110
+            _ttl = 600
+        r.setex(
+            CTX_KEY.format(token),
+            _ttl,
+            json.dumps(
+                {
+                    "file_id": file_id,
+                    "file_unique_id": file_unique_id,
+                    "filename": filename,
+                    "mime": mime,
+                    "chat_id": chat_id,
+                    # The file lives at the input message in the user's chat,
+                    # so re-downloads use chat_id + message_id (source None).
+                    "source_chat_id": None,
+                    "message_id": message_id,
+                    "file_size": file_size,
+                    "forward_info": forward_info,
+                    "user_id": user_id,
+                    "kind": kind,
+                }
+            ),
+        )
+        return token
+    except Exception:  # nosec B110 - record store is best-effort
+        logger.exception("Failed to store context-menu record for %s", filename)
+        return None
+
+
+def _ctx_menu_kb(
+    uid: int, token: str, filename: str, kind: str
+) -> InlineKeyboardMarkup | None:
+    """The input context menu for a detected file (type-appropriate actions).
+
+    Callback data reuses the delivered-file prefixes (``bookconvert`` /
+    ``compresspdf`` / ``ocr``) so ONE set of handlers serves both flows; the
+    new ``ctxthumb`` prefix starts the normal thumbnail pipeline.  Returns
+    None when no action is available (feature disabled / engines missing) —
+    callers then reply with a clear message instead of a dead menu.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if kind in ("pdf", "image"):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f5bc\ufe0f Thumbnail",
+                    callback_data=f"ctxthumb:{uid}:{token}",
+                )
+            ]
+        )
+        if kind == "pdf":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f5dc\ufe0f Compress PDF",
+                        callback_data=f"compresspdf:{uid}:{token}",
+                    )
+                ]
+            )
+        if is_ocr_source(filename) and ocr_enabled():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f50e OCR",
+                        callback_data=f"ocr:{uid}:{token}",
+                    )
+                ]
+            )
+    elif kind == "book":
+        if getattr(config, "ENABLE_BOOK_CONVERSION", False) and calibre_available():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f501 Convert",
+                        callback_data=f"bookconvert:{uid}:{token}",
+                    )
+                ]
+            )
+        # Books aren't OCR-able directly — ocr_job converts them to PDF first
+        # (needs Calibre), so the button is gated on Calibre being present.
+        if ocr_enabled() and calibre_available():
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f50e OCR PDF",
+                        callback_data=f"ocr:{uid}:{token}",
+                    )
+                ]
+            )
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def _queued_cancel_kb(user_id: int | None, job_id: str) -> InlineKeyboardMarkup | None:
@@ -4311,6 +4430,103 @@ async def handle_canceljob_abort_callback(
         pass
 
 
+async def handle_ctx_thumb_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """🖼 Thumbnail button on the input context menu: ``ctxthumb:<uid>:<token>``.
+
+    Consumes the pending record atomically (``ctxfile:<token>``) and enqueues
+    ``process_document_job`` — the normal thumbnail pipeline, now running only
+    when the user asks for it (no more auto-processing on send).  Same-user
+    bound.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    uid = getattr(update.effective_user, "id", None)
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "ctxthumb":
+        await query.answer("Invalid action", show_alert=True)
+        return
+    try:
+        armer = int(parts[1])
+    except ValueError:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    token = parts[2]
+    if uid != armer:
+        await query.answer(
+            "Only the person who sent the file can process it.",
+            show_alert=True,
+        )
+        return
+    rec = _load_pending_token(token, True, "ctxfile")
+    if not rec:
+        await query.answer(
+            "This menu has expired. Send the file again.", show_alert=True
+        )
+        return
+    await _track_user_session(update, "ctx_thumbnail")
+    chat_id = rec.get("chat_id")
+    filename = rec.get("filename") or "file"
+    if not chat_id:
+        await query.answer(
+            "This action is invalid. Send the file again.", show_alert=True
+        )
+        return
+    # job_timeout > RQ's 180s default: a large file's userbot download +
+    # thumbnail pass can legitimately outlive the death penalty.
+    ok = await asyncio.to_thread(
+        enqueue_job,
+        "process_document_job",
+        chat_id,
+        rec.get("file_id"),
+        filename,
+        rec.get("mime", ""),
+        rec.get("file_unique_id"),
+        rec.get("message_id"),
+        rec.get("forward_info"),
+        rec.get("file_size"),
+        armer,
+        job_timeout=1800,
+    )
+    if ok:
+        try:
+            await query.answer("\U0001f5bc\ufe0f Thumbnail queued")
+        except Exception:  # nosec B110
+            pass
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([])
+            )
+        except Exception:  # nosec B110
+            pass
+        _queued_msg = None
+        try:
+            _queued_msg = await query.message.reply_text(
+                f"\U0001f5bc\ufe0f Building the thumbnail for "
+                f"`{safe_code_span(filename)}`...\n"
+                f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
+                reply_markup=_queued_cancel_kb(armer, ok),
+                parse_mode="Markdown",
+            )
+        except Exception:  # nosec B110
+            pass
+        _store_queued_message(
+            ok,
+            chat_id,
+            getattr(_queued_msg, "message_id", None),
+        )
+    else:
+        try:
+            await query.answer(
+                "\u274c Couldn't queue the job. Try again in a moment.",
+                show_alert=True,
+            )
+        except Exception:  # nosec B110
+            pass
+
+
 async def handle_book_convert_button_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -4337,11 +4553,11 @@ async def handle_book_convert_button_callback(
     token = parts[2]
     if uid != armer:
         await query.answer(
-            "Only the person who received the book can convert it.",
+            "Only the person who sent or received the book can convert it.",
             show_alert=True,
         )
         return
-    rec = _load_book_convert(token, consume=False)
+    rec = _load_pending_token(token, False, "bookconvert", "ctxfile")
     if not rec:
         try:
             await query.answer(
@@ -4422,11 +4638,11 @@ async def handle_book_convert_callback(
     target = parts[3].lower()
     if uid != armer:
         await query.answer(
-            "Only the person who received the book can convert it.",
+            "Only the person who sent or received the book can convert it.",
             show_alert=True,
         )
         return
-    pending = _load_book_convert(token, consume=True)
+    pending = _load_pending_token(token, True, "bookconvert", "ctxfile")
     if not pending:
         try:
             await query.edit_message_text(
@@ -4512,13 +4728,7 @@ async def handle_compress_callback(
             show_alert=True,
         )
         return
-    rec = None
-    raw = _consume_pending_record(f"bookcompress:{token}")
-    if raw:
-        try:
-            rec = json.loads(raw)
-        except Exception:  # nosec B110 - corrupt record = expired
-            rec = None
+    rec = _load_pending_token(token, True, "bookcompress", "ctxfile")
     if not rec:
         await query.answer(
             "This compress link has expired. Send the file again.", show_alert=True
@@ -4781,13 +4991,7 @@ async def handle_ocr_callback(
             show_alert=True,
         )
         return
-    rec = None
-    raw = _peek_pending_record(f"bookocr:{token}")
-    if raw:
-        try:
-            rec = json.loads(raw)
-        except Exception:  # nosec B110 - corrupt record = expired
-            rec = None
+    rec = _load_pending_token(token, False, "bookocr", "ctxfile")
     if not rec:
         await query.answer(
             "This OCR link has expired. Send the file again.", show_alert=True
@@ -4818,13 +5022,7 @@ async def handle_ocr_callback(
                 pass
             _default = ""
         else:
-            _rec2 = None
-            _raw2 = _consume_pending_record(f"bookocr:{token}")
-            if _raw2:
-                try:
-                    _rec2 = json.loads(_raw2)
-                except Exception:  # nosec B110 - corrupt record = expired
-                    _rec2 = None
+            _rec2 = _load_pending_token(token, True, "bookocr", "ctxfile")
             if not _rec2:
                 await query.answer(
                     "This OCR link has expired. Send the file again.",
@@ -4896,13 +5094,7 @@ async def handle_ocr_pick_callback(
     if target not in ("pdf", "txt"):
         await query.answer("Invalid action", show_alert=True)
         return
-    rec = None
-    raw = _consume_pending_record(f"bookocr:{token}")
-    if raw:
-        try:
-            rec = json.loads(raw)
-        except Exception:  # nosec B110 - corrupt record = expired
-            rec = None
+    rec = _load_pending_token(token, True, "bookocr", "ctxfile")
     if not rec:
         await query.answer(
             "This OCR link has expired. Send the file again.", show_alert=True
@@ -4959,7 +5151,11 @@ async def _enqueue_ocr_job(
         rec.get("file_size"),
         source_chat_id=rec.get("source_chat_id"),
         target=target,
-        job_timeout=3600,
+        # job_timeout > RQ's 180s default: OCR of a multi-page PDF at 200-300
+        # DPI (plus ocrmypdf's text-layer pass) can outlive the death penalty.
+        # E-book sources first run a Calibre conversion (up to
+        # BOOK_CONVERT_TIMEOUT_SECONDS) before OCR, so allow generous headroom.
+        job_timeout=7200,
     )
     if ok:
         try:
@@ -5088,6 +5284,12 @@ application.add_handler(
     CallbackQueryHandler(
         handle_ocr_set_callback,
         pattern=r"^ocrset:\d+:(pdf|txt|picker)$",
+    )
+)
+application.add_handler(
+    CallbackQueryHandler(
+        handle_ctx_thumb_callback,
+        pattern=r"^ctxthumb:\d+:\S+$",
     )
 )
 application.add_handler(CommandHandler("ocr", cmd_ocr))

@@ -3749,6 +3749,44 @@ def ocr_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
 
+        # E-books aren't OCR-able directly — convert to PDF with Calibre first,
+        # then OCR the PDF (both searchable-PDF and text extraction work on it).
+        if is_book_format(filename) and not filename.lower().endswith(".pdf"):
+            _pdf_name = safe_target_name(filename, "pdf")
+            _pdf_src = os.path.join(tmpdir, _pdf_name)
+            _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
+            _tg_send_progress(
+                chat_id, filename, "compressing",
+                detail="\U0001f4d5 Converting book to PDF for OCR...",
+                message_id=_progress_msg_id,
+            )
+            try:
+                _conv_ok = convert_book_to_pdf_with_thumbnail(
+                    _src, _pdf_src, os.path.join(tmpdir, "thumb.jpg"),
+                    timeout=_conv_timeout,
+                    cancel_check=lambda: _job_cancelled(_cancel_check_id),
+                )
+            except ConversionCancelledError:
+                logger.info(
+                    "ocr_job: cancelled mid book->PDF conversion for %s",
+                    filename,
+                )
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                return {"status": "cancelled"}
+            if not _conv_ok or not os.path.exists(_pdf_src):
+                _tg_send_progress(
+                    chat_id, filename, "failed",
+                    detail=(
+                        "\u274c Couldn't convert the book to PDF for OCR. "
+                        "The file may be DRM-protected or corrupt."
+                    ),
+                    message_id=_progress_msg_id,
+                )
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
+                return {"error": "conversion_failed"}
+            _src = _pdf_src
+            filename = _pdf_name
+
         if _job_cancelled(_cancel_check_id):
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
