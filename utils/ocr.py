@@ -251,10 +251,15 @@ def run_ocr_pdf(
 
     ocrmypdf OCRs each page and overlays an INVISIBLE text layer on the ORIGINAL
     page rendering — the output looks exactly like the input but its text is
-    selectable/copyable/searchable.  ``--skip-text`` copies pages that already
-    have a text layer unchanged (born-digital pages are never double-OCR'd, and
-    an existing — possibly stale — layer is never re-OCR'd, matching the
-    "as they are" semantics), and ``--output-type pdf`` skips PDF/A conversion
+    selectable/copyable/searchable.  ``--redo-ocr`` re-OCRs pages that already
+    carry a text layer while RETAINING the original layer: this is deliberate.
+    Pirated scans are often stamped with a website footer (e.g. ``www.site.com``
+    on every page) — ocrmypdf's default ``--skip-text`` sees that thin text and
+    skips the whole page, so the textbook body never gets OCR'd.  ``--redo-ocr``
+    guarantees every page gets a real searchable layer regardless of such
+    fragments, and the ``pdf_has_text_layer`` validator (which requires
+    meaningful text per page) gates the run up front so genuinely born-digital
+    PDFs never reach the engine.  ``--output-type pdf`` skips PDF/A conversion
     for speed.
 
     ``cancel_check()`` is polled while the subprocess runs; when it turns True
@@ -278,7 +283,7 @@ def run_ocr_pdf(
     cmd = [
         "ocrmypdf",
         "--quiet",
-        "--skip-text",
+        "--redo-ocr",
         "--output-type", "pdf",
         "--optimize", "1",
         "--jobs", "1",

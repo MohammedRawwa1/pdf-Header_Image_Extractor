@@ -521,15 +521,26 @@ def extract_pdf_embedded_thumbnail_bytes(pdf_bytes: bytes) -> bytes | None:
         return None
 
 
-def pdf_has_text_layer(pdf_path: str, min_ratio: float = 0.9) -> bool:
-    """True when most pages of ``pdf_path`` already carry extractable text.
+def pdf_has_text_layer(
+    pdf_path: str, min_ratio: float = 0.9, min_chars: int = 60
+) -> bool:
+    """True when most pages of ``pdf_path`` already carry MEANINGFUL text.
 
     The "already OCR'd" validator: born-digital or previously-OCR'd PDFs have
     a real text layer, so re-running ocrmypdf/tesseract would waste CPU for
-    zero gain.  ``min_ratio`` is the fraction of pages that must contain text
-    (a mixed scan only partially OCR'd still gets the full pass).  Corrupt or
-    empty PDFs return False so the OCR job proceeds and surfaces the real
-    error as today.
+    zero gain.  ``min_ratio`` is the fraction of pages that must qualify (a
+    mixed scan only partially OCR'd still gets the full pass).
+
+    ``min_chars`` is the minimum non-whitespace text a page must carry before
+    it counts as "already OCR'd".  This is the fix for pirated scans stamped
+    with a website footer (e.g. ``www.example.com`` on every page): such pages
+    DO contain extractable text, so the old any-text check reported them as
+    100% OCR'd and skipped the whole pass even though the textbook body is
+    nothing but images.  A page whose only text is a short link/watermark/
+    page number falls below the threshold and still gets the full OCR pass.
+
+    Corrupt or empty PDFs return False so the OCR job proceeds and surfaces
+    the real error as today.
     """
     try:
         doc = fitz.open(pdf_path)
@@ -540,7 +551,7 @@ def pdf_has_text_layer(pdf_path: str, min_ratio: float = 0.9) -> bool:
             with_text = sum(
                 1
                 for i in range(total)
-                if (doc.load_page(i).get_text() or "").strip()
+                if len((doc.load_page(i).get_text() or "").strip()) >= min_chars
             )
             return with_text / total >= min_ratio
         finally:
