@@ -166,6 +166,7 @@ def _tg_send_document(
     compress_user_id: int | None = None,
     convert_user_id: int | None = None,
     ocr_user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> dict:
     """Send a document via the Bot API ``sendDocument`` endpoint.
 
@@ -254,6 +255,7 @@ def _tg_send_document(
                     compress_user_id,
                     convert_user_id,
                     ocr_user_id,
+                    done_ops,
                 )
             return _res
         except (
@@ -280,6 +282,7 @@ def _attach_send_buttons(
     compress_user_id: int | None = None,
     convert_user_id: int | None = None,
     ocr_user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> None:
     """Attach one-tap follow-up buttons to a delivered document (best-effort).
 
@@ -288,6 +291,11 @@ def _attach_send_buttons(
     Convert / OCR buttons on the delivered copy.  ``res`` is the sendDocument
     response dict.  Uses the DELIVERED file_id so one-tap actions operate on
     exactly what the user received.
+
+    ``done_ops`` names the operations (``compress`` / ``convert`` / ``ocr``)
+    this delivery ALREADY performed — the matching follow-up button is
+    suppressed so a result never offers the job it just did (an OCR'd PDF
+    gets 🗜 Compress but not another 🔎🖼 OCR, a compressed PDF the reverse).
     """
     if not res or not res.get("ok"):
         return
@@ -296,9 +304,15 @@ def _attach_send_buttons(
         _msg_id = _result.get("message_id")
         _doc = _result.get("document") or {}
         _actions: list[tuple[str, str, str]] = []
-        if compress_user_id and filename and filename.lower().endswith(".pdf"):
-            # 🗜 Compress on delivered PDFs (thumb/convert/compress results —
-            # one tap -> compress_pdf_job).
+        if (
+            compress_user_id
+            and filename
+            and filename.lower().endswith(".pdf")
+            and "compress" not in done_ops
+        ):
+            # 🗜 Compress on delivered PDFs (thumb/convert results — one tap
+            # -> compress_pdf_job).  Skipped when this delivery just ran the
+            # compression job itself.
             _actions.append(
                 (
                     COMPRESS_PDF_ACTION[0],
@@ -306,7 +320,12 @@ def _attach_send_buttons(
                     COMPRESS_PDF_ACTION[2],
                 )
             )
-        if convert_user_id and filename and not filename.lower().endswith(".pdf"):
+        if (
+            convert_user_id
+            and filename
+            and not filename.lower().endswith(".pdf")
+            and "convert" not in done_ops
+        ):
             # 🔁 Convert on delivered e-books (its own interface — never
             # mixed with the thumbnail flow).
             _actions.append(
@@ -316,8 +335,14 @@ def _attach_send_buttons(
                     BOOK_CONVERT_ACTION[2],
                 )
             )
-        if ocr_user_id and is_ocr_source(filename) and ocr_enabled():
-            # 🔎🖼 OCR & Thumbnail on delivered PDFs/images (scanned text).
+        if (
+            ocr_user_id
+            and is_ocr_source(filename)
+            and ocr_enabled()
+            and "ocr" not in done_ops
+        ):
+            # 🔎🖼 OCR & Thumbnail on delivered PDFs/images (scanned text) —
+            # skipped when this delivery just ran the OCR job itself.
             _actions.append((OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2]))
         if _actions:
             _attach_pending_buttons(
@@ -343,6 +368,7 @@ def _tg_send_document_by_id(
     compress_user_id: int | None = None,
     convert_user_id: int | None = None,
     ocr_user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> dict:
     """Re-send a previously delivered document by its cached Bot API file_id.
 
@@ -395,6 +421,7 @@ def _tg_send_document_by_id(
                     compress_user_id,
                     convert_user_id,
                     ocr_user_id,
+                    done_ops,
                 )
             return _res
         except (
@@ -692,6 +719,24 @@ def _store_pending_record(
 
 
 
+
+
+def sent_doc_file_unique_id(msg: Any | None) -> str | None:
+    """Best-effort: the Bot API ``file_unique_id`` of a userbot-sent message.
+
+    Userbot deliveries (Telethon/Pyrogram) return a library Message object.
+    Pyrogram exposes the Bot API ``file_unique_id`` on ``message.document``;
+    Telethon's MTProto documents do not carry it, so this returns None there
+    and the pending record simply stores no fuid (no surface dedup for that
+    delivery) rather than inventing an identifier.  Safe for both libraries:
+    every access is a getattr with a None fallback.
+    """
+    if msg is None:
+        return None
+    _doc = getattr(msg, "document", None)
+    if _doc is None:
+        _doc = getattr(msg, "file", None)
+    return getattr(_doc, "file_unique_id", None) or None
 
 
 def _tg_send_pending_prompt(

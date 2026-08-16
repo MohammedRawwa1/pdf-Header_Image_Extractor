@@ -127,6 +127,7 @@ from utils.session_healthcheck import (  # noqa: E402
     stop_session_healthcheck,
 )
 from utils.tg_http import (  # noqa: E402
+    BOOK_CONVERT_ACTION,
     COMPRESS_PDF_ACTION,
     OCR_ACTION,
     _attach_pending_buttons,
@@ -134,6 +135,7 @@ from utils.tg_http import (  # noqa: E402
     _tg_send_document,
     _tg_send_document_by_id,
     _tg_send_pending_prompt,
+    sent_doc_file_unique_id,
 )
 from utils.url_validation import _validate_url_safe  # noqa: E402
 from utils.user_settings import (  # noqa: E402
@@ -352,6 +354,8 @@ async def _send_with_upload_progress(
     target_chat_id: int | str = None,
     task=None,
     progress_msg_id: int | None = None,
+    convert_user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> bool:
     """Send a file via userbot with upload progress tracking.
 
@@ -415,11 +419,24 @@ async def _send_with_upload_progress(
             # results get a bot-API prompt pointing at the delivered copy —
             # web-process parity with the worker flow.  PDFs: [🗜 Compress PDF]
             # + [🔎🖼 OCR & Thumbnail]; raster images: [🔎🖼 OCR & Thumbnail].
+            # ``done_ops`` suppresses the follow-up for an operation this
+            # delivery already performed (mirrors the worker's
+            # _deliver_converted_file fallback).  E-books get [🔁 Convert]
+            # when ``convert_user_id`` is set (Calibre available) — the
+            # userbot-delivered echo keeps the full conversion interface.
             # Best-effort by contract: _tg_send_pending_prompt never raises.
             _name = filename or ""
             _is_pdf = _name.lower().endswith(".pdf")
-            _has_ocr = is_ocr_source(_name) and ocr_enabled()
-            if _is_pdf or _has_ocr:
+            _want_compress = _is_pdf and "compress" not in done_ops
+            _want_ocr = (
+                is_ocr_source(_name)
+                and ocr_enabled()
+                and "ocr" not in done_ops
+            )
+            _want_convert = (
+                bool(convert_user_id) and "convert" not in done_ops
+            )
+            if _want_compress or _want_ocr or _want_convert:
                 _msg_chat = getattr(_sent_msg, "chat_id", None)
                 if _msg_chat is None:
                     _msg_chat = getattr(
@@ -431,8 +448,13 @@ async def _send_with_upload_progress(
                     else (_msg_chat if _msg_chat is not None else _used_chat)
                 )
                 _sent_id = getattr(_sent_msg, "id", None)
+                # The delivered copy's Bot API file_unique_id (Pyrogram
+                # sends; None on Telethon) lets a later Convert/Compress/OCR
+                # tap on this copy resolve the cached processed record at the
+                # surface and re-send instead of re-running the job.
+                _sent_fuid = sent_doc_file_unique_id(_sent_msg)
                 if _sent_id:
-                    if _is_pdf:
+                    if _want_compress and _want_ocr:
                         await asyncio.to_thread(
                             _tg_send_pending_prompt,
                             *COMPRESS_PDF_ACTION,
@@ -442,13 +464,26 @@ async def _send_with_upload_progress(
                             file_size=file_size,
                             src_chat_id=_src_chat,
                             src_message_id=_sent_id,
+                            file_unique_id=_sent_fuid,
                             extra_action=(
                                 (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
                                 if ocr_enabled()
                                 else None
                             ),
                         )
-                    else:
+                    elif _want_compress:
+                        await asyncio.to_thread(
+                            _tg_send_pending_prompt,
+                            *COMPRESS_PDF_ACTION,
+                            chat_id=chat_id,
+                            filename=filename,
+                            user_id=user_id,
+                            file_size=file_size,
+                            src_chat_id=_src_chat,
+                            src_message_id=_sent_id,
+                            file_unique_id=_sent_fuid,
+                        )
+                    elif _want_ocr:
                         await asyncio.to_thread(
                             _tg_send_pending_prompt,
                             *OCR_ACTION,
@@ -458,6 +493,19 @@ async def _send_with_upload_progress(
                             file_size=file_size,
                             src_chat_id=_src_chat,
                             src_message_id=_sent_id,
+                            file_unique_id=_sent_fuid,
+                        )
+                    elif _want_convert:
+                        await asyncio.to_thread(
+                            _tg_send_pending_prompt,
+                            *BOOK_CONVERT_ACTION,
+                            chat_id=chat_id,
+                            filename=filename,
+                            user_id=user_id,
+                            file_size=file_size,
+                            src_chat_id=_src_chat,
+                            src_message_id=_sent_id,
+                            file_unique_id=_sent_fuid,
                         )
             await progress_tracker.complete_task(task.task_id)
             # Auto-remove the transient progress message after delivery.
@@ -504,6 +552,7 @@ async def _send_document_via_bot_api(
     task=None,
     progress_msg_id: int | None = None,
     user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> None:
     """Send a document via the Bot API with LIVE upload progress.
 
@@ -544,12 +593,16 @@ async def _send_document_via_bot_api(
                 _thumb_fh.close()
         # Attach the result buttons (🗜 Compress + 🔎🖼 OCR & Thumbnail for
         # PDFs, 🔎🖼 OCR & Thumbnail for images) — parity with the raw-HTTP
-        # path in _tg_send_document.
+        # path in _tg_send_document.  ``done_ops`` suppresses the follow-up
+        # for an operation this delivery already performed.
         if user_id:
             try:
                 _doc = getattr(_sent, "document", None)
                 _actions: list[tuple[str, str, str]] = []
-                if filename.lower().endswith(".pdf"):
+                if (
+                    filename.lower().endswith(".pdf")
+                    and "compress" not in done_ops
+                ):
                     _actions.append(
                         (
                             COMPRESS_PDF_ACTION[0],
@@ -557,7 +610,11 @@ async def _send_document_via_bot_api(
                             COMPRESS_PDF_ACTION[2],
                         )
                     )
-                if is_ocr_source(filename) and ocr_enabled():
+                if (
+                    is_ocr_source(filename)
+                    and ocr_enabled()
+                    and "ocr" not in done_ops
+                ):
                     _actions.append(
                         (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
                     )
@@ -595,6 +652,7 @@ async def _send_document_via_bot_api(
                 _cb,
                 user_id,
                 ocr_user_id=user_id,
+                done_ops=done_ops,
             )
     finally:
         if _thumb_fh is not None:
@@ -1103,6 +1161,7 @@ def _resend_cached_result(
             caption=caption,
             compress_user_id=user_id,
             ocr_user_id=user_id,
+            done_ops=(op,),
         )
         return bool(_res and _res.get("ok"))
     except Exception:
@@ -7124,6 +7183,7 @@ async def handle_text_with_url(
                         file_size=_url_file_size,
                         loop=_loop,
                         target_chat_id=BOT_USER_ID or "me",
+                        convert_user_id=_convert_uid,
                     )
                 else:
                     with open(file_path, "rb") as f_doc:

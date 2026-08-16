@@ -519,6 +519,7 @@ from utils.tg_http import (  # noqa: E402
     _tg_send_message,
     _tg_send_pending_prompt,
     _tg_send_progress,
+    sent_doc_file_unique_id,
 )
 
 
@@ -529,6 +530,7 @@ def _maybe_attach_result_prompt(
     user_id: int | None,
     src_chat: int | str,
     src_message: int | None,
+    file_unique_id: str | None = None,
 ) -> None:
     """Post one-tap result prompts after a userbot-delivered file.
 
@@ -559,6 +561,7 @@ def _maybe_attach_result_prompt(
             file_size=_size,
             src_chat_id=src_chat,
             src_message_id=src_message,
+            file_unique_id=file_unique_id,
             extra_action=(
                 (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
                 if ocr_enabled()
@@ -574,6 +577,7 @@ def _maybe_attach_result_prompt(
             file_size=_size,
             src_chat_id=src_chat,
             src_message_id=src_message,
+            file_unique_id=file_unique_id,
         )
 
 try:
@@ -1117,6 +1121,7 @@ def process_input_key_job(job: dict) -> dict:
                     user_id,
                     _src_chat,
                     getattr(_sent, "id", None),
+                    file_unique_id=sent_doc_file_unique_id(_sent),
                 )
                 _cache_userbot_delivered_copy(
                     _content_hash,
@@ -1698,6 +1703,7 @@ def _resend_cached_processed(
                 ),
                 compress_user_id=user_id,
                 ocr_user_id=user_id,
+                done_ops=(op,),
             )
             return "bot" if _res and _res.get("ok") else None
         except Exception:  # nosec B110 - cached copy failed; process fresh
@@ -2648,6 +2654,7 @@ def process_document_job(
                         user_id,
                         _src_chat,
                         getattr(_sent, "id", None),
+                        file_unique_id=sent_doc_file_unique_id(_sent),
                     )
                     _cache_userbot_delivered_copy(
                         _content_hash,
@@ -3082,6 +3089,7 @@ def process_document_job(
                                 user_id,
                                 _src_chat,
                                 getattr(_sent, "id", None),
+                                file_unique_id=sent_doc_file_unique_id(_sent),
                             )
                             _cache_userbot_delivered_copy(
                                 _content_hash,
@@ -3693,8 +3701,15 @@ def _deliver_converted_file(
     progress_msg_id: int | None = None,
     convert_user_id: int | None = None,
     ocr_user_id: int | None = None,
+    done_ops: tuple[str, ...] = (),
 ) -> dict | None:
     """Send a converted/compressed result with live progress + cancel respect.
+
+    ``done_ops`` names the operations this job already performed (e.g.
+    ``("compress",)`` from compress_pdf_job or ``("ocr",)`` from ocr_job) so
+    the delivered copy's follow-up buttons never re-offer the job it just did
+    — an OCR'd PDF gets 🗜 Compress but not another 🔎🖼 OCR, and a compressed
+    PDF gets the reverse.
 
     Returns the sendDocument response dict when the result was delivered via
     the Bot API, or ``{"ok": False, "delivery": "userbot", "src_chat_id": ...,
@@ -3776,6 +3791,7 @@ def _deliver_converted_file(
                     compress_user_id=user_id,
                     convert_user_id=convert_user_id,
                     ocr_user_id=ocr_user_id or user_id,
+                    done_ops=done_ops,
                 )
         except Exception:
             # Too large for a Bot API upload (sendDocument cap): deliver via
@@ -3793,6 +3809,11 @@ def _deliver_converted_file(
                 raise
             _sent, _src_chat = _res
             _sent_id = getattr(_sent, "id", None)
+            # The delivered copy's Bot API file_unique_id (Pyrogram sends;
+            # None on Telethon) lets a later Convert/Compress/OCR tap on this
+            # copy resolve the cached processed record at the surface and
+            # re-send instead of re-running the job.
+            _sent_fuid = sent_doc_file_unique_id(_sent)
             try:
                 _dl_size = 0
                 try:
@@ -3801,7 +3822,17 @@ def _deliver_converted_file(
                     pass
                 _name = filename or ""
                 _is_pdf = _name.lower().endswith(".pdf")
-                if _is_pdf:
+                # Only offer follow-ups the job did NOT just perform: a
+                # compressed PDF gets 🗜 skipped, an OCR'd file gets 🔎🖼
+                # skipped — mirroring _attach_send_buttons on the Bot API
+                # path above.
+                _want_compress = _is_pdf and "compress" not in done_ops
+                _want_ocr = (
+                    ocr_enabled()
+                    and is_ocr_source(_name)
+                    and "ocr" not in done_ops
+                )
+                if _want_compress and _want_ocr:
                     _tg_send_pending_prompt(
                         *COMPRESS_PDF_ACTION,
                         chat_id=chat_id,
@@ -3810,23 +3841,35 @@ def _deliver_converted_file(
                         file_size=_dl_size,
                         src_chat_id=_src_chat,
                         src_message_id=_sent_id,
+                        file_unique_id=_sent_fuid,
                         extra_action=(
                             (OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2])
                             if ocr_enabled()
                             else None
                         ),
                     )
-                elif is_ocr_source(_name):
-                    if ocr_enabled():
-                        _tg_send_pending_prompt(
-                            *OCR_ACTION,
-                            chat_id=chat_id,
-                            filename=filename,
-                            user_id=user_id,
-                            file_size=_dl_size,
-                            src_chat_id=_src_chat,
-                            src_message_id=_sent_id,
-                        )
+                elif _want_compress:
+                    _tg_send_pending_prompt(
+                        *COMPRESS_PDF_ACTION,
+                        chat_id=chat_id,
+                        filename=filename,
+                        user_id=user_id,
+                        file_size=_dl_size,
+                        src_chat_id=_src_chat,
+                        src_message_id=_sent_id,
+                        file_unique_id=_sent_fuid,
+                    )
+                elif _want_ocr:
+                    _tg_send_pending_prompt(
+                        *OCR_ACTION,
+                        chat_id=chat_id,
+                        filename=filename,
+                        user_id=user_id,
+                        file_size=_dl_size,
+                        src_chat_id=_src_chat,
+                        src_message_id=_sent_id,
+                        file_unique_id=_sent_fuid,
+                    )
                 elif convert_user_id:
                     _tg_send_pending_prompt(
                         *BOOK_CONVERT_ACTION,
@@ -3836,6 +3879,7 @@ def _deliver_converted_file(
                         file_size=_dl_size,
                         src_chat_id=_src_chat,
                         src_message_id=_sent_id,
+                        file_unique_id=_sent_fuid,
                     )
             except Exception:  # nosec B110 - the prompt is best-effort
                 logger.exception(
@@ -4735,6 +4779,7 @@ def compress_pdf_job(
         _comp_res = _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
+            done_ops=("compress",),
         )
         if _comp_res and _comp_res.get("ok"):
             try:
@@ -5113,6 +5158,7 @@ def ocr_job(
             _ocr_res = _deliver_converted_file(
                 chat_id, _src, filename, _thumb_path, _caption, user_id,
                 progress_msg_id=_progress_msg_id,
+                done_ops=("ocr",),
             )
             if _ocr_res and _ocr_res.get("ok"):
                 try:
@@ -5301,6 +5347,7 @@ def ocr_job(
         _ocr_res = _deliver_converted_file(
             chat_id, _out, _out_name, _thumb_path, _caption, user_id,
             progress_msg_id=_progress_msg_id,
+            done_ops=("ocr",),
         )
         if _ocr_res and not _converted_book:
             # Only direct-PDF/image sources: a converted book's fuid is not a
@@ -5587,6 +5634,7 @@ def process_url_job(
                     user_id,
                     _src_chat,
                     getattr(_sent, "id", None),
+                    file_unique_id=sent_doc_file_unique_id(_sent),
                 )
                 _write_out("done")
                 _cleanup_after_success(chat_id, _rq_job_id, _progress_msg_id)
