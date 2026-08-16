@@ -13,7 +13,8 @@ DEFAULTS = {
     "default_thumbnail": None,  # path or URL
     "bulk_mode": False,  # when True, treat pasted URL lists as bulk uploads
     "use_custom_thumbnail": False,  # when True, use per-user custom thumbnail if set
-    # OCR output default when tapping 🔎 OCR: "" = always show the picker,
+    # OCR output default when tapping 🔎🖼 OCR & Thumbnail: "" = always
+    # show the picker,
     # "pdf" = skip the picker and go straight to Searchable PDF, "txt" =
     # skip the picker and go straight to plain text.
     "ocr_target": "",

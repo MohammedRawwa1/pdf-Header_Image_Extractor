@@ -1,11 +1,12 @@
 # PDF Header / Cover Image Extractor Bot
 
-A Telegram bot that extracts a header/cover image (first PDF page) and generates thumbnails for PDFs and images. Supports large PDFs (>20MB) via userbot fallback and runs as a FastAPI webhook service on Railway.
+A Telegram bot that generates cover thumbnails for PDFs and images, and runs OCR (Tesseract) on scanned PDFs/images to produce searchable PDFs or plain text — every delivered result ships with its cover thumbnail in a single download. Supports large PDFs (>20MB) via userbot fallback and runs as a FastAPI webhook service on Railway.
 
 ## Features
 
 - **PDF Thumbnail Extraction** — Automatically selects the best page as cover image
 - **Automatic Thumb Detection** — Uses visual entropy to pick the most relevant page
+- **OCR & Thumbnail** — OCR scanned PDFs/images into a searchable PDF or plain text; the result is always delivered with an auto-generated cover thumbnail (one job, one download)
 - **Big PDF Support** — Handles files >20MB via Telethon/Pyrogram userbot download
 - **Progress Tracking** — Real-time download/upload progress bars
 - **Keep-Alive Heartbeat** — Prevents free-tier spin-down (15min inactivity)
@@ -91,6 +92,18 @@ A Telegram bot that extracts a header/cover image (first PDF page) and generates
 | `/startbatch` | Start collecting forwarded files |
 | `/endbatch` | Process collected batch |
 | `/cancelbatch` | Cancel batch collection |
+
+## Media Action Menu
+
+Send a PDF, image, or e-book and the bot shows an action menu — nothing is processed until you tap a button:
+
+| Media type | Buttons |
+|------------|---------|
+| PDF | 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail · 🗜🖼 Compress & Thumbnail |
+| Image | 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail |
+| E-book | 🔁 Convert · 🗜 Compress PDF · 🔎🖼 OCR & Thumbnail PDF |
+
+**OCR & Thumbnail** runs a single OCR job — a searchable PDF (selectable text layer) or extracted plain text, per your `/ocr` default — and the result is always delivered with an auto-generated cover thumbnail attached, all from the same download. There is no separate "OCR + Thumbnail" combo button: OCR already includes the thumbnail, so tapping it never runs extra jobs or downloads.
 
 ## HTTP API Endpoints
 

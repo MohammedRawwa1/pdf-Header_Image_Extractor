@@ -414,8 +414,8 @@ async def _send_with_upload_progress(
             # The bot cannot edit the userbot's delivered message, so oversized
             # results get a bot-API prompt pointing at the delivered copy —
             # web-process parity with the worker flow.  PDFs: [🗜 Compress PDF]
-            # + [🔎 OCR]; raster images: [🔎 OCR].  Best-effort by contract:
-            # _tg_send_pending_prompt never raises.
+            # + [🔎🖼 OCR & Thumbnail]; raster images: [🔎🖼 OCR & Thumbnail].
+            # Best-effort by contract: _tg_send_pending_prompt never raises.
             _name = filename or ""
             _is_pdf = _name.lower().endswith(".pdf")
             _has_ocr = is_ocr_source(_name) and ocr_enabled()
@@ -542,8 +542,9 @@ async def _send_document_via_bot_api(
         finally:
             if _thumb_fh is not None:
                 _thumb_fh.close()
-        # Attach the result buttons (🗜 Compress + 🔎 OCR for PDFs, 🔎 OCR for
-        # images) — parity with the raw-HTTP path in _tg_send_document.
+        # Attach the result buttons (🗜 Compress + 🔎🖼 OCR & Thumbnail for
+        # PDFs, 🔎🖼 OCR & Thumbnail for images) — parity with the raw-HTTP
+        # path in _tg_send_document.
         if user_id:
             try:
                 _doc = getattr(_sent, "document", None)
@@ -2223,9 +2224,9 @@ async def cmd_start(
         f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
         "📄 Send a **PDF**, **image**, or **e-book** and I'll show you an "
         "**action menu** — tap what you want and I process only that:\n"
-        "• **PDF**: 🖼 **Thumbnail** · 🔎🖼 **OCR & Thumbnail** (all-in-one) · 🗜🖼 **Compress & Thumbnail**\n"
-        "• **Images**: 🖼 **Thumbnail** · 🔎 **OCR**\n"
-        "• **E-books**: 🔁 **Convert** · 🗜 **Compress PDF** · 🔎 **OCR PDF**\n\n"
+        "• **PDF**: 🖼 **Thumbnail** · 🔎🖼 **OCR & Thumbnail** · 🗜🖼 **Compress & Thumbnail**\n"
+        "• **Images**: 🖼 **Thumbnail** · 🔎🖼 **OCR & Thumbnail**\n"
+        "• **E-books**: 🔁 **Convert** · 🗜 **Compress PDF** · 🔎🖼 **OCR & Thumbnail PDF**\n\n"
         "⚡ **Quick commands:**\n"
         "• /help — all commands\n"
         "• /login — connect **your** Telethon account (large files)\n"
@@ -2281,11 +2282,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📖 Media → action menu\n"
         "• Send a PDF / image / e-book → I detect it and show an **action "
         "menu**; nothing is processed until you tap an option\n"
-        "• **PDF**: 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail (all-in-one) · "
+        "• **PDF**: 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail · "
         "🗜🖼 Compress & Thumbnail\n"
-        "• **Image**: 🖼 Thumbnail · 🔎 OCR\n"
+        "• **Image**: 🖼 Thumbnail · 🔎🖼 OCR & Thumbnail\n"
         "• **E-book**: 🔁 Convert · 🗜 Compress PDF (convert→PDF, then "
-        "shrink) · 🔎 OCR PDF (converted to PDF first)\n"
+        "shrink) · 🔎🖼 OCR & Thumbnail PDF (converted to PDF first)\n"
         "• /ocr [pdf|txt|picker] — pin your OCR output so the picker is skipped\n"
         "\n"
         "Send any supported file to get its action menu."
@@ -2629,10 +2630,10 @@ def _ctx_menu_kb(
     """
     rows: list[list[InlineKeyboardButton]] = []
     if kind == "pdf":
-        # PDFs get a dedicated menu-interface: 🖼 Thumbnail, 🔎+🖼 OCR &
-        # Thumbnail (all-in-one — one download for both steps), 🔎 OCR (OCR
-        # only, both pipes), and 🗜+🖼 Compress & Thumbnail
-        # (compress_pdf_job already delivers a cover thumbnail).
+        # PDFs get a dedicated menu-interface: 🖼 Thumbnail, 🔎🖼 OCR &
+        # Thumbnail (the OCR job already ships the result with a cover
+        # preview — no separate combo button), and 🗜+🖼 Compress &
+        # Thumbnail (compress_pdf_job already delivers a cover thumbnail).
         rows.append(
             [
                 InlineKeyboardButton(
@@ -2646,14 +2647,6 @@ def _ctx_menu_kb(
                 [
                     InlineKeyboardButton(
                         "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
-                        callback_data=f"ctxthumbocr:{uid}:{token}",
-                    )
-                ]
-            )
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "\U0001f50e OCR",
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -2679,7 +2672,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f50e OCR",
+                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -2710,7 +2703,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f50e OCR PDF",
+                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail PDF",
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -5208,270 +5201,6 @@ async def handle_ctx_thumb_callback(
             pass
 
 
-async def handle_ctx_thumb_ocr_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """🔎+🖼 OCR & Thumbnail button on the input context menu: ``ctxthumbocr:<uid>:<token>``.
-
-    All-in-one for PDFs: consumes the pending record atomically
-    (``ctxfile:<token>``) and enqueues a SINGLE ``ocr_job`` with
-    ``also_thumb=True`` when both parts are still pending — the file is
-    downloaded ONCE via the shared Bot-API + userbot pipe chain, then Step 1
-    runs OCR and Step 2 builds the cover thumbnail from the SAME download (no
-    double userbot pull, no second relay forward).  When only one part is
-    pending, that part's standalone job is queued instead.  Same-user bound.
-    """
-    query = update.callback_query
-    if query is None:
-        return
-    uid = getattr(update.effective_user, "id", None)
-    parts = str(query.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "ctxthumbocr":
-        await query.answer("Invalid action", show_alert=True)
-        return
-    try:
-        armer = int(parts[1])
-    except ValueError:
-        await query.answer("Invalid action", show_alert=True)
-        return
-    token = parts[2]
-    if uid != armer:
-        await query.answer(
-            "Only the person who sent the file can process it.",
-            show_alert=True,
-        )
-        return
-    rec = _load_pending_token(token, True, "ctxfile")
-    if not rec:
-        await query.answer(
-            "This menu has expired. Send the file again.", show_alert=True
-        )
-        return
-    await _track_user_session(update, "ctx_thumb_ocr")
-    chat_id = rec.get("chat_id")
-    filename = rec.get("filename") or "file"
-    if not chat_id:
-        await query.answer(
-            "This action is invalid. Send the file again.", show_alert=True
-        )
-        return
-    # ── Already-processed gate: queue only the parts not yet done ──
-    # Re-sends of the same CONTENT (resolved via the file's Telegram
-    # file_unique_id) skip the parts already delivered (cached file_id
-    # re-sent instead of a new job) and the parts the PDF validator already
-    # proved pointless (embedded thumb / text layer).
-    _fchecks = _get_pdf_checks(rec.get("file_unique_id"))
-    _f_thumb = _fchecks.get("has_thumb") if _fchecks is not None else None
-    _rec = (
-        get_processed_by_file_unique_id(rec.get("file_unique_id"))
-        if rec.get("file_unique_id")
-        else None
-    )
-    _ops = (_rec or {}).get("ops") or {}
-    _thumb_entry = _ops.get("thumb")
-    _ocr_entry = _ops.get("ocr")
-    _thumb_handled = _thumb_entry is not None or _f_thumb is True
-    # ``has_text_layer`` no longer counts as "OCR handled": an already-
-    # searchable PDF still needs the OCR job — the worker now DELIVERS the
-    # searchable file back in one tap instead of messaging "nothing to add".
-    # Only a real cached delivery (a done ``ocr`` entry) skips the enqueue.
-    _ocr_handled = _ocr_entry is not None
-    if _thumb_handled and _ocr_handled:
-        # Both parts are already done: re-send one cached copy if available.
-        _resent = False
-        if _thumb_entry and _thumb_entry.get("status") == "done":
-            _resent = await asyncio.to_thread(
-                _resend_cached_result,
-                chat_id,
-                rec.get("file_unique_id"),
-                filename,
-                "thumb",
-                armer,
-                "\U0001f5bc\ufe0f Here is your file (cached result — "
-                "already processed).",
-            )
-        if not _resent and _ocr_entry and _ocr_entry.get("status") == "done":
-            _resent = await asyncio.to_thread(
-                _resend_cached_result,
-                chat_id,
-                rec.get("file_unique_id"),
-                filename,
-                "ocr",
-                armer,
-                "\U0001f50e Here is the cached OCR result (already "
-                "processed).",
-            )
-        _msg = (
-            "\u267b\ufe0f Already processed — re-sent the cached result, "
-            "no new job."
-            if _resent
-            else "\u2705 Already processed — nothing new to add."
-        )
-        try:
-            await query.answer(_msg)
-        except Exception:  # nosec B110
-            pass
-        await _replace_tapped_text(query, _msg, InlineKeyboardMarkup([]))
-        return
-    _want_thumb = not _thumb_handled
-    _want_ocr = not _ocr_handled
-    # Cached text-layer check: an already-searchable PDF's OCR "output" is
-    # the file itself (the worker delivers it back, no engine needed).
-    _already_searchable = (
-        filename.lower().endswith(".pdf")
-        and _fchecks is not None
-        and _fchecks.get("has_text_layer") is True
-    )
-    # OCR target: honor the user's pinned default; else, when the cached
-    # text-layer check already proves the PDF is searchable, enqueue
-    # target="pdf" — the worker delivers the already-searchable file back in
-    # one tap (no OCR engine needed), so the engine check is skipped; else
-    # searchable PDF when the engine is available, else plain text.
-    _target = (get_user_setting(armer, "ocr_target", "") or "").lower()
-    if _target not in ("pdf", "txt"):
-        _target = (
-            "pdf"
-            if (_already_searchable or ocr_pdf_available())
-            else "txt"
-        )
-    # Warm the durable fuid->content_hash index from the worker's pdfcheck
-    # binding so the SURFACE fast-path stays alive even before the worker
-    # runs (heals transient pfuid write failures).
-    _warm_fuid_binding(rec.get("file_unique_id"))
-    # OCR & Thumbnail combo: when BOTH parts are still pending, ONE job
-    # downloads the file once (shared Bot-API + userbot pipe chain) and runs
-    # both steps — Step 1: OCR, then Step 2: Thumbnail from the SAME download
-    # (no double userbot pull, no second relay forward).  When only one part
-    # is pending, queue that part's standalone job instead.
-    ok_thumb = None
-    ok_ocr = None
-    if _want_thumb and _want_ocr:
-        ok_ocr = await asyncio.to_thread(
-            enqueue_job,
-            "ocr_job",
-            chat_id,
-            rec.get("file_id"),
-            filename,
-            armer,
-            rec.get("file_unique_id"),
-            rec.get("message_id"),
-            None,  # forward_info is not stored in the pending record
-            rec.get("file_size"),
-            owner_user_id=armer,
-            source_chat_id=rec.get("source_chat_id"),
-            target=_target,
-            also_thumb=True,
-            job_timeout=7200,
-        )
-    elif _want_thumb:
-        ok_thumb = await asyncio.to_thread(
-            enqueue_job,
-            "process_document_job",
-            chat_id,
-            rec.get("file_id"),
-            filename,
-            rec.get("mime", ""),
-            rec.get("file_unique_id"),
-            rec.get("message_id"),
-            rec.get("forward_info"),
-            rec.get("file_size"),
-            armer,
-            owner_user_id=armer,
-            job_timeout=1800,
-        )
-    elif _want_ocr:
-        ok_ocr = await asyncio.to_thread(
-            enqueue_job,
-            "ocr_job",
-            chat_id,
-            rec.get("file_id"),
-            filename,
-            armer,
-            rec.get("file_unique_id"),
-            rec.get("message_id"),
-            None,  # forward_info is not stored in the pending record
-            rec.get("file_size"),
-            owner_user_id=armer,
-            source_chat_id=rec.get("source_chat_id"),
-            target=_target,
-            job_timeout=7200,
-        )
-    if ok_thumb or ok_ocr:
-        _queued_parts = []
-        _kb_rows: list[list[InlineKeyboardButton]] = []
-        if ok_thumb:
-            _queued_parts.append(f"🖼 Thumbnail — `{ok_thumb}`")
-            _kb_t = _queued_cancel_kb(armer, ok_thumb)
-            if _kb_t:
-                _kb_rows.extend(_kb_t.inline_keyboard)
-        if ok_ocr and _want_thumb and _want_ocr:
-            # Combined job: both steps run inside one download.
-            _queued_parts.append(
-                f"\U0001f50e\U0001f5bc\ufe0f Step 1: OCR — Step 2: "
-                f"Thumbnail (one download) — `{ok_ocr}`"
-            )
-            _kb_o = _queued_cancel_kb(armer, ok_ocr)
-            if _kb_o:
-                _kb_rows.extend(_kb_o.inline_keyboard)
-        elif ok_ocr:
-            _queued_parts.append(f"🔎 OCR — `{ok_ocr}`")
-            _kb_o = _queued_cancel_kb(armer, ok_ocr)
-            if _kb_o:
-                _kb_rows.extend(_kb_o.inline_keyboard)
-        _skipped_parts = []
-        if not _want_thumb:
-            _skipped_parts.append("\U0001f5bc\ufe0f thumbnail already done")
-        if not _want_ocr:
-            _skipped_parts.append("\U0001f50e OCR already done")
-        _failed_part = (ok_thumb is None and _want_thumb) or (
-            ok_ocr is None and _want_ocr
-        )
-        _msg = (
-            f"\U0001f50e\U0001f5bc\ufe0f Building thumbnail + OCR for "
-            f"`{safe_code_span(filename)}`...\n"
-            + "\n".join(_queued_parts)
-            + (
-                f"\n_skipping: {', '.join(_skipped_parts)}._"
-                if _skipped_parts
-                else ""
-            )
-            + (
-                "\n\u26a0\ufe0f One of the jobs failed to queue — try again."
-                if _failed_part
-                else ""
-            )
-        )
-        try:
-            await query.answer(
-                "\U0001f50e\U0001f5bc\ufe0f Thumbnail + OCR queued"
-            )
-        except Exception:  # nosec B110
-            pass
-        # Explicit empty keyboard (not None) when no cancel rows exist so the
-        # tapped menu's buttons are fully removed either way (PTB omits the
-        # reply_markup field for None, leaving the old row stuck).
-        _qid = await _replace_tapped_text(
-            query,
-            _msg,
-            InlineKeyboardMarkup(_kb_rows) if _kb_rows else InlineKeyboardMarkup([]),
-        )
-        # Store the confirmation under the LONGER-running job (OCR) so it is
-        # not deleted when the thumbnail finishes first; the second job's
-        # _delete_queued_messages is then a no-op on the missing record.
-        if ok_ocr:
-            _store_queued_message(ok_ocr, chat_id, _qid)
-        elif ok_thumb:
-            _store_queued_message(ok_thumb, chat_id, _qid)
-    else:
-        try:
-            await query.answer(
-                "\u274c Couldn't queue the jobs. Try again in a moment.",
-                show_alert=True,
-            )
-        except Exception:  # nosec B110
-            pass
-
-
 async def _replace_tapped_text(
     query, text: str, reply_markup
 ) -> int | None:
@@ -6066,9 +5795,9 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/ocr [pdf|txt|picker] — set your per-user OCR output default.
 
     With no argument, shows the current default plus one-tap buttons.  With an
-    argument, pins the output so the 🔎 OCR button skips the picker and runs
-    directly (Searchable PDF for ``pdf``, plain text for ``txt``, always ask
-    for ``picker``).
+    argument, pins the output so the 🔎🖼 OCR & Thumbnail button skips the
+    picker and runs directly (Searchable PDF for ``pdf``, plain text for
+    ``txt``, always ask for ``picker``).
     """
     await _track_user_session(update, "/ocr")
     uid = getattr(update.effective_user, "id", None)
@@ -6103,8 +5832,9 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _label = _OCR_TARGET_LABELS.get(_val, _OCR_TARGET_LABELS[""])
         try:
             await update.effective_message.reply_text(
-                f"\u2705 OCR default set to **{_label}** \u2014 the \U0001f50e OCR "
-                "button will now run it directly (no picker).\n"
+                f"\u2705 OCR default set to **{_label}** \u2014 the "
+                "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail button will now "
+                "run it directly (no picker).\n"
                 "Change it any time with /ocr or the buttons below.",
                 reply_markup=_ocr_settings_kb(uid),
                 parse_mode="Markdown",
@@ -6119,8 +5849,9 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             f"\U0001f50e **OCR output default**\n\n"
             f"Current: **{_cur_label}**\n\n"
-            "Tap a button to pin it (the \U0001f50e OCR button then skips the "
-            "picker), or use `/ocr pdf`, `/ocr txt`, `/ocr picker`.",
+            "Tap a button to pin it (the \U0001f50e\U0001f5bc\ufe0f OCR & "
+            "Thumbnail button then skips the picker), or use `/ocr pdf`, "
+            "`/ocr txt`, `/ocr picker`.",
             reply_markup=_ocr_settings_kb(uid),
             parse_mode="Markdown",
         )
@@ -6180,8 +5911,9 @@ async def handle_ocr_set_callback(
     _label = _OCR_TARGET_LABELS.get(_val, _OCR_TARGET_LABELS[""])
     try:
         await query.edit_message_text(
-            f"\u2705 OCR default set to **{_label}** \u2014 the \U0001f50e OCR "
-            "button will now run it directly (no picker).",
+            f"\u2705 OCR default set to **{_label}** \u2014 the "
+            "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail button will now "
+            "run it directly (no picker).",
             reply_markup=_ocr_settings_kb(armer),
             parse_mode="Markdown",
         )
@@ -6192,7 +5924,7 @@ async def handle_ocr_set_callback(
 async def handle_ocr_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """🔎 OCR button on a delivered result: ``ocr:<uid>:<token>``.
+    """🔎🖼 OCR & Thumbnail button on a delivered result: ``ocr:<uid>:<token>``.
 
     Verifies ownership, PEEKS the pending record (``bookocr:<token>``), and
     reveals the output picker (📄 Searchable PDF / 📝 Plain text).  The record
@@ -6294,7 +6026,8 @@ async def handle_ocr_callback(
     # user the reveal didn't stick.
     _revealed = await _replace_tapped_text(
         query,
-        f"\U0001f50e OCR `{safe_code_span(filename)}` as:",
+        f"\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail "
+        f"`{safe_code_span(filename)}` as:",
         _ocr_pick_kb(armer, token),
     )
     if _revealed is None:
@@ -6411,7 +6144,7 @@ async def _enqueue_ocr_job(
     )
     if ok:
         try:
-            await query.answer("\U0001f50e OCR queued")
+            await query.answer("\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail queued")
         except Exception:  # nosec B110
             pass
         _label = (
@@ -6424,7 +6157,7 @@ async def _enqueue_ocr_job(
         # inside the helper to clear-button + new text message.
         _qid = await _replace_tapped_text(
             query,
-            f"\U0001f50e OCR started — {_label} on "
+            f"\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail started — {_label} on "
             f"`{safe_code_span(filename)}`...\n"
             f"Job ID: `{ok}` — use /canceljob {ok} to cancel it.",
             _queued_cancel_kb(uid, ok),
@@ -6609,12 +6342,6 @@ application.add_handler(
     CallbackQueryHandler(
         handle_ctx_thumb_callback,
         pattern=r"^ctxthumb:\d+:\S+$",
-    )
-)
-application.add_handler(
-    CallbackQueryHandler(
-        handle_ctx_thumb_ocr_callback,
-        pattern=r"^ctxthumbocr:\d+:\S+$",
     )
 )
 application.add_handler(

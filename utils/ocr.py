@@ -27,7 +27,8 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Formats the 🔎 OCR button is offered for: scanned PDFs + raster images.
+# Formats the 🔎🖼 OCR & Thumbnail button is offered for: scanned PDFs +
+# raster images.
 OCR_SOURCE_EXTS: set[str] = {"pdf", "jpg", "jpeg", "png", "webp"}
 
 
@@ -52,7 +53,7 @@ def ocr_available() -> bool:
 
 
 def ocr_enabled() -> bool:
-    """True when the 🔎 OCR feature is both installed AND enabled.
+    """True when the 🔎🖼 OCR & Thumbnail feature is both installed AND enabled.
 
     Combines the ``ENABLE_OCR`` config master switch with the binary check, so
     the button disappears entirely when the operator flips the switch off —

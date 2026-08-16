@@ -195,7 +195,8 @@ EPUB_EMPTY_MERGE_FALLBACK_SECONDS: int = int(
 )
 
 # ── OCR (Tesseract) ─────────────────────────────────────────────────────────
-# Master switch for the 🔎 OCR button (scanned PDFs + raster images).
+# Master switch for the 🔎🖼 OCR & Thumbnail button (scanned PDFs +
+# raster images).
 ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in (
     "1",
     "true",

@@ -317,7 +317,7 @@ def _attach_send_buttons(
                 )
             )
         if ocr_user_id and is_ocr_source(filename) and ocr_enabled():
-            # 🔎 OCR on delivered PDFs/images (scanned text).
+            # 🔎🖼 OCR & Thumbnail on delivered PDFs/images (scanned text).
             _actions.append((OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2]))
         if _actions:
             _attach_pending_buttons(
@@ -627,11 +627,11 @@ COMPRESS_PDF_ACTION: tuple[str, str, str, str] = (
 )
 OCR_ACTION: tuple[str, str, str, str] = (
     "bookocr",
-    "\U0001f50e OCR",
+    "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
     "ocr",
     "\U0001f50e Your file was delivered via the userbot. "
-    "Tap **OCR** to make it a searchable PDF (selectable text) "
-    "or extract plain text.",
+    "Tap **OCR & Thumbnail** to make it a searchable PDF (selectable "
+    "text), extract plain text, or get a cover preview.",
 )
 
 

@@ -535,8 +535,8 @@ def _maybe_attach_result_prompt(
     The bot cannot edit the userbot's delivered message, so oversized results
     delivered through the userbot get a bot-API prompt pointing at the
     delivered copy (mirrors the book/convert fallback).  PDFs get
-    [🗜 Compress PDF] + [🔎 OCR]; raster images get [🔎 OCR]; everything else
-    is skipped.  Best-effort.
+    [🗜 Compress PDF] + [🔎🖼 OCR & Thumbnail]; raster images get
+    [🔎🖼 OCR & Thumbnail]; everything else is skipped.  Best-effort.
     """
     if not src_message:
         return
@@ -4836,155 +4836,6 @@ def _build_pdf_output_preview(
     return thumb_path
 
 
-def _combo_thumb_step(
-    *,
-    chat_id: int,
-    filename: str,
-    user_id: int | None,
-    src: str,
-    file_unique_id: str | None,
-    content_hash: str | None,
-    file_size: int | None,
-    tmpdir: str,
-    preview_already_sent: bool = False,
-) -> None:
-    """Step 2 of the OCR & Thumbnail combo: cover preview from the SAME download.
-
-    The OCR step already pulled ``src``, so the thumbnail is built from it —
-    the combo never downloads twice (no double userbot pull / relay forward).
-
-    Skips (with a short note) when:
-    - ``preview_already_sent`` — the OCR step just delivered a file with a
-      usable cover preview (a pdf-target searchable PDF, or the
-      already-searchable deliver-back), so re-sending the original with a
-      thumb would duplicate bytes the user already has; or
-    - the PDF carries an embedded page-1 thumbnail — the file already ships a
-      cover preview, recorded (pdfcheck ``has_thumb`` + a ``skipped`` thumb op)
-      so repeat taps short-circuit at enqueue without re-downloading.
-
-    Otherwise renders a preview from ``src`` and delivers ``src`` with it,
-    caching the delivered thumb copy for re-send dedup and publishing the
-    ``has_thumb`` check (mirrors the standalone thumbnail job).  Best-effort:
-    never raises, never fails the parent OCR job.
-    """
-    if preview_already_sent:
-        try:
-            _tg_send_message(
-                None,
-                chat_id,
-                "\U0001f5bc\ufe0f Step 2/2: Thumbnail skipped — the cover "
-                "preview was already delivered with the OCR result.",
-            )
-        except Exception:  # nosec B110 - best-effort note
-            pass
-        return
-    _is_pdf_src = filename.lower().endswith(".pdf")
-    _step2_thumb = os.path.join(tmpdir, "step2_thumb.jpg")
-    if _is_pdf_src and extract_pdf_embedded_thumbnail(src, _step2_thumb):
-        # Already-thumbed PDF: it ships its own cover preview — step 2 is a
-        # no-op.  Record the skip so re-sends short-circuit at the surface
-        # instead of queueing a fresh job that re-downloads to discover it.
-        _store_pdf_checks(
-            file_unique_id, has_thumb=True, content_hash=content_hash
-        )
-        upsert_processed_record(
-            content_hash,
-            "thumb",
-            "skipped",
-            filename=filename,
-            file_size=file_size,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-        try:
-            _tg_send_message(
-                None,
-                chat_id,
-                "\u2705 This PDF already has a thumbnail — nothing to add.",
-            )
-        except Exception:  # nosec B110 - best-effort note
-            pass
-        return
-    _step2_msg = _tg_send_progress(
-        chat_id,
-        filename,
-        "thumbnailing",
-        detail="\U0001f5bc\ufe0f Step 2/2: Creating cover preview...",
-        file_size=file_size or 0,
-    )
-    try:
-        if _is_pdf_src:
-            create_thumbnail_from_pdf(src, _step2_thumb)
-        else:
-            create_thumbnail_from_image(src, _step2_thumb)
-    except Exception:  # nosec B110 - preview is best-effort
-        _step2_thumb = None
-    if not thumbnail_is_usable(_step2_thumb):
-        # Blank/unusable render is worse than none — drop it and the progress
-        # message without delivering a white placeholder.
-        try:
-            _tg_delete_message(chat_id, _step2_msg)
-        except Exception:  # nosec B110
-            pass
-        return
-    try:
-        _thumb_res = _deliver_converted_file(
-            chat_id,
-            src,
-            filename,
-            _step2_thumb,
-            "Here is your file with an auto-generated cover preview.",
-            user_id,
-            progress_msg_id=_step2_msg,
-        )
-    except Exception:
-        # Step 2 is best-effort: a failed delivery (both Bot API and userbot
-        # pipes down) must NEVER fail the already-completed OCR job or post a
-        # misleading "Error running OCR" message.  Drop the transient progress
-        # message and move on.
-        logger.warning(
-            "_combo_thumb_step: step-2 delivery failed for %s",
-            filename,
-            exc_info=True,
-        )
-        try:
-            _tg_delete_message(chat_id, _step2_msg)
-        except Exception:  # nosec B110
-            pass
-        return
-    # Cache the delivered thumbed copy (Bot API file_id, or the userbot copy's
-    # location for forward-based re-sends) and publish the has_thumb check so
-    # repeat taps short-circuit at the surface.
-    if _thumb_res and _thumb_res.get("ok"):
-        try:
-            _doc = (_thumb_res.get("result") or {}).get("document") or {}
-            upsert_processed_record(
-                content_hash,
-                "thumb",
-                "done",
-                filename=filename,
-                file_size=file_size,
-                file_id=_doc.get("file_id"),
-                thumb_file_id=(_doc.get("thumbnail") or {}).get("file_id"),
-                user_id=user_id,
-                chat_id=chat_id,
-            )
-        except Exception:  # nosec B110 - cache is best-effort
-            pass
-    elif _thumb_res and _thumb_res.get("delivery") == "userbot":
-        _cache_userbot_delivered_copy(
-            content_hash,
-            filename,
-            file_size,
-            "thumb",
-            _thumb_res.get("src_chat_id"),
-            _thumb_res.get("src_message_id"),
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-    _publish_thumb_ready(file_unique_id, _is_pdf_src, thumb_path=_step2_thumb)
-
-
 def ocr_job(
     chat_id: int,
     file_id: str,
@@ -4996,13 +4847,14 @@ def ocr_job(
     file_size: int | None = None,
     source_chat_id: int | str | None = None,
     target: str = "txt",
-    also_thumb: bool = False,
 ) -> dict:
     """RQ job: OCR a delivered PDF/image and send the result back.
 
-    Triggered by the 🔎 OCR button (then a format pick) on a delivered result.
-    Downloads via the shared Bot-API + userbot pipe chain (so any delivered
-    size works), then either:
+    Triggered by the 🔎🖼 OCR & Thumbnail button (then a format pick) on a
+    delivered result.  The OCR output always ships with a cover preview
+    thumbnail attached, so no separate combo job is needed.  Downloads via
+    the shared Bot-API + userbot pipe chain (so any delivered size works),
+    then either:
 
     - ``target="txt"`` (default): Tesseract via PyMuPDF/pytesseract → ``.txt``;
     - ``target="pdf"``: ocrmypdf sandwiches an INVISIBLE text layer over the
@@ -5010,19 +4862,7 @@ def ocr_job(
       input but has selectable/copyable text.
 
     ``source_chat_id`` overrides the download chat when the file was
-    userbot-delivered elsewhere.
-
-    ``also_thumb=True`` runs the OCR & Thumbnail combo: after OCR delivers, a
-    second "thumbnail" phase builds a cover preview from the SAME download
-    (never a second userbot/Bot-API pull) and delivers the original file with
-    it.  Compression-style single delivery: the thumbnail phase is a no-op
-    when the OCR result already shipped a usable cover preview (a pdf-target
-    searchable PDF carries one), when the PDF already carries an embedded
-    cover preview (recorded so repeat taps short-circuit at the surface), or
-    when the OCR step delivered the original with a preview (the
-    already-searchable deliver-back).  It only delivers a separate thumbed
-    copy when the OCR output had no preview (txt target) or the preview was
-    unusable/blank.  Returns a result dict.
+    userbot-delivered elsewhere.  Returns a result dict.
     """
     _rq_job_id = _attach_job_user_meta(user_id)
     logger.info(
@@ -5327,24 +5167,6 @@ def ocr_job(
                 )
             except Exception:  # nosec B110
                 pass
-            if also_thumb:
-                # The OCR step delivered the ORIGINAL file with a usable cover
-                # preview — the thumbnail is already delivered, so step 2 is a
-                # no-op (re-sending identical bytes adds nothing).  Only when
-                # the preview was actually shipped: _deliver_converted_file
-                # silently drops blank/unusable previews, and in that case
-                # step 2 must still run to deliver a real thumb.
-                _combo_thumb_step(
-                    chat_id=chat_id,
-                    filename=filename,
-                    user_id=user_id,
-                    src=_src,
-                    file_unique_id=file_unique_id,
-                    content_hash=_content_hash,
-                    file_size=file_size,
-                    tmpdir=tmpdir,
-                    preview_already_sent=thumbnail_is_usable(_thumb_path),
-                )
             _delete_queued_messages(_rq_job_id)
             return {"status": "already_ocr_delivered", "delivered": True}
 
@@ -5363,8 +5185,6 @@ def ocr_job(
                 else "\U0001f50e Extracting text with OCR..."
             )
         )
-        if also_thumb:
-            _ocr_detail = f"\U0001f4af Step 1/2: {_ocr_detail}"
         _progress_msg_id = _tg_send_progress(
             chat_id, filename, "ocr",
             detail=_ocr_detail,
@@ -5406,20 +5226,7 @@ def ocr_job(
                     # Keep the failed progress message visible (it's the only
                     # OCR feedback the user gets) — mirroring the txt path
                     # below; only the transient "Queued..." confirmation is
-                    # dropped.  In the OCR & Thumbnail combo the thumbnail
-                    # step still runs: the thumb was part of the promise and
-                    # a failed OCR pass must not lose it.
-                    if also_thumb:
-                        _combo_thumb_step(
-                            chat_id=chat_id,
-                            filename=filename,
-                            user_id=user_id,
-                            src=_src,
-                            file_unique_id=file_unique_id,
-                            content_hash=_content_hash,
-                            file_size=file_size,
-                            tmpdir=tmpdir,
-                        )
+                    # dropped.
                     _delete_queued_messages(_rq_job_id)
                     return {"error": "ocr_failed"}
                 text = _pdf_text or ""
@@ -5485,21 +5292,7 @@ def ocr_job(
                     message_id=_progress_msg_id,
                 )
                 # Keep the failed progress message visible — it's the only
-                # feedback the user gets (same as convert_book_job).  In the
-                # OCR & Thumbnail combo the thumbnail step still runs: a
-                # failed OCR pass must not lose the thumbnail the tap also
-                # promised.
-                if also_thumb:
-                    _combo_thumb_step(
-                        chat_id=chat_id,
-                        filename=filename,
-                        user_id=user_id,
-                        src=_src,
-                        file_unique_id=file_unique_id,
-                        content_hash=_content_hash,
-                        file_size=file_size,
-                        tmpdir=tmpdir,
-                    )
+                # feedback the user gets (same as convert_book_job).
                 _delete_queued_messages(_rq_job_id)
                 return {"error": "no_text_found"}
             with open(_out, "w", encoding="utf-8") as _fh:
@@ -5548,27 +5341,6 @@ def ocr_job(
                 user_id=user_id,
                 chat_id=chat_id,
                 target=target,
-            )
-        if also_thumb:
-            # Step 2: cover preview from the SAME download — the combo never
-            # pulls the file twice.  Compression-style: when the OCR result
-            # already shipped a usable cover preview (a pdf-target searchable
-            # PDF carries one), step 2 is a no-op — re-sending the original
-            # would duplicate bytes the user already has.  It only delivers a
-            # separate thumbed copy when the OCR output had NO preview (txt
-            # target) or the preview was unusable/blank.  Skipped-with-note
-            # also when the PDF already ships an embedded thumbnail (recorded
-            # for surface short-circuits).
-            _combo_thumb_step(
-                chat_id=chat_id,
-                filename=filename,
-                user_id=user_id,
-                src=_src,
-                file_unique_id=file_unique_id,
-                content_hash=_content_hash,
-                file_size=file_size,
-                tmpdir=tmpdir,
-                preview_already_sent=thumbnail_is_usable(_thumb_path),
             )
         out_meta = {
             "status": "done",

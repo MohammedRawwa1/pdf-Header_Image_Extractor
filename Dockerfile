@@ -34,7 +34,8 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Install Tesseract OCR (tesseract binary + English language pack) for the
-# 🔎 OCR feature.  The binary is an OS package (not a Python dependency); the
+# 🔎🖼 OCR & Thumbnail feature.  The binary is an OS package (not a Python
+# dependency); the
 # Python wrapper (pytesseract) ships in requirements.txt.  Build arg lets
 # deployments skip it (e.g. space-constrained builds).
 ARG INSTALL_OCR="1"

@@ -60,8 +60,8 @@ def content_sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
 
 # ── PDF validator-result cache ─────────────────────────────────────
 # Keyed by Telegram's ``file_unique_id`` (an immutable property of the
-# file's content), NOT the RQ job id, so the two jobs enqueued by the
-# OCR & Thumbnail button can share results even though each writes its own
+# file's content), NOT the RQ job id, so the thumbnail and OCR jobs for a
+# given file can share results even though each writes its own
 # ``io:in:<job_id>`` key.  Safe to reuse because the embedded-thumbnail /
 # text-layer status of a given file never changes.  Stored as a Redis HASH
 # (``pdfcheck:<file_unique_id>`` with ``has_thumb`` / ``has_text_layer`` /
