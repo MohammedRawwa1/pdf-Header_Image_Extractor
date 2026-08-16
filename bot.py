@@ -2630,8 +2630,9 @@ def _ctx_menu_kb(
     rows: list[list[InlineKeyboardButton]] = []
     if kind == "pdf":
         # PDFs get a dedicated menu-interface: 🖼 Thumbnail, 🔎+🖼 OCR &
-        # Thumbnail (all-in-one — no standalone OCR), and 🗜+🖼 Compress &
-        # Thumbnail (compress_pdf_job already delivers a cover thumbnail).
+        # Thumbnail (all-in-one — one download for both steps), 🔎 OCR (OCR
+        # only, both pipes), and 🗜+🖼 Compress & Thumbnail
+        # (compress_pdf_job already delivers a cover thumbnail).
         rows.append(
             [
                 InlineKeyboardButton(
@@ -2646,6 +2647,14 @@ def _ctx_menu_kb(
                     InlineKeyboardButton(
                         "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
                         callback_data=f"ctxthumbocr:{uid}:{token}",
+                    )
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f50e OCR",
+                        callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
             )
@@ -5205,9 +5214,12 @@ async def handle_ctx_thumb_ocr_callback(
     """🔎+🖼 OCR & Thumbnail button on the input context menu: ``ctxthumbocr:<uid>:<token>``.
 
     All-in-one for PDFs: consumes the pending record atomically
-    (``ctxfile:<token>``) and enqueues BOTH ``process_document_job`` (cover
-    thumbnail) and ``ocr_job`` (searchable PDF / plain text) in one tap — so
-    there is no standalone OCR button for PDFs.  Same-user bound.
+    (``ctxfile:<token>``) and enqueues a SINGLE ``ocr_job`` with
+    ``also_thumb=True`` when both parts are still pending — the file is
+    downloaded ONCE via the shared Bot-API + userbot pipe chain, then Step 1
+    runs OCR and Step 2 builds the cover thumbnail from the SAME download (no
+    double userbot pull, no second relay forward).  When only one part is
+    pending, that part's standalone job is queued instead.  Same-user bound.
     """
     query = update.callback_query
     if query is None:
@@ -5326,8 +5338,32 @@ async def handle_ctx_thumb_ocr_callback(
     # binding so the SURFACE fast-path stays alive even before the worker
     # runs (heals transient pfuid write failures).
     _warm_fuid_binding(rec.get("file_unique_id"))
+    # OCR & Thumbnail combo: when BOTH parts are still pending, ONE job
+    # downloads the file once (shared Bot-API + userbot pipe chain) and runs
+    # both steps — Step 1: OCR, then Step 2: Thumbnail from the SAME download
+    # (no double userbot pull, no second relay forward).  When only one part
+    # is pending, queue that part's standalone job instead.
     ok_thumb = None
-    if _want_thumb:
+    ok_ocr = None
+    if _want_thumb and _want_ocr:
+        ok_ocr = await asyncio.to_thread(
+            enqueue_job,
+            "ocr_job",
+            chat_id,
+            rec.get("file_id"),
+            filename,
+            armer,
+            rec.get("file_unique_id"),
+            rec.get("message_id"),
+            None,  # forward_info is not stored in the pending record
+            rec.get("file_size"),
+            owner_user_id=armer,
+            source_chat_id=rec.get("source_chat_id"),
+            target=_target,
+            also_thumb=True,
+            job_timeout=7200,
+        )
+    elif _want_thumb:
         ok_thumb = await asyncio.to_thread(
             enqueue_job,
             "process_document_job",
@@ -5343,26 +5379,7 @@ async def handle_ctx_thumb_ocr_callback(
             owner_user_id=armer,
             job_timeout=1800,
         )
-    # Double-delivery guard: when the thumbnail job actually queued AND the
-    # OCR target is the deliver-back (already-searchable PDF → target=pdf),
-    # the thumbnail job will deliver the file back with its cover — re-running
-    # ocr_job would re-send identical bytes.  Suppress it so the all-in-one
-    # tap yields exactly one delivery.  (target=txt still runs: it produces a
-    # different artifact, the extracted text.)  Only suppressed once the thumb
-    # enqueue succeeded — a failed thumb enqueue keeps the OCR deliver-back
-    # as the fallback, so the tap never ends with nothing queued.
-    _ocr_suppressed_dupe = False
-    if (
-        _want_thumb
-        and ok_thumb is not None
-        and _want_ocr
-        and _target == "pdf"
-        and _already_searchable
-    ):
-        _want_ocr = False
-        _ocr_suppressed_dupe = True
-    ok_ocr = None
-    if _want_ocr:
+    elif _want_ocr:
         ok_ocr = await asyncio.to_thread(
             enqueue_job,
             "ocr_job",
@@ -5387,7 +5404,16 @@ async def handle_ctx_thumb_ocr_callback(
             _kb_t = _queued_cancel_kb(armer, ok_thumb)
             if _kb_t:
                 _kb_rows.extend(_kb_t.inline_keyboard)
-        if ok_ocr:
+        if ok_ocr and _want_thumb and _want_ocr:
+            # Combined job: both steps run inside one download.
+            _queued_parts.append(
+                f"\U0001f50e\U0001f5bc\ufe0f Step 1: OCR — Step 2: "
+                f"Thumbnail (one download) — `{ok_ocr}`"
+            )
+            _kb_o = _queued_cancel_kb(armer, ok_ocr)
+            if _kb_o:
+                _kb_rows.extend(_kb_o.inline_keyboard)
+        elif ok_ocr:
             _queued_parts.append(f"🔎 OCR — `{ok_ocr}`")
             _kb_o = _queued_cancel_kb(armer, ok_ocr)
             if _kb_o:
@@ -5396,12 +5422,7 @@ async def handle_ctx_thumb_ocr_callback(
         if not _want_thumb:
             _skipped_parts.append("\U0001f5bc\ufe0f thumbnail already done")
         if not _want_ocr:
-            _skipped_parts.append(
-                "\U0001f50e OCR skipped — already searchable "
-                "(delivered with the thumbnail)"
-                if _ocr_suppressed_dupe
-                else "\U0001f50e OCR already done"
-            )
+            _skipped_parts.append("\U0001f50e OCR already done")
         _failed_part = (ok_thumb is None and _want_thumb) or (
             ok_ocr is None and _want_ocr
         )
