@@ -99,6 +99,21 @@ PDF_RECOMPRESS_MIN_BYTES: int = max(
 PDF_RECOMPRESS_JPEG_QUALITY: int = int(os.getenv("PDF_RECOMPRESS_JPEG_QUALITY", "70"))
 PDF_RECOMPRESS_MIN_GAIN_PCT: float = float(os.getenv("PDF_RECOMPRESS_MIN_GAIN_PCT", "5"))
 PDF_RECOMPRESS_MIN_GAIN_BYTES: int = int(os.getenv("PDF_RECOMPRESS_MIN_GAIN_BYTES", "100000"))
+# Post-render sanity scan (utils/weasyprint_converter.py): wall-clock cap on
+# inspecting the rendered PDF (seconds), and the overflow threshold (pt) beyond
+# which an image sticking out of the page box still routes the render to the
+# Calibre fallback. Smaller overflows are logged and accepted so a borderline
+# render ships instead of dying in the fallback.
+PDF_SANITY_CHECK_BUDGET_S: float = float(os.getenv("PDF_SANITY_CHECK_BUDGET_S", "15"))
+PDF_OVERFLOW_FATAL_PT: float = float(os.getenv("PDF_OVERFLOW_FATAL_PT", "30"))
+# Calibre fallback memory guard (utils/ebook_converter.py): ebook-convert is
+# memory-hungry, and spawning it while the worker still holds a WeasyPrint
+# render previously OOM-killed the worker (SIGKILL, no output delivered). The
+# guard refuses the spawn when current RSS + reserve would exceed the cgroup
+# memory limit. Set CALIBRE_FALLBACK_MAX_RSS_MB for an absolute cap; set both
+# to 0 to disable the guard entirely.
+CALIBRE_FALLBACK_MEM_RESERVE_MB: float = float(os.getenv("CALIBRE_FALLBACK_MEM_RESERVE_MB", "200"))
+CALIBRE_FALLBACK_MAX_RSS_MB: float = float(os.getenv("CALIBRE_FALLBACK_MAX_RSS_MB", "0"))
 
 ALLOWED_FORMATS_RAW: str = os.getenv("ALLOWED_FORMATS", "")
 ALLOWED_FORMATS: set[str] = {p.strip().lower().lstrip(".") for p in ALLOWED_FORMATS_RAW.split(",") if p.strip()}

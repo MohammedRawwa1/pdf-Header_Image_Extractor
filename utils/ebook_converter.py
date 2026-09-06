@@ -22,6 +22,74 @@ class DRMProtectedError(Exception):
     pass
 
 
+def _rss_mb() -> float:
+    """Resident set size of this process in MB (0.0 when unknown)."""
+    try:
+        with open("/proc/self/status", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _container_mem_limit_mb() -> float:
+    """cgroup memory limit in MB (0.0 when unlimited/unknown)."""
+    try:
+        with open("/sys/fs/cgroup/memory.max", encoding="utf-8", errors="replace") as f:  # cgroup v2
+            val = f.read().strip()
+        if val and val != "max":
+            return float(val) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", encoding="utf-8", errors="replace") as f:  # cgroup v1
+            val = f.read().strip()
+        if val:
+            return float(val) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _calibre_memory_guard_failed(input_path: str) -> bool:
+    """True when spawning ebook-convert would likely OOM-kill the worker.
+
+    ebook-convert is memory-hungry (loads the whole book); on a small
+    container, a work horse already holding a WeasyPrint render can push the
+    cgroup over its limit, and the kernel SIGKILLs the worker ("waitpid
+    returned 9") with no output ever delivered. This refuses the spawn -- the
+    job then fails with a clear error instead of dying -- when current RSS +
+    CALIBRE_FALLBACK_MEM_RESERVE_MB would exceed the container limit. Set
+    CALIBRE_FALLBACK_MAX_RSS_MB for an absolute cap, or both to 0 to disable.
+    """
+    try:
+        import config as _cfg
+        reserve_mb = float(getattr(_cfg, "CALIBRE_FALLBACK_MEM_RESERVE_MB", 0) or 0)
+        max_rss_mb = float(getattr(_cfg, "CALIBRE_FALLBACK_MAX_RSS_MB", 0) or 0)
+    except Exception:
+        return False
+    if max_rss_mb <= 0:
+        limit_mb = _container_mem_limit_mb()
+        if limit_mb <= 128.0 or reserve_mb <= 0.0:
+            return False  # unknown/unlimited limit, or guard disabled
+        max_rss_mb = limit_mb - reserve_mb
+    if max_rss_mb <= 0:
+        return False
+    rss_mb = _rss_mb()
+    if rss_mb <= 0.0:
+        return False  # cannot measure; do not block
+    if rss_mb >= max_rss_mb:
+        logger.warning(
+            "convert_ebook: skipping Calibre fallback for %s (RSS %.0fMB >= %.0fMB cap); "
+            "spawning ebook-convert would risk OOM-killing the worker",
+            os.path.basename(input_path), rss_mb, max_rss_mb,
+        )
+        return True
+    return False
+
+
 _DRM_DOCTYPE_RE = re.compile(rb"<!DOCTYPE(?:\s+[^>\[\]]*)?(?:\[[^\]]*\])?[^>]*>", re.IGNORECASE | re.DOTALL)
 _FONT_EXTS: tuple[str, ...] = (".ttf", ".otf", ".ttc", ".woff", ".woff2", ".eot", ".pfb", ".pfm", ".dfont")
 
@@ -211,6 +279,8 @@ def convert_ebook(input_path: str, output_path: str, timeout: int = 600, cancel_
     except Exception:
         pass
     cmd = [exe, input_path, output_path]
+    if _calibre_memory_guard_failed(input_path):
+        return False
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_calibre_env())

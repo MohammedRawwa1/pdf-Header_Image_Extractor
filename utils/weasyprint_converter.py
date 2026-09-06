@@ -1,5 +1,6 @@
 """Fast EPUB→PDF conversion via WeasyPrint with Calibre fallback."""
 
+import gc
 import html
 import logging
 import os
@@ -39,6 +40,14 @@ _MIN_PDF_TEXT_CHARS = 40
 _MIN_PAGE_DIM_PT = 150.0
 _MAX_PAGE_DIM_PT = 1400.0
 _PAGE_OVERFLOW_TOLERANCE_PT = 5.0
+# Wall-clock cap on the post-render PDF scan so inspecting a big book can
+# never eat minutes (PDF_SANITY_CHECK_BUDGET_S overrides).
+_SANITY_CHECK_BUDGET_S = 15.0
+# Overflow beyond the tolerance is logged and accepted; only overflow larger
+# than this (pt) still routes the render to the Calibre fallback
+# (PDF_OVERFLOW_FATAL_PT overrides). A slightly clipped page ships rather
+# than dying in the fallback.
+_PDF_OVERFLOW_FATAL_PT = 30.0
 
 _PX_PER_MM = 96.0 / 25.4
 _CSS_UNIT_PX = {
@@ -395,7 +404,9 @@ def _normalize_raster_image(
     if max_w <= 0:
         return
     existing = (elem.get("style") or "").strip()
-    inline = f"max-width:{max_w}px;min-width:0;height:auto;"
+    # !important so a book stylesheet rule like `img { width: 2000px
+    # !important }` cannot override the inline cap.
+    inline = f"max-width:{max_w}px !important;min-width:0;height:auto;"
     elem.set("style", f"{existing};{inline}" if existing else inline)
     new_ref = _downsample_image(zf, zip_path, image_dir, resolved_ref)
     if new_ref:
@@ -547,10 +558,14 @@ def _build_merged_html(
         )
     style_block = f"<style>{styles}</style>" if styles else ""
     page_css, _content_w = _render_page_config()
+    # !important on max-width beats book CSS like `img { width: 2000px
+    # !important }` that would otherwise defeat our inline caps and blow the
+    # page box (right-edge clipping). Ours is appended last, so for same-
+    # origin !important declarations the later rule wins.
     _wp_fix = (
         "<style>"
         f"{page_css}"
-        "img, image, svg { max-width: 100%; height: auto; } "
+        "img, image, svg { max-width: 100% !important; height: auto; } "
         "img, image { margin-left: 0 !important; margin-right: 0 !important; } "
         "body { margin: 0; padding: 0; } "
         "</style>"
@@ -634,9 +649,25 @@ def _render_weasyprint(
 def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
     """Return a reason string when the rendered PDF looks broken, else None.
 
-    Catches blank output, suspiciously large page dimensions, and text/images
-    spilling past the page box (right-edge clipping). Any hit routes the book
-    to the Calibre fallback."""
+    Routes to the Calibre fallback only for genuinely broken output: blank
+    renders, zero pages, absurd page dimensions, or images spilling well past
+    the page box. Small overflows (beyond the base tolerance but within
+    PDF_OVERFLOW_FATAL_PT) are logged and accepted -- a slightly clipped page
+    ships, because routing it to Calibre previously OOM-killed the worker. The
+    scan is wall-clock budgeted (PDF_SANITY_CHECK_BUDGET_S) so inspecting a big
+    book can never eat minutes, and uses a single get_image_info() pass per
+    page instead of per-image get_image_rects() re-walks.
+    """
+    import config as _cfg
+    try:
+        budget_s = float(getattr(_cfg, "PDF_SANITY_CHECK_BUDGET_S", 0) or 0)
+        fatal_pt = float(getattr(_cfg, "PDF_OVERFLOW_FATAL_PT", 0) or 0)
+    except Exception:
+        budget_s, fatal_pt = 0.0, 0.0
+    if budget_s <= 0:
+        budget_s = _SANITY_CHECK_BUDGET_S
+    if fatal_pt <= 0:
+        fatal_pt = _PDF_OVERFLOW_FATAL_PT
     try:
         size = os.path.getsize(pdf_path)
         if size == 0:
@@ -648,7 +679,14 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
                 return "PDF has zero pages"
             total_text = 0
             total_images = 0
+            start = time.monotonic()
             for page in doc:
+                if time.monotonic() - start > budget_s:
+                    logger.warning(
+                        "weasyprint: sanity scan of %s exceeded %ss budget; accepting render",
+                        os.path.basename(pdf_path), budget_s,
+                    )
+                    return None
                 pr = page.rect
                 if (
                     pr.width < _MIN_PAGE_DIM_PT
@@ -660,31 +698,28 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
                         f"page size {pr.width:.0f}x{pr.height:.0f}pt outside "
                         f"{_MIN_PAGE_DIM_PT:.0f}-{_MAX_PAGE_DIM_PT:.0f}pt"
                     )
-                text_dict = page.get_text("dict")
-                for block in text_dict.get("blocks", []):
-                    bbox = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
-                    if (
-                        bbox.x0 < -_PAGE_OVERFLOW_TOLERANCE_PT
-                        or bbox.y0 < -_PAGE_OVERFLOW_TOLERANCE_PT
-                        or bbox.x1 > pr.x1 + _PAGE_OVERFLOW_TOLERANCE_PT
-                        or bbox.y1 > pr.y1 + _PAGE_OVERFLOW_TOLERANCE_PT
-                    ):
-                        return f"text overflows the page box on page {page.number + 1}"
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            total_text += sum(
-                                1 for ch in span.get("text", "") if ch != "\ufffd"
-                            )
-                for img in page.get_images(full=True):
+                total_text += sum(1 for ch in page.get_text() if ch != "\ufffd")
+                for info in page.get_image_info(xrefs=True):
                     total_images += 1
-                    for rect in page.get_image_rects(img[0]):
-                        if (
-                            rect.x0 < -_PAGE_OVERFLOW_TOLERANCE_PT
-                            or rect.y0 < -_PAGE_OVERFLOW_TOLERANCE_PT
-                            or rect.x1 > pr.x1 + _PAGE_OVERFLOW_TOLERANCE_PT
-                            or rect.y1 > pr.y1 + _PAGE_OVERFLOW_TOLERANCE_PT
-                        ):
-                            return f"image overflows the page box on page {page.number + 1}"
+                    bbox = fitz.Rect(info.get("bbox", (0, 0, 0, 0)))
+                    overflow = max(
+                        0.0,
+                        bbox.x1 - pr.x1,
+                        -bbox.x0,
+                        bbox.y1 - pr.y1,
+                        -bbox.y0,
+                    )
+                    if overflow > _PAGE_OVERFLOW_TOLERANCE_PT + fatal_pt:
+                        return (
+                            f"image overflows the page box by {overflow:.0f}pt "
+                            f"on page {page.number + 1}"
+                        )
+                    if overflow > _PAGE_OVERFLOW_TOLERANCE_PT:
+                        logger.warning(
+                            "weasyprint: image on page %d of %s sticks out %.1fpt "
+                            "past the page box (accepted; fatal threshold %.0fpt)",
+                            page.number + 1, os.path.basename(pdf_path), overflow, fatal_pt,
+                        )
             if size <= _MIN_PDF_BYTES and total_text < _MIN_PDF_TEXT_CHARS and total_images == 0:
                 return f"blank render ({size} bytes, no text or images)"
             return None
@@ -846,6 +881,10 @@ def _calibre_fallback_shrunk(
     timeout: int,
     cancel_check: Callable[[], bool] | None,
 ) -> bool:
+    # Free the WeasyPrint render (a 200+-page layout tree can be hundreds of
+    # MB) before ebook-convert starts; running both in the same container is
+    # what previously OOM-killed the worker.
+    gc.collect()
     if not _calibre_fallback(input_path, pdf_path, thumb_path, timeout, cancel_check):
         return False
     _shrink_oversized_pdf(pdf_path)
