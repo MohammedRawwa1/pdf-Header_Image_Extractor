@@ -34,37 +34,37 @@ logger = logging.getLogger(__name__)
 
 
 def _sanitize_outbound(text: str | None) -> str | None:
-    """Sanitize-on-send wrapper for every outbound text field.
-
-    Third-party content (filenames, captions, error/detail strings) can
-    contain corrupted surrogate escapes or control characters that crash the
-    Bot API send layer with ``UnicodeEncodeError: surrogates not allowed``
-    or a 400 ``Bad Request``.  All outbound ``text`` / ``caption`` / multipart
-    ``filename`` values flow through this helper (see the call sites below)
-    so no third-party text can take down a send.  ``None`` passes through.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if text is None:
         return None
     return sanitize_text(text)
 
-# Shared HTTP session for Bot API calls.  urllib3's connection pools are
-# thread-safe, so a single session is reused across the web process's streaming
-# uploads (each runs in its own worker thread via asyncio.to_thread) and the
-# RQ/pipeline workers — avoiding a fresh TCP + TLS handshake per request.
-# No per-request session state is mutated (headers/cookies stay untouched), so
-# concurrent ``post()`` calls through the pool are safe.
+                                                                        
+                                                                               
+                                                                            
+                                                                         
+                                                                              
+                                                        
 _SESSION = requests.Session()
 atexit.register(_SESSION.close)
 
 
 def _get_bot_token(bot_token: str | None = None) -> str | None:
-    """Return ``bot_token`` if provided, else the configured ``config.BOT_TOKEN``.
-
-    The Bot API helpers accept an explicit token (e.g. from a caller that
-    resolved its own) and otherwise fall back to the shared
-    ``config.BOT_TOKEN``.  ``config`` is imported lazily so this module stays
-    importable without forcing a config load at import time.
-    """
+\
+\
+\
+\
+\
+\
+       
     if bot_token:
         return bot_token
     try:
@@ -76,12 +76,12 @@ def _get_bot_token(bot_token: str | None = None) -> str | None:
 
 
 class _BinaryFile(Protocol):
-    """Minimal binary file-object interface consumed by the raw HTTP helpers.
-
-    Satisfied by ``open(...)`` handles and ``io.BytesIO``-style streams; the
-    ``_ProgressFileReader`` wrapper satisfies it too via its ``__getattr__``
-    delegation.
-    """
+\
+\
+\
+\
+\
+       
 
     def read(self, size: int = -1) -> bytes: ...
 
@@ -93,23 +93,23 @@ class _BinaryFile(Protocol):
 
 
 class _ProgressCallback(Protocol):
-    """``(current_bytes, total_bytes)`` upload/download progress callback.
-
-    Used for both uploads (``_ProgressFileReader``, ``_tg_send_document``) and
-    downloads (``_tg_download_to_file``); implementations may also accept
-    extra trailing args (Telethon-style callbacks).
-    """
+\
+\
+\
+\
+\
+       
 
     def __call__(self, current: int, total: int) -> None: ...
 
 
 class _ProgressFileReader:
-    """Wrap a binary file object so a multipart upload reports live progress.
-
-    urllib3 reads the payload via ``read()``; we count the bytes and invoke a
-    (throttled) ``callback(current, total)``.    ``seek(0)`` — used by the retry
-    loop before re-sending — resets the counter so a retry reports from 0 again.
-    """
+\
+\
+\
+\
+\
+       
 
     def __init__(
         self, fh: _BinaryFile, total: int, callback: _ProgressCallback, throttle: float = 0.7
@@ -151,7 +151,7 @@ class _ProgressFileReader:
             self._last_t = now
             try:
                 self._callback(self._read, self._total)
-            except Exception:  # nosec B110 - progress is best-effort
+            except Exception:                                        
                 pass
 
 
@@ -168,21 +168,21 @@ def _tg_send_document(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> dict:
-    """Send a document via the Bot API ``sendDocument`` endpoint.
-
-    Streams the multipart body straight from the open file objects (wrapping
-    the document in ``_ProgressFileReader`` to report live progress via
-    ``progress_callback(current, total)``) and retries transient 429/5xx
-    responses with backoff.
-
-    Returns:
-        The Bot API response dict (``{"ok": true, "result": {...}}``).
-        Raises after 3 attempts on persistent 429/5xx, connection or timeout
-        errors.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     if progress_callback is not None:
-        # Wrap the file so the multipart upload reports LIVE send progress.
+                                                                           
         try:
             _doc_total = os.fstat(doc_fileobj.fileno()).st_size
         except Exception:
@@ -191,11 +191,11 @@ def _tg_send_document(
             doc_fileobj, _doc_total, progress_callback
         )
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    # Sanitize-on-send: the multipart filename and caption may carry
-    # third-party text (user filenames) — a corrupted surrogate would crash
-    # the send-layer encoding.  If sanitization strips a pathological
-    # filename to nothing, fall back to a safe placeholder instead of the
-    # raw (crash-causing) original.
+                                                                    
+                                                                           
+                                                                     
+                                                                         
+                                   
     filename = _sanitize_outbound(filename) or "file"
     caption = _sanitize_outbound(caption)
     files: dict[str, Any] = {"document": (filename, doc_fileobj)}
@@ -204,20 +204,20 @@ def _tg_send_document(
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-    # Retry on transient 429/5xx (Telegram flood control) with backoff — the
-    # worker shares the bot token with the web process, so sends must tolerate
-    # global-rate-limit responses instead of failing the job.
+                                                                            
+                                                                              
+                                                             
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            # Rewind file streams so a retry re-sends the FULL payload
-            # (requests consumes the file object; without seek(0) a retry
-            # would upload a truncated file).
+                                                                      
+                                                                         
+                                             
             try:
                 doc_fileobj.seek(0)
                 if thumb_fileobj is not None:
                     thumb_fileobj.seek(0)
-            except Exception:  # nosec B110 - non-seekable streams
+            except Exception:                                     
                 pass
             r = _SESSION.post(url, data=data, files=files, timeout=120)
             if r.status_code in (429,) or r.status_code >= 500:
@@ -230,13 +230,13 @@ def _tg_send_document(
                     attempt + 1,
                     filename,
                 )
-                # The error body is never read, so close the response so the
-                # connection is released promptly instead of being held until
-                # GC (urllib3 discards a partially-read connection, which is
-                # fine — the retry opens a fresh one from the pool).
+                                                                            
+                                                                             
+                                                                            
+                                                                    
                 try:
                     r.close()
-                except Exception:  # nosec B110 - best-effort cleanup
+                except Exception:                                    
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -244,9 +244,9 @@ def _tg_send_document(
                 raise last_exc
             r.raise_for_status()
             _res = r.json()
-            # Attach the Compress-PDF button to delivered PDF results (one
-            # tap -> compress_pdf_job).  Uses the DELIVERED file_id so the
-            # user compresses exactly what they received.
+                                                                          
+                                                                          
+                                                         
             if _res and _res.get("ok"):
                 _attach_send_buttons(
                     chat_id,
@@ -284,19 +284,19 @@ def _attach_send_buttons(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> None:
-    """Attach one-tap follow-up buttons to a delivered document (best-effort).
-
-    Shared by the upload path (``_tg_send_document``) and the cached re-send
-    path (``_tg_send_document_by_id``) so both land the same Compress /
-    Convert / OCR buttons on the delivered copy.  ``res`` is the sendDocument
-    response dict.  Uses the DELIVERED file_id so one-tap actions operate on
-    exactly what the user received.
-
-    ``done_ops`` names the operations (``compress`` / ``convert`` / ``ocr``)
-    this delivery ALREADY performed — the matching follow-up button is
-    suppressed so a result never offers the job it just did (an OCR'd PDF
-    gets 🗜 Compress but not another 🔎🖼 OCR, a compressed PDF the reverse).
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if not res or not res.get("ok"):
         return
     try:
@@ -310,9 +310,9 @@ def _attach_send_buttons(
             and filename.lower().endswith(".pdf")
             and "compress" not in done_ops
         ):
-            # 🗜 Compress on delivered PDFs (thumb/convert results — one tap
-            # -> compress_pdf_job).  Skipped when this delivery just ran the
-            # compression job itself.
+                                                                           
+                                                                            
+                                     
             _actions.append(
                 (
                     COMPRESS_PDF_ACTION[0],
@@ -326,8 +326,8 @@ def _attach_send_buttons(
             and not filename.lower().endswith(".pdf")
             and "convert" not in done_ops
         ):
-            # 🔁 Convert on delivered e-books (its own interface — never
-            # mixed with the thumbnail flow).
+                                                                       
+                                             
             _actions.append(
                 (
                     BOOK_CONVERT_ACTION[0],
@@ -341,8 +341,8 @@ def _attach_send_buttons(
             and ocr_enabled()
             and "ocr" not in done_ops
         ):
-            # 🔎🖼 OCR & Thumbnail on delivered PDFs/images (scanned text) —
-            # skipped when this delivery just ran the OCR job itself.
+                                                                          
+                                                                     
             _actions.append((OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2]))
         if _actions:
             _attach_pending_buttons(
@@ -355,7 +355,7 @@ def _attach_send_buttons(
                 _doc.get("file_size"),
                 tuple(_actions),
             )
-    except Exception:  # nosec B110 - best-effort button
+    except Exception:                                   
         pass
 
 
@@ -370,18 +370,18 @@ def _tg_send_document_by_id(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> dict:
-    """Re-send a previously delivered document by its cached Bot API file_id.
-
-    Zero upload: Telegram restores the file (and its stored thumbnail) from
-    the file_id, so a cached result can be re-delivered WITHOUT re-processing
-    — even after the user deleted the bot's earlier messages.  Returns the
-    Bot API response dict; raises after 3 attempts on persistent errors.
-    """
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    # Sanitize-on-send: the caption and filename may carry third-party text
-    # (user filenames) — see _tg_send_document.  Same safe fallback: never
-    # restore the raw filename if sanitization empties it.
+                                                                           
+                                                                          
+                                                          
     filename = _sanitize_outbound(filename) or "file"
     caption = _sanitize_outbound(caption)
     data: dict[str, Any] = {
@@ -405,7 +405,7 @@ def _tg_send_document_by_id(
                 )
                 try:
                     r.close()
-                except Exception:  # nosec B110 - best-effort cleanup
+                except Exception:                                    
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -451,19 +451,19 @@ def _tg_send_message(
 ):
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    # Sanitize-on-send: ``text`` may embed third-party content (filenames,
-    # error strings, user details) — a corrupted surrogate would crash the
-    # send-layer URL-encoding with "surrogates not allowed".
+                                                                          
+                                                                          
+                                                            
     data = {"chat_id": str(chat_id), "text": _sanitize_outbound(text) or ""}
     if reply_markup is not None:
-        # The Bot API expects reply_markup as a JSON-serialized form value;
-        # passing the dict raw makes requests urlencode it as a mangled
-        # Python repr (and mypy flags the assignment).
+                                                                           
+                                                                       
+                                                      
         data["reply_markup"] = json.dumps(reply_markup)
     if parse_mode:
         data["parse_mode"] = parse_mode
-    # Retry on transient 429/5xx (Telegram flood control) with backoff —
-    # mirrors the sendDocument helper so background workers survive bursts.
+                                                                        
+                                                                           
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -478,14 +478,14 @@ def _tg_send_message(
                     attempt + 1,
                     chat_id,
                 )
-                # The error body is never read, so close the response so the
-                # pooled connection is released promptly instead of being held
-                # through the backoff sleep and retry (urllib3 discards a
-                # partially-read connection, which is fine — the retry opens
-                # a fresh one from the pool).
+                                                                            
+                                                                              
+                                                                         
+                                                                            
+                                             
                 try:
                     r.close()
-                except Exception:  # nosec B110 - best-effort cleanup
+                except Exception:                                    
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -517,13 +517,13 @@ def _tg_edit_message_text(
     parse_mode: str = "Markdown",
     reply_markup: dict | None = None,
 ):
-    """Edit a previously-sent message using Bot API's editMessageText.
-
-    ``reply_markup`` is an optional inline-keyboard payload (``{"inline_keyboard":
-    [...]}``). Pass ``{"inline_keyboard": []}`` to remove an existing keyboard.
-
-    Returns the API response dict on success, or None on failure (non-fatal).
-    """
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token()
     if not bot_token:
         return None
@@ -532,12 +532,12 @@ def _tg_edit_message_text(
         data = {
             "chat_id": str(chat_id),
             "message_id": message_id,
-            # Sanitize-on-send: edited text can embed third-party content.
+                                                                          
             "text": _sanitize_outbound(text) or "",
             "parse_mode": parse_mode,
         }
         if reply_markup is not None:
-            # JSON-serialized form value — see _tg_send_message.
+                                                                
             data["reply_markup"] = json.dumps(reply_markup)
         r = _SESSION.post(url, data=data, timeout=15)
         r.raise_for_status()
@@ -549,14 +549,14 @@ def _tg_edit_message_text(
 def _tg_edit_message_reply_markup(
     chat_id: int, message_id: int | None, reply_markup: dict | None = None
 ) -> bool:
-    """Set (or clear) the inline keyboard on a message (editMessageReplyMarkup).
-
-    ``reply_markup=None`` sends an empty keyboard (removes the buttons) — used
-    to strip a stale cancel button once a job hands off to a different
-    pipeline, so a file never shows two cancel controls.  Pass a keyboard dict
-    to attach a new set of buttons (e.g. the Compress-PDF button on a
-    delivered result). Best-effort.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if not message_id:
         return False
     bot_token = _get_bot_token()
@@ -569,7 +569,7 @@ def _tg_edit_message_reply_markup(
             data={
                 "chat_id": str(chat_id),
                 "message_id": message_id,
-                # JSON-serialized form value — see _tg_send_message.
+                                                                    
                 "reply_markup": json.dumps(
                     reply_markup or {"inline_keyboard": []}
                 ),
@@ -592,14 +592,14 @@ def _attach_pending_buttons(
     file_size: int | None,
     actions: tuple[tuple[str, str, str], ...],
 ) -> None:
-    """Store pending records and attach ONE combined keyboard to a result.
-
-    ``actions`` is a sequence of ``(record_prefix, button_text,
-    callback_prefix)`` — e.g. (Compress, OCR) on a delivered PDF.  Each action
-    gets its own token + pending record; all buttons land on a single keyboard
-    via one edit (two sequential edits would overwrite each other).  Best-
-    effort: any failure just leaves the message without buttons.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if not message_id or not file_id or not actions:
         return
     try:
@@ -630,14 +630,14 @@ def _attach_pending_buttons(
         _tg_edit_message_reply_markup(
             chat_id, message_id, {"inline_keyboard": kb_rows}
         )
-    except Exception:  # nosec B110 - best-effort button attach
+    except Exception:                                          
         pass
 
 
-# ── Pending-action button configs ──────────────────────────────────────────
-# ``(record_prefix, button_text, callback_prefix, prompt_text)`` — defined once
-# so the attach helpers (tg_http.py) and the worker prompt call sites
-# (tasks.py) can never drift apart on labels, prefixes or user-facing text.
+                                                                             
+                                                                               
+                                                                     
+                                                                           
 BOOK_CONVERT_ACTION: tuple[str, str, str, str] = (
     "bookconvert",
     "\U0001f501 Convert",
@@ -676,16 +676,16 @@ def _store_pending_record(
     mime: str = "",
     source_chat_id: int | str | None = None,
 ) -> None:
-    """Persist a pending button record under ``<prefix>:<token>`` (best-effort).
-
-    Shared by the Convert (``bookconvert``) and Compress-PDF (``bookcompress``)
-    buttons.  ``chat_id`` is where the user tapped the button (the delivery
-    target for the result).  ``source_chat_id``/``message_id`` describe where
-    the file currently lives so the job can re-download it — for bot-sent
-    results that is the same chat as the button (source_chat_id left None),
-    for userbot-delivered (large) copies it is the DM/Saved Messages where the
-    copy landed.  Records expire after ``BOOK_ASK_TTL_SECONDS``.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     try:
         from utils.redis_client import get_sync_redis
 
@@ -695,7 +695,7 @@ def _store_pending_record(
                 import config as _cfg
 
                 _ttl = getattr(_cfg, "BOOK_ASK_TTL_SECONDS", 600)
-            except Exception:  # nosec B110
+            except Exception:              
                 _ttl = 600
             r.setex(
                 f"{prefix}:{token}",
@@ -714,7 +714,7 @@ def _store_pending_record(
                     }
                 ),
             )
-    except Exception:  # nosec B110
+    except Exception:              
         pass
 
 
@@ -722,15 +722,15 @@ def _store_pending_record(
 
 
 def sent_doc_file_unique_id(msg: Any | None) -> str | None:
-    """Best-effort: the Bot API ``file_unique_id`` of a userbot-sent message.
-
-    Userbot deliveries (Telethon/Pyrogram) return a library Message object.
-    Pyrogram exposes the Bot API ``file_unique_id`` on ``message.document``;
-    Telethon's MTProto documents do not carry it, so this returns None there
-    and the pending record simply stores no fuid (no surface dedup for that
-    delivery) rather than inventing an identifier.  Safe for both libraries:
-    every access is a getattr with a None fallback.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if msg is None:
         return None
     _doc = getattr(msg, "document", None)
@@ -755,15 +755,15 @@ def _tg_send_pending_prompt(
     mime: str = "",
     extra_action: tuple[str, str, str] | None = None,
 ) -> None:
-    """Post a bot-API Compress/Convert prompt for a userbot-delivered file.
-
-    The bot cannot edit the userbot's delivered message, so it sends its own
-    prompt message in the user's chat.  The pending record (keyed under
-    ``<record_prefix>:<token>``) points at the delivered copy (``src_chat_id``
-    + ``src_message_id``) so the corresponding job can re-download it via the
-    userbot chat-based pipe.  Best-effort: any failure leaves the file
-    delivered without the button.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if not src_message_id:
         return
     try:
@@ -815,12 +815,12 @@ def _tg_send_pending_prompt(
             reply_markup={"inline_keyboard": kb_rows},
             parse_mode="Markdown",
         )
-    except Exception:  # nosec B110 - best-effort prompt
+    except Exception:                                   
         pass
 
 
 def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
-    """Delete a message via the Bot API ``deleteMessage`` endpoint (best-effort)."""
+                                                                                    
     if not message_id:
         return False
     bot_token = _get_bot_token()
@@ -844,20 +844,20 @@ def _tg_get_file_path(
     file_id: str,
     diagnostic: Callable[[dict], None] | None = None,
 ) -> str:
-    """Resolve a Bot API ``file_id`` to its ``file_path`` via ``getFile``.
-
-    Retries transient issues (5xx / 429) with backoff.  ``diagnostic`` is an
-    optional callback invoked with an output-meta dict when getFile fails, so
-    callers can record their own diagnostics without coupling this module to
-    their storage layer.
-
-    Returns:
-        The resolved ``file_path``.  Raises ``requests.exceptions.HTTPError`` on
-        non-200 responses and ``ValueError``-style exceptions on parse errors.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/getFile"
-    # Try a couple of times for transient issues (e.g., 5xx or rate limits)
+                                                                           
     for attempt in range(3):
         try:
             r = _SESSION.get(url, params={"file_id": file_id}, timeout=30)
@@ -873,7 +873,7 @@ def _tg_get_file_path(
             raise
 
         if r.status_code != 200:
-            # Try to extract Telegram error description for more context
+                                                                        
             try:
                 body = r.json()
                 desc = body.get("description") or body
@@ -883,7 +883,7 @@ def _tg_get_file_path(
                 f"Telegram getFile failed: status={r.status_code} desc={desc}"
             )
             logger.error(msg)
-            # Record diagnostic info for this file_id (caller-side, best-effort)
+                                                                                
             if diagnostic is not None:
                 try:
                     diagnostic(
@@ -894,14 +894,14 @@ def _tg_get_file_path(
                             "timestamp": int(time.time()),
                         }
                     )
-                except Exception:  # nosec B110
+                except Exception:              
                     pass
-            # For server errors or rate limits, retry a couple times
+                                                                    
             if r.status_code >= 500 or r.status_code == 429:
                 if attempt < 2:
                     time.sleep(1 + attempt)
                     continue
-            # Raise an HTTPError with details so callers can include it in their handling
+                                                                                         
             raise requests.exceptions.HTTPError(msg)
 
         try:
@@ -909,7 +909,7 @@ def _tg_get_file_path(
             return data["result"]["file_path"]
         except Exception as e:
             logger.exception("Failed parsing getFile JSON for %s", file_id)
-            # On 400 errors like 'file is too big' record diagnostic info
+                                                                         
             if diagnostic is not None:
                 try:
                     diagnostic(
@@ -921,24 +921,24 @@ def _tg_get_file_path(
                             "timestamp": int(time.time()),
                         }
                     )
-                except Exception:  # nosec B110
+                except Exception:              
                     pass
             raise
 
-    # Unreachable in practice (every loop path returns or raises) but lets the
-    # type checker prove the function always returns str.
+                                                                              
+                                                         
     raise RuntimeError(f"Failed to resolve file_path for {file_id}")
 
 
 def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
-    """Download a Bot API file into memory (``api.telegram.org/file/...``).
-
-    Retries transient 429/5xx and connection errors with backoff; non-retryable
-    HTTP errors (e.g. 400/404) raise immediately.
-
-    Returns:
-        The raw file bytes.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
     last_exc: Exception | None = None
@@ -946,7 +946,7 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
         try:
             with _SESSION.get(url, stream=True, timeout=60) as r:
                 if r.status_code >= 500 or r.status_code == 429:
-                    # Server error or rate limit — retry with backoff
+                                                                     
                     last_exc = requests.exceptions.HTTPError(
                         f"Telegram download failed: status={r.status_code}"
                     )
@@ -971,7 +971,7 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
             requests.exceptions.Timeout,
             requests.exceptions.ChunkedEncodingError,
         ) as e:
-            # Transient network errors — retry with exponential backoff
+                                                                       
             last_exc = e
             logger.warning(
                 "_tg_download_to_bytes: transient error %s on attempt %d for %s",
@@ -983,7 +983,7 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
                 time.sleep(2**attempt)
                 continue
         except requests.exceptions.HTTPError:
-            # Non-retryable HTTP errors (e.g., 400, 404) — raise immediately
+                                                                            
             raise
     raise last_exc or RuntimeError(
         f"Failed to download {tg_file_path} after 3 attempts"
@@ -997,14 +997,14 @@ def _tg_download_to_file(
     total: int = 0,
     progress_callback: _ProgressCallback | None = None,
 ) -> int:
-    """Download a Bot API file to ``dest_path`` (streamed, never fully buffered).
-
-    When ``total`` > 0, ``progress_callback(recv, total)`` is invoked per chunk
-    so callers can live-edit a progress message.
-
-    Returns:
-        The number of bytes written.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
     seen = 0
@@ -1018,7 +1018,7 @@ def _tg_download_to_file(
                     if total and progress_callback is not None:
                         try:
                             progress_callback(seen, total)
-                        except Exception:  # nosec B110 - progress is best-effort
+                        except Exception:                                        
                             pass
     return seen
 
@@ -1029,12 +1029,12 @@ def _tg_forward_message(
     from_chat_id: int,
     message_id: int,
 ) -> int | None:
-    """Forward a message via the Bot API ``forwardMessage`` endpoint.
-
-    Returns:
-        The forwarded message id on success, or None on failure (the failure
-        detail is logged).
-    """
+\
+\
+\
+\
+\
+       
     bot_token = _get_bot_token(bot_token)
     try:
         url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
@@ -1069,9 +1069,9 @@ def _tg_forward_message(
         return None
 
 
-# ── HTTP-based progress messages (no PTB needed in workers) ──────
-# Mirror bot.py's send_progress_update but use raw HTTP calls so they work in
-# background workers without a PTB bot instance.
+                                                                   
+                                                                             
+                                                
 
 _PROGRESS_STAGES = {
     "queued": 0,
@@ -1096,24 +1096,24 @@ def _tg_send_progress(
     progress_pct: int | None = None,
     reply_markup: dict | None = None,
 ) -> int | None:
-    """Send or update a progress message with a visual Unicode progress bar.
-
-    Args:
-        chat_id: Telegram chat ID to send to.
-        filename: Display name of the file being processed.
-        stage: Key from _PROGRESS_STAGES dict (e.g. "downloading", "done").
-        detail: Optional detail line (e.g. "40.2 MB downloaded").
-        file_size: Total file size for display.
-        message_id: If provided, *edit* the existing message instead of sending new.
-        progress_pct: Optional live byte percentage (0-100) that overrides the
-            stage's fixed percentage (used while downloading via userbot).
-        reply_markup: Optional inline-keyboard payload to attach (e.g. a live
-            cancel button on the handoff message). Pass ``{"inline_keyboard":
-            []}`` to remove an existing keyboard.
-
-    Returns:
-        message_id of the sent/edited message, or None on failure.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     pct = _PROGRESS_STAGES.get(stage, 0)
     if progress_pct is not None:
         pct = max(0, min(100, int(progress_pct)))
@@ -1134,9 +1134,9 @@ def _tg_send_progress(
     emoji = emojis.get(stage, "\u2753")
 
     lines = [
-        # filename is user-controlled: entities ARE parsed inside **bold** in
-        # legacy Markdown, so a raw ``_``/``*``/``[`` would render mangled or
-        # crash the send with "Can't parse entities" -- escape it first.
+                                                                             
+                                                                             
+                                                                        
         f"\U0001f4c1 **{escape_markdown(filename)}**",
         f"{bar} `{pct}%`",
     ]
@@ -1159,11 +1159,11 @@ def _tg_send_progress(
                 chat_id,
                 text,
                 reply_markup=reply_markup,
-                # Mirror the edit branch (and the web process's
-                # send_progress_update) so the FIRST progress message renders
-                # Markdown exactly like every subsequent live edit — otherwise
-                # the **bold**/`code` markers show literally on the initial
-                # post and only render once the first edit lands.
+                                                               
+                                                                             
+                                                                              
+                                                                           
+                                                                 
                 parse_mode="Markdown",
             )
             if res and "result" in res and "message_id" in res["result"]:

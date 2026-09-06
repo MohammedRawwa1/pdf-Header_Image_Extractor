@@ -25,59 +25,59 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-# Module-level default timeout for Telethon download operations.
-# Configurable via TELETHON_DOWNLOAD_TIMEOUT env var (default 600s = 10 min).
+                                                                
+                                                                             
 TELETHON_DOWNLOAD_TIMEOUT = int(os.getenv("TELETHON_DOWNLOAD_TIMEOUT", "600"))
 
-# Module-level default timeout for Pyrogram download operations.
-# Configurable via PYROGRAM_DOWNLOAD_TIMEOUT env var (default 600s = 10 min).
+                                                                
+                                                                             
 PYROGRAM_DOWNLOAD_TIMEOUT = int(os.getenv("PYROGRAM_DOWNLOAD_TIMEOUT", "600"))
 
-# Telethon download chunk size in KB.  Telethon defaults to 128KB chunks for
-# large files, making high-latency / cross-DC downloads wait on hundreds of
-# sequential round-trips.  Larger chunks cut that overhead (512KB = 4x fewer
-# requests, the library's safe maximum).  Configurable via
-# TELETHON_DOWNLOAD_PART_SIZE_KB.
+                                                                            
+                                                                           
+                                                                            
+                                                          
+                                 
 TELETHON_DOWNLOAD_PART_SIZE_KB = int(
     os.getenv("TELETHON_DOWNLOAD_PART_SIZE_KB", "512")
 )
 
 
 async def _download_media_with_part_size(client, msg, **kwargs):
-    """download_media() with a custom chunk size.
-
-    Telethon's ``download_media()`` does not accept ``part_size_kb`` (only
-    ``download_file()`` does), so resolve the media's input location and route
-    through ``download_file()`` when a part size was requested.  Falls back to
-    a plain ``download_media()`` if the location cannot be resolved.
-    """
+\
+\
+\
+\
+\
+\
+       
     part_size_kb = kwargs.pop("part_size_kb", None)
     location = None
     if part_size_kb:
         try:
             from telethon.utils import get_input_location
 
-            # get_input_location() returns a (dc_id, location) tuple — unpack
-            # it and hand download_file() the bare InputFileLocation (with the
-            # DC hint).  Passing the tuple whole raises
-            # "Cannot cast tuple to any kind of InputFileLocation".
+                                                                             
+                                                                              
+                                                       
+                                                                   
             dc_id, location = get_input_location(msg)
         except Exception:
-            # Could not resolve the media location (e.g. missing access hash);
-            # fall back to download_media() below.
+                                                                              
+                                                  
             location = None
     if location is not None:
         kwargs["part_size_kb"] = part_size_kb
         kwargs["dc_id"] = dc_id
-        # Transfer errors propagate to the caller's retry logic instead of
-        # triggering a redundant full re-download via download_media().
+                                                                          
+                                                                       
         return await client.download_file(location, **kwargs)
     return await client.download_media(msg, **kwargs)
 
-# Check if PyMuPDF (fitz) is available for PDF validation after download.
-# If not installed, PDF validation is skipped and all downloads are accepted
-# at the file-exists level (graceful degradation — the error will surface later
-# when thumbnail creation is attempted).
+                                                                         
+                                                                            
+                                                                               
+                                        
 try:
     import fitz as _fitz
 
@@ -87,16 +87,16 @@ except ImportError:
 
 
 def _get_bot_user_id() -> int | None:
-    """Extract the bot's user ID from the BOT_TOKEN environment variable.
-
-    When the Bot API reports ``chat_id == user_id`` (i.e. the user's ID in a DM),
-    MTProto clients (Telethon/Pyrogram) need the **bot's user ID** to access
-    those same messages from the bot's chat.  This helper extracts the bot's
-    numeric ID from the first segment of the BOT_TOKEN.
-
-    Returns:
-        The bot user ID (int), or None if BOT_TOKEN is not set or malformed.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     token = os.getenv("BOT_TOKEN", "")
     if ":" in token:
         try:
@@ -107,11 +107,11 @@ def _get_bot_user_id() -> int | None:
 
 
 def _is_user_dm_chat(chat_id: int | str) -> bool:
-    """Return True if ``chat_id`` looks like a user-to-bot DM chat.
-
-    In the Bot API, DMs use the user's Telegram ID as the ``chat_id``,
-    which is always a positive integer.  Negative IDs are groups/channels.
-    """
+\
+\
+\
+\
+       
     try:
         cid = int(chat_id)
         return cid > 0
@@ -120,41 +120,41 @@ def _is_user_dm_chat(chat_id: int | str) -> bool:
 
 
 def _extract_file_dc_id(msg) -> int | None:
-    """Extract the Telegram DC ID where the file in ``msg`` is stored.
-
-    Telethon message media objects contain a ``dc_id`` attribute that tells
-    which Telegram DC (data center) the file resides on.  By migrating the
-    client to that DC before downloading, we avoid ``FILE_MIGRATE_X`` errors
-    and the associated timeout/retry storms that happen during cross-DC file
-    transfers.
-
-    Args:
-        msg: A Telethon ``Message`` object with ``media``.
-
-    Returns:
-        The DC ID (int) if found, else None.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if msg is None:
         return None
     media = getattr(msg, "media", None)
     if media is None:
         return None
 
-    # Document (files, stickers, voice, video)
+                                              
     doc = getattr(media, "document", None)
     if doc is not None:
         dc_id = getattr(doc, "dc_id", None)
         if dc_id:
             return dc_id
 
-    # Photo
+           
     photo = getattr(media, "photo", None)
     if photo is not None:
         dc_id = getattr(photo, "dc_id", None)
         if dc_id:
             return dc_id
 
-    # WebPage (link previews with media)
+                                        
     webpage = getattr(media, "webpage", None)
     if webpage is not None:
         for attr in ("photo", "document"):
@@ -168,7 +168,7 @@ def _extract_file_dc_id(msg) -> int | None:
 
 
 async def _normalize_target(chat_id: int | str, client=None):
-    """Return a compatible target entity for ``chat_id``."""
+                                                            
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         return chat_id
     try:
@@ -178,27 +178,27 @@ async def _normalize_target(chat_id: int | str, client=None):
 
 
 async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
-    """Resolve a peer ID to get Pyrogram's cached entity (with access_hash).
-
-    Pyrogram needs the ``access_hash`` for a peer before it can call
-    ``get_messages()`` or similar.  For user IDs the userbot has never
-    interacted with, Pyrogram raises ``[400 PEER_ID_INVALID]`` because
-    it lacks the hash.  This function resolves the peer via
-    ``get_chat()`` / ``get_users()``, which fetches and caches the hash.
-
-    Adapted from the media_conersion_bot reference implementation.
-
-    Args:
-        client: An active Pyrogram Client.
-        peer_id: Numeric chat/user ID or @username.
-
-    Returns:
-        The resolved peer (usually the same numeric ID, now cached).
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if not isinstance(peer_id, int):
         return peer_id
 
-    # Try get_chat first (covers groups, channels, and users)
+                                                             
     try:
         resolved = await client.get_chat(peer_id)
         if resolved is not None:
@@ -218,7 +218,7 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             e,
         )
 
-    # Fall back to get_users (only works for users, not groups/channels)
+                                                                        
     try:
         resolved = await client.get_users(peer_id)
         if resolved is not None:
@@ -237,9 +237,9 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             e,
         )
 
-    # Final fallback: scan recent dialogs for the peer.  The bot the user DMs
-    # shows up here with its access_hash, which get_chat/get_users above may
-    # not resolve for an account that has never synced the peer's cache.
+                                                                             
+                                                                            
+                                                                        
     try:
         _dialogs = await client.get_dialogs(limit=200)
         for _d in _dialogs:
@@ -255,7 +255,7 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             "resolve_pyrogram_peer: dialog scan failed: %s", e
         )
 
-    # Could not resolve; return original ID (get_messages will fail gracefully)
+                                                                               
     logger.info(
         "resolve_pyrogram_peer: could not resolve %s, will try as-is",
         peer_id,
@@ -263,33 +263,33 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
     return peer_id
 
 
-# ── Large Bot API channel helpers ─────────────────────────────────
-# Pyrogram 2.0.106's ``get_peer_type()`` has a hardcoded range check that
-# only accepts channel IDs whose raw ``channel_id <= 2147483647``.
-# Channels with larger raw IDs (e.g. 4367325292) are rejected with
-# ``Peer id invalid`` BEFORE any network request is made.
-# The helpers below bypass this via raw MTProto API.
-# Adapted from the media_conersion_bot reference implementation.
+                                                                    
+                                                                         
+                                                                  
+                                                                  
+                                                         
+                                                    
+                                                                
 
 
 def _is_likely_pdf(path: str) -> bool:
-    """Return True if the file path has a .pdf extension."""
+                                                            
     return path.lower().endswith(".pdf")
 
 
 def _validate_downloaded_pdf(path: str) -> bool:
-    """Validate a downloaded PDF file by attempting to open it with PyMuPDF.
-
-    Returns True if the file is a valid PDF, False otherwise.
-    Logs a warning if validation fails.
-
-    If PyMuPDF (fitz) is not installed, skips validation and returns True
-    (assumes valid — the error will surface later during thumbnail creation).
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if not os.path.exists(path):
         return False
     if not _FITZ_AVAILABLE:
-        return True  # can't validate, assume valid
+        return True                                
     try:
         doc = _fitz.open(path)
         doc.close()
@@ -302,8 +302,8 @@ def _validate_downloaded_pdf(path: str) -> bool:
 
 
 def _is_large_bot_api_channel(peer_id) -> bool:
-    """Return True if ``peer_id`` is a Bot API channel ID whose raw
-    channel_id exceeds Pyrogram's 32-bit range check (2147483647)."""
+\
+                                                                     
     if not isinstance(peer_id, int) or peer_id >= 0:
         return False
     s = str(peer_id)
@@ -314,14 +314,14 @@ def _is_large_bot_api_channel(peer_id) -> bool:
 
 
 async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
-    """Resolve a Bot API channel ID (-100xxxxx...) via raw MTProto API.
-
-    Invokes `channels.GetChannels` with ``access_hash=0`` so the server
-    responds with the correct access_hash, bypassing Pyrogram's peer
-    type validation.
-
-    Returns an ``InputPeerChannel`` on success, or ``None`` on failure.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     from pyrogram import raw
 
     raw_channel_id = abs(bot_api_chat_id) - 1000000000000
@@ -361,10 +361,10 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
 async def _get_message_via_raw_channel_api(
     client, channel_peer, message_id: int
 ):
-    """Get a single message from a resolved channel peer using raw MTProto API.
-
-    Returns the Pyrogram ``Message`` object on success, or ``None``.
-    """
+\
+\
+\
+       
     from pyrogram import raw
     from pyrogram import types as pyro_types
 
@@ -402,13 +402,13 @@ async def _download_from_raw_channel(
     dest_path: str,
     progress_callback=None,
 ) -> bool:
-    """Try to download a message from a large Bot API channel via raw API.
-
-    Handles path reconciliation (Pyrogram may resolve relative paths
-    differently) and returns True on success, False on failure.
-
-    Features exponential backoff between retries.
-    """
+\
+\
+\
+\
+\
+\
+       
     for attempt in range(3):
         channel_peer = await _resolve_bot_api_channel_raw(
             client, bot_api_chat_id
@@ -447,10 +447,10 @@ async def _download_from_raw_channel(
             if os.path.exists(_dl_path):
                 try:
                     shutil.move(_dl_path, _abs_dest)
-                except Exception:  # nosec B110
+                except Exception:              
                     pass
         if os.path.exists(_abs_dest) and os.path.getsize(_abs_dest) > 0:
-            # Validate PDF files to catch corrupted/incomplete downloads
+                                                                        
             if _is_likely_pdf(_abs_dest) and not _validate_downloaded_pdf(
                 _abs_dest
             ):
@@ -460,7 +460,7 @@ async def _download_from_raw_channel(
                 )
                 try:
                     os.remove(_abs_dest)
-                except Exception:  # nosec B110
+                except Exception:              
                     pass
                 await asyncio.sleep(2**attempt)
                 continue
@@ -475,12 +475,12 @@ async def _download_bytes_from_raw_channel(
     message_id: int,
     progress_callback=None,
 ) -> bytes | None:
-    """Try to in-memory download a message from a large Bot API channel via raw API.
-
-    Returns bytes on success, or None.
-
-    Features exponential backoff between retries.
-    """
+\
+\
+\
+\
+\
+       
     for attempt in range(3):
         channel_peer = await _resolve_bot_api_channel_raw(
             client, bot_api_chat_id
@@ -519,21 +519,21 @@ async def _download_file_by_file_id(
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
 ) -> bool:
-    """Download a file directly by Bot API file_id using Telethon's resolve_bot_file_id.
-
-    This bypasses chat/message resolution entirely and is the fastest path for
-    downloading files. Works regardless of whether the userbot has joined the
-    source chat, because it uses the raw file location embedded in the Bot API
-    file_id.
-
-    Args:
-        file_id: Telegram Bot API file_id.
-        dest_path: Local path to save the downloaded file.
-        progress_callback: Optional callable(current_bytes, total_bytes).
-
-    Returns:
-        True on success, False on failure.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if TelegramClient is None:
         logger.debug(
             "userbot: Telethon not installed; cannot download by file_id"
@@ -585,7 +585,7 @@ async def _download_file_by_file_id(
                     "userbot: could not create dest dir %s: %s", _dest_dir, e
                 )
 
-        # download_file writes directly to the file path
+                                                        
         dl_kwargs = {
             "file": dest_path,
             "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
@@ -596,7 +596,7 @@ async def _download_file_by_file_id(
         await client.download_file(location, **dl_kwargs)
 
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            # Validate PDF files to catch corrupted/incomplete downloads
+                                                                        
             if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(
                 dest_path
             ):
@@ -605,7 +605,7 @@ async def _download_file_by_file_id(
                 )
                 try:
                     os.remove(dest_path)
-                except Exception:  # nosec B110
+                except Exception:              
                     pass
                 return False
             logger.info(
@@ -625,26 +625,26 @@ async def _download_file_by_file_id(
     finally:
         try:
             await client.disconnect()
-        except Exception:  # nosec B110
+        except Exception:              
             pass
 
 
 async def _resolve_telethon_entity(client, chat_id: int | str):
-    """Resolve a chat/peer entity for Telethon with multiple fallback strategies.
-
-    Telethon needs a cached entity (from ``get_entity`` or dialog iteration)
-    to download messages from a chat. This function tries several approaches:
-    1. Direct ``client.get_entity()`` with the original ID
-    2. For channel IDs, try with ``-100`` prefix normalization
-    3. Iterate through recent dialogs and match by ID
-
-    Args:
-        client: An active Telethon client.
-        chat_id: Numeric chat ID or @username.
-
-    Returns:
-        Resolved entity on success, or None on failure.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         try:
             return await client.get_entity(chat_id)
@@ -654,7 +654,7 @@ async def _resolve_telethon_entity(client, chat_id: int | str):
             )
             return None
 
-    # Strategy 1: Try direct get_entity with the raw ID
+                                                       
     try:
         return await client.get_entity(chat_id)
     except ValueError as e:
@@ -669,8 +669,8 @@ async def _resolve_telethon_entity(client, chat_id: int | str):
     except Exception as e:
         logger.debug("userbot: get_entity(%s) failed: %s", chat_id, e)
 
-    # Strategy 2: For Bot API channel IDs (e.g. -100xxxxxxxxx), try resolving
-    # by constructing the canonical peer and using raw API
+                                                                             
+                                                          
     if isinstance(chat_id, int) and chat_id < 0:
         s = str(chat_id)
         if s.startswith("-100"):
@@ -696,7 +696,7 @@ async def _resolve_telethon_entity(client, chat_id: int | str):
                     e2,
                 )
 
-    # Strategy 3: Scan recent dialogs for a matching entity
+                                                           
     try:
         async for dialog in client.iter_dialogs(limit=200):
             if dialog and dialog.entity:
@@ -716,26 +716,26 @@ async def _resolve_telethon_entity(client, chat_id: int | str):
 
 
 async def _resolve_bot_entity(client):
-    """Resolve the bot's user entity so the userbot can read the bot DM.
-
-    ``client.get_entity(bot_user_id)`` fails with "Could not find the input
-    entity" when the session has never cached the bot (no access hash) —
-    exactly what the production log shows for big-file downloads.  The
-    userbot HAS an active DM with the bot (that's where the file lives), so
-    a dialog scan reliably finds it; an optional ``BOT_USERNAME`` env is the
-    last resort.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+       
     bot_user_id = _get_bot_user_id()
     if bot_user_id is None:
         return None
-    # 1) Cached entity (session already knows the bot)
+                                                      
     try:
         entity = await client.get_entity(bot_user_id)
         if entity is not None:
             return entity
-    except Exception:  # nosec B110 - fall through to dialog scan
+    except Exception:                                            
         pass
-    # 2) Dialog scan: the DM with the bot is an active dialog for the userbot
+                                                                             
     try:
         async for dialog in client.iter_dialogs(limit=300):
             ent = getattr(dialog, "entity", None)
@@ -745,14 +745,14 @@ async def _resolve_bot_entity(client):
                     bot_user_id,
                 )
                 return ent
-    except Exception:  # nosec B110
+    except Exception:              
         pass
-    # 3) Username resolution (BOT_USERNAME env, optional but most reliable)
+                                                                           
     _username = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
     if _username:
         try:
             return await client.get_entity(_username)
-        except Exception:  # nosec B110
+        except Exception:              
             pass
     logger.warning("userbot: could not resolve bot entity %s", bot_user_id)
     return None
@@ -769,19 +769,19 @@ async def _download_with_telethon(
     user_id: int | None = None,
     session_str: str | None = None,
 ) -> bool:
-    """Download using Telethon client.
-
-    If ``file_id`` is provided, tries direct file_id-based download first
-    (fastest path, bypasses chat resolution entirely). Falls back to
-    chat-based download with smart entity resolution if file_id is not
-    available or fails.
-
-    If ``progress_callback`` is provided, it will be called with
-    ``(current_bytes, total_bytes)`` during download.
-
-    Features exponential backoff between retries and a total retry budget
-    to prevent infinite retry storms when Telegram's DC is having issues.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if TelegramClient is None:
         logger.debug("Telethon not installed; skipping Telethon download")
         return False
@@ -794,8 +794,8 @@ async def _download_with_telethon(
 
     api_id, api_hash = get_userbot_credentials()
 
-    # Use the caller's pre-resolved session string when provided; fall back to
-    # resolving it here (direct callers) so it is never resolved twice.
+                                                                              
+                                                                       
     session_str = await resolve_session_string(
         "telethon", session_str=session_str, user_id=user_id
     )
@@ -808,16 +808,16 @@ async def _download_with_telethon(
         logger.exception("userbot: failed to start Telethon client: %s", e)
         return False
 
-    # Cap total download attempts to prevent infinite retry storms.
+                                                                   
     MAX_TOTAL_ATTEMPTS = int(os.getenv("TELETHON_MAX_RETRY_ATTEMPTS", "20"))
-    # Total timeout for the entire download operation (used with asyncio.wait_for).
-    # 600s = 10 minutes for files up to ~200MB. Adjust via env for faster/slower connections.
+                                                                                   
+                                                                                             
     DOWNLOAD_TOTAL_TIMEOUT = TELETHON_DOWNLOAD_TIMEOUT
     _dest_dir = os.path.dirname(dest_path)
     if _dest_dir:
         try:
             os.makedirs(_dest_dir, exist_ok=True)
-        except Exception:  # nosec B110
+        except Exception:              
             pass
 
     try:
@@ -825,7 +825,7 @@ async def _download_with_telethon(
 
         total_attempts = 0
 
-        # Use smart entity resolution for better channel/chat handling
+                                                                      
         resolved_entity = await _resolve_telethon_entity(client, chat_id)
         if resolved_entity is not None:
             try:
@@ -841,7 +841,7 @@ async def _download_with_telethon(
         else:
             msgs = None
 
-        # If entity resolution didn't work, fall back to direct get_messages
+                                                                            
         if msgs is None:
             try:
                 msgs = await client.get_messages(target, ids=message_id)
@@ -851,13 +851,13 @@ async def _download_with_telethon(
                 )
                 msgs = None
 
-        # ── DM fallback: Bot API chat_id maps to user ID in DMs, but MTProto
-        # needs the **bot's** user ID.  Try resolving the bot — via the cached
-        # entity, a DIALOG SCAN (the userbot has the DM with the bot in its
-        # dialog list), or the BOT_USERNAME env — so get_messages can read the
-        # bot DM.  A bare get_entity(bot_id) fails here when the session has
-        # never cached the bot (no access hash), which silently killed every
-        # big-file DM download before this resolver existed.
+                                                                             
+                                                                              
+                                                                           
+                                                                              
+                                                                            
+                                                                            
+                                                            
         if msgs is None and _is_user_dm_chat(chat_id):
             bot_user_id = _get_bot_user_id()
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
@@ -891,10 +891,10 @@ async def _download_with_telethon(
                     dest_path,
                 )
 
-                # ── Pre-migrate to the file's DC before downloading ──
-                # Cross-DC GetFileRequest timeouts are the #1 cause of download
-                # failures for large files.  Extract the file's DC from the
-                # message media and migrate the client there first.
+                                                                       
+                                                                               
+                                                                           
+                                                                   
                 try:
                     _file_dc = _extract_file_dc_id(msg)
                     if _file_dc is not None:
@@ -923,10 +923,10 @@ async def _download_with_telethon(
                         }
                         if progress_callback is not None:
                             kwargs["progress_callback"] = progress_callback
-                        # Wrap in asyncio.wait_for to enforce a total-download timeout
-                        # and prevent hanging on large files that span multiple DCs.
-                        # This is more portable than Telethon's native timeout param
-                        # (which was added in a later version).
+                                                                                      
+                                                                                    
+                                                                                    
+                                                               
                         await asyncio.wait_for(
                             _download_media_with_part_size(client, msg, **kwargs),
                             timeout=DOWNLOAD_TOTAL_TIMEOUT,
@@ -944,7 +944,7 @@ async def _download_with_telethon(
                                 )
                                 try:
                                     os.remove(dest_path)
-                                except Exception:  # nosec B110
+                                except Exception:              
                                     pass
                                 await asyncio.sleep(2**attempt)
                                 continue
@@ -956,7 +956,7 @@ async def _download_with_telethon(
                         )
                         try:
                             os.remove(dest_path)
-                        except Exception:  # nosec B110
+                        except Exception:              
                             pass
                         await asyncio.sleep(2**attempt)
                     except Exception as e:
@@ -967,17 +967,17 @@ async def _download_with_telethon(
                         )
                         await asyncio.sleep(2**attempt)
 
-        # Scan recent messages as fallback.  GUARD: in a Bot API DM the
-        # ``chat_id`` IS the user's own ID, so a scan of ``target`` would
-        # iterate the userbot's Saved Messages and download an UNRELATED
-        # file — skip the scan in that case (the bot-DM path above is the
-        # correct route for DMs).  A successful scan still counts as success.
+                                                                       
+                                                                         
+                                                                        
+                                                                         
+                                                                             
         _self_id = getattr(client, "_self_id", None)
         if _self_id is None:
             try:
                 _me = await client.get_me()
                 _self_id = getattr(_me, "id", None)
-            except Exception:  # nosec B110
+            except Exception:              
                 pass
         _target_is_self = False
         try:
@@ -985,7 +985,7 @@ async def _download_with_telethon(
                 _self_id is not None
                 and str(abs(int(target))) == str(abs(int(_self_id)))
             )
-        except (TypeError, ValueError):  # nosec B110 - non-numeric target
+        except (TypeError, ValueError):                                   
             pass
         if _target_is_self:
             logger.warning(
@@ -1011,7 +1011,7 @@ async def _download_with_telethon(
     finally:
         try:
             await client.disconnect()
-        except Exception:  # nosec B110
+        except Exception:              
             pass
 
 
@@ -1023,14 +1023,14 @@ async def _scan_fallback_download(
     max_attempts: int,
     timeout: int,
 ) -> bool:
-    """Scan recent messages of ``target`` and download the first media found.
-
-    Used as a last-resort fallback in :func:`_download_with_telethon` when
-    the exact message can't be fetched by id.  Returns True when a file was
-    actually downloaded to ``dest_path`` (callers must treat that as
-    success — a discarded result would waste a valid download).  Never
-    raises.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     total_attempts = 0
     try:
         async for m in client.iter_messages(target, limit=200):
@@ -1056,7 +1056,7 @@ async def _scan_fallback_download(
                         }
                         if progress_callback is not None:
                             kwargs["progress_callback"] = progress_callback
-                        # Wrap in asyncio.wait_for to enforce total-download timeout
+                                                                                    
                         await asyncio.wait_for(
                             _download_media_with_part_size(client, m, **kwargs),
                             timeout=timeout,
@@ -1073,7 +1073,7 @@ async def _scan_fallback_download(
                                 )
                                 try:
                                     os.remove(dest_path)
-                                except Exception:  # nosec B110
+                                except Exception:              
                                     pass
                                 await asyncio.sleep(2**attempt)
                                 continue
@@ -1081,7 +1081,7 @@ async def _scan_fallback_download(
                         await asyncio.sleep(2**attempt)
                     except Exception:
                         await asyncio.sleep(2**attempt)
-    except Exception:  # nosec B110
+    except Exception:              
         pass
     return False
 
@@ -1093,14 +1093,14 @@ async def _download_bytes_with_pyrogram(
     user_id: int | None = None,
     session_str: str | None = None,
 ) -> bytes | None:
-    """Download a message's media into memory (bytes) using Pyrogram.
-
-    If ``progress_callback`` is provided, it will be called with
-    ``(current_bytes, total_bytes)`` during download.
-
-    Features exponential backoff between retries and a total retry budget
-    to prevent infinite retry storms when Telegram's DC is having issues.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if PyrogramClient is None:
         logger.info(
             "userbot: Pyrogram not installed; cannot do in-memory download"
@@ -1115,8 +1115,8 @@ async def _download_bytes_with_pyrogram(
 
     api_id, api_hash = get_userbot_credentials()
 
-    # Use the caller's pre-resolved session string when provided; fall back to
-    # resolving it here (direct callers) so it is never resolved twice.
+                                                                              
+                                                                       
     session_str = await resolve_session_string(
         "pyrogram", session_str=session_str, user_id=user_id
     )
@@ -1135,11 +1135,11 @@ async def _download_bytes_with_pyrogram(
 
         target = await _normalize_target(chat_id)
 
-        # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
+                                                                              
         _candidates = [await _resolve_pyrogram_peer(client, target)]
 
-        # ── DM fallback: if chat_id looks like a user ID (Bot API DM),
-        # also try the bot's user ID so Pyrogram can access the bot's chat.
+                                                                       
+                                                                           
         if _is_user_dm_chat(chat_id):
             bot_user_id = _get_bot_user_id()
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
@@ -1241,7 +1241,7 @@ async def _download_bytes_with_pyrogram(
     finally:
         try:
             await client.stop()
-        except Exception:  # nosec B110
+        except Exception:              
             pass
 
 
@@ -1253,14 +1253,14 @@ async def _download_with_pyrogram(
     user_id: int | None = None,
     session_str: str | None = None,
 ) -> bool:
-    """Download using Pyrogram client (session string fallback).
-
-    If ``progress_callback`` is provided, it will be called with
-    ``(current_bytes, total_bytes)`` during download.
-
-    Features exponential backoff between retries and a total retry budget
-    to prevent infinite retry storms when Telegram's DC is having issues.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if PyrogramClient is None:
         logger.info("userbot: Pyrogram not installed; skipping")
         return False
@@ -1273,8 +1273,8 @@ async def _download_with_pyrogram(
 
     api_id, api_hash = get_userbot_credentials()
 
-    # Use the caller's pre-resolved session string when provided; fall back to
-    # resolving it here (direct callers) so it is never resolved twice.
+                                                                              
+                                                                       
     session_str = await resolve_session_string(
         "pyrogram", session_str=session_str, user_id=user_id
     )
@@ -1300,11 +1300,11 @@ async def _download_with_pyrogram(
 
         target = await _normalize_target(chat_id)
 
-        # Resolve the peer to cache its access_hash (prevents PEER_ID_INVALID)
+                                                                              
         _candidates = [await _resolve_pyrogram_peer(client, target)]
 
-        # ── DM fallback: if chat_id looks like a user ID (Bot API DM),
-        # also try the bot's user ID so Pyrogram can access the bot's chat.
+                                                                       
+                                                                           
         if _is_user_dm_chat(chat_id):
             bot_user_id = _get_bot_user_id()
             if bot_user_id is not None and bot_user_id != abs(int(chat_id)):
@@ -1372,7 +1372,7 @@ async def _download_with_pyrogram(
                                         )
                                         try:
                                             os.remove(_abs_dest)
-                                        except Exception:  # nosec B110
+                                        except Exception:              
                                             pass
                                         await asyncio.sleep(2**attempt)
                                         continue
@@ -1380,7 +1380,7 @@ async def _download_with_pyrogram(
                             if os.path.exists(dest_path):
                                 try:
                                     os.remove(dest_path)
-                                except Exception:  # nosec B110
+                                except Exception:              
                                     pass
                         else:
                             break
@@ -1431,7 +1431,7 @@ async def _download_with_pyrogram(
     finally:
         try:
             await client.stop()
-        except Exception:  # nosec B110
+        except Exception:              
             pass
 
 
@@ -1440,19 +1440,19 @@ async def download_bytes_by_file_id_via_userbot(
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
 ) -> bytes | None:
-    """Download a file directly by bot-API file_id using userbot.
-
-    Uses Telethon's ``resolve_bot_file_id`` + ``download_file`` to get the raw
-    bytes without needing a chat_id/message_id. Falls back to Pyrogram if
-    Telethon is unavailable.
-
-    Args:
-        file_id: Telegram bot API file_id (the ``file_id`` field on a Document).
-        progress_callback: Optional callable(current_bytes, total_bytes).
-
-    Returns:
-        Raw bytes of the file, or None on failure.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if TelegramClient is not None:
         try:
             from telethon.utils import resolve_bot_file_id
@@ -1481,8 +1481,8 @@ async def download_bytes_by_file_id_via_userbot(
                         resolved = resolve_bot_file_id(file_id)
                         if resolved is not None:
                             location, file_size = resolved
-                            # download_file expects input_location as first arg,
-                            # file_size and progress_callback as kwargs.
+                                                                                
+                                                                        
                             dl_kwargs = {}
                             if progress_callback is not None:
                                 dl_kwargs["progress_callback"] = (
@@ -1511,15 +1511,15 @@ async def download_bytes_by_file_id_via_userbot(
                     finally:
                         try:
                             await client.disconnect()
-                        except Exception:  # nosec B110
+                        except Exception:              
                             pass
         except Exception as e:
             logger.warning("userbot: Telethon file_id setup error: %s", e)
 
-    # Pyrogram does not have a resolve_bot_file_id equivalent for direct file_id
-    # downloads.  The chat+message_id-based download functions remain available
-    # (download_forward_via_userbot etc.) for Pyrogram users.  This file_id-only
-    # path relies on Telethon's resolve_bot_file_id utility.
+                                                                                
+                                                                               
+                                                                                
+                                                            
     if PyrogramClient is not None:
         logger.warning(
             "userbot: Pyrogram file_id download not supported (no resolve_bot_file_id); "
@@ -1543,21 +1543,21 @@ async def download_forward_via_userbot(
     file_id: str | None = None,
     user_id: int | None = None,
 ) -> bool:
-    """Download a message media using a user account.
-
-    Tries file_id-based download first (if ``file_id`` provided, this bypasses
-    chat resolution entirely and is the fastest path), then Telethon, then
-    Pyrogram session string fallback.
-
-    When called with ``chat_id=0, message_id=0`` (sentinel values used when
-    only ``file_id`` is available), the chat-based fallbacks are skipped
-    entirely to avoid wasting time on invalid IDs.
-
-    If ``progress_callback`` is provided, it will be forwarded to the
-    underlying download method for real-time progress updates.
-
-    Returns True on success, False on failure. Raises RuntimeError for missing config.
-    """
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+       
     if TelegramClient is None and PyrogramClient is None:
         raise RuntimeError(
             "Neither Telethon nor Pyrogram are installed. "
@@ -1569,13 +1569,13 @@ async def download_forward_via_userbot(
         get_telethon_session_string_for_user,
     )
 
-    # Note: file_id-based download via _download_file_by_file_id() was removed
-    # because modern Bot API file_id formats (v4+) are not supported by
-    # Telethon's resolve_bot_file_id utility.  The function still exists for
-    # potential future use or manual invocation.
+                                                                              
+                                                                       
+                                                                            
+                                                
 
-    # ── Sentinel check: if chat_id=0 and message_id=0, no chat context is
-    # available — skip all chat-based downloads.
+                                                                          
+                                                
     _only_file_id = (chat_id == 0 or str(chat_id) == "0") and (
         message_id == 0 or str(message_id) == "0"
     )
@@ -1588,7 +1588,7 @@ async def download_forward_via_userbot(
         )
         return False
 
-    # ── 1) Telethon (preferred: faster, better large-file support) ──
+                                                                      
     _tele_session = await get_telethon_session_string_for_user(user_id=user_id)
     if TelegramClient is not None and _tele_session:
         try:
@@ -1618,7 +1618,7 @@ async def download_forward_via_userbot(
             "userbot: Telethon session not configured; skipping Telethon download"
         )
 
-    # ── 2) Pyrogram fallback (if configured) ──
+                                                
     _pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id)
     if PyrogramClient is not None and _pyro_session:
         try:
@@ -1647,14 +1647,14 @@ async def download_bytes_via_userbot(
     progress_callback: Callable[[int, int], None] | None = None,
     user_id: int | None = None,
 ) -> bytes | None:
-    """Download a message media into memory (bytes) using userbot.
-
-    Tries **Telethon** first (faster, better large-file support),
-    falls back to Pyrogram with ``in_memory=True`` if Telethon is unavailable.
-
-    If ``progress_callback`` is provided, it will be forwarded to the
-    underlying download method for real-time progress updates.
-    """
+\
+\
+\
+\
+\
+\
+\
+       
     if TelegramClient is None and PyrogramClient is None:
         raise RuntimeError(
             "Neither Telethon nor Pyrogram are installed. "
@@ -1666,7 +1666,7 @@ async def download_bytes_via_userbot(
         get_telethon_session_string_for_user,
     )
 
-    # ── 1) Telethon (preferred: faster, better large-file support) ──
+                                                                      
     _tele_session = await get_telethon_session_string_for_user(user_id=user_id)
     if TelegramClient is not None and _tele_session:
         try:
@@ -1676,7 +1676,7 @@ async def download_bytes_via_userbot(
             )
 
             _api_id, _api_hash = _get_creds()
-            # Reuse the session string already resolved by the gate.
+                                                                    
             _session_str = _tele_session
             _client = build_telethon_client(
                 _api_id, _api_hash, session_str=_session_str
@@ -1696,9 +1696,9 @@ async def download_bytes_via_userbot(
                         )
                         msgs = None
 
-                    # ── DM fallback: try bot entity for in-memory download too
-                    # (via the same robust resolver — a bare get_entity(bot_id)
-                    # fails when the session never cached the bot).
+                                                                               
+                                                                               
+                                                                   
                     if not msgs and _is_user_dm_chat(chat_id):
                         bot_user_id = _get_bot_user_id()
                         if bot_user_id is not None and bot_user_id != abs(
@@ -1728,7 +1728,7 @@ async def download_bytes_via_userbot(
                             else msgs
                         )
                         if getattr(msg, "media", None):
-                            # ── Pre-migrate to the file's DC before downloading ──
+                                                                                   
                             try:
                                 _file_dc = _extract_file_dc_id(msg)
                                 if _file_dc is not None:
@@ -1737,7 +1737,7 @@ async def download_bytes_via_userbot(
                                         _file_dc,
                                     )
                                     await _client._set_connection_dc(_file_dc)
-                            except Exception:  # nosec B110
+                            except Exception:              
                                 pass
 
                             for attempt in range(3):
@@ -1776,7 +1776,7 @@ async def download_bytes_via_userbot(
                 finally:
                     try:
                         await _client.disconnect()
-                    except Exception:  # nosec B110
+                    except Exception:              
                         pass
         except Exception as e:
             logger.warning(
@@ -1784,7 +1784,7 @@ async def download_bytes_via_userbot(
                 e,
             )
 
-    # ── 2) Pyrogram fallback ──
+                                
     _pyro_session = await get_pyrogram_session_string_for_user(user_id=user_id)
     if PyrogramClient is not None and _pyro_session:
         try:
