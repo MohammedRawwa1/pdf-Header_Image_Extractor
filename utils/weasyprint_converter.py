@@ -74,11 +74,6 @@ _C0_CONTROL_RE = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 # A chapter with more than this fraction of control bytes is binary garbage,
 # not book content — parsed it would render as mojibake/replacement chars.
 _MAX_CONTROL_RATIO = 0.02
-# Files whose bytes count as "image content" for the text-heavy heuristic.
-_IMAGE_EXTS = (
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
-    ".svg", ".avif",
-)
 # A merged document with less than this much text AND no images is blank.
 _MIN_MERGE_TEXT_CHARS = 20
 # A rendered PDF under this size is immediately suspect (a real book embeds
@@ -199,41 +194,6 @@ def weasyprint_available() -> bool:
         return True
     except Exception:
         return False
-
-
-def epub_image_weight(epub_path: str) -> tuple[int, int]:
-    """Return ``(uncompressed_total_bytes, image_bytes)`` for an EPUB.
-
-    ``(0, 0)`` on unreadable files — callers treat that as "not text-heavy".
-    """
-    total = images = 0
-    try:
-        with zipfile.ZipFile(epub_path) as zf:
-            for info in zf.infolist():
-                total += info.file_size
-                if info.filename.lower().endswith(_IMAGE_EXTS):
-                    images += info.file_size
-    except Exception:
-        return 0, 0
-    return total, images
-
-
-def epub_is_text_heavy(
-    epub_path: str,
-    image_bytes_limit: int = 8 * 1024 * 1024,
-    image_ratio_limit: float = 0.35,
-) -> bool:
-    """True when an EPUB is text-dominated (fast + faithful via WeasyPrint).
-
-    Image-heavy books (photo albums, most fixed-layout EPUBs) are rejected so
-    they keep Calibre's page rendering.  Unreadable files are rejected.
-    """
-    total, images = epub_image_weight(epub_path)
-    if total <= 0:
-        return False
-    if images >= image_bytes_limit:
-        return False
-    return (images / total) <= image_ratio_limit
 
 
 def _parse_epub_spine(epub_path: str) -> tuple[str, list[str], str]:
@@ -729,13 +689,16 @@ def convert_epub_to_pdf_fast(
 ) -> bool:
     """Convert an EPUB to PDF, preferring the fast WeasyPrint path.
 
-    WeasyPrint is used only when: installed, enabled (``EPUB_FAST_CONVERT_ENABLED``)
-    and the EPUB is heuristically text-heavy.  Any failure anywhere — an empty
-    merge, a blank rendered PDF, a parse error, a timeout — falls back to the
-    Calibre path, so this function can only ever be as good as the status quo,
-    never worse.  Thumbnail behavior mirrors
-    ``convert_book_to_pdf_with_thumbnail`` (cover via ``ebook-meta``, else a
-    preview of the produced PDF's first page).
+    WeasyPrint is always tried first when installed and enabled
+    (``EPUB_FAST_CONVERT_ENABLED``).  Any failure anywhere — an empty
+    merge, a blank rendered PDF, a parse error, a timeout — falls back to
+    the Calibre path, so this function can only ever be as good as the
+    status quo, never worse.  Image-heavy books that WeasyPrint can't
+    render cleanly also fall back to Calibre automatically.
+
+    Thumbnail behavior mirrors ``convert_book_to_pdf_with_thumbnail``
+    (cover via ``ebook-meta``, else a preview of the produced PDF's
+    first page).
     """
     import config as _cfg
 
@@ -753,25 +716,6 @@ def convert_epub_to_pdf_fast(
             input_path, pdf_path, thumb_path, timeout, cancel_check
         )
     if not getattr(_cfg, "EPUB_FAST_CONVERT_ENABLED", True):
-        return _calibre_fallback(
-            input_path, pdf_path, thumb_path, timeout, cancel_check
-        )
-    try:
-        if not epub_is_text_heavy(
-            input_path,
-            image_bytes_limit=getattr(
-                _cfg, "EPUB_FAST_IMAGE_BYTES_LIMIT", 8 * 1024 * 1024
-            ),
-        ):
-            logger.info(
-                "weasyprint: %s is image-heavy; using Calibre",
-                os.path.basename(input_path),
-            )
-            return _calibre_fallback(
-                input_path, pdf_path, thumb_path, timeout, cancel_check
-            )
-    except Exception as exc:  # nosec B110 - heuristic failure falls back
-        logger.warning("weasyprint: heuristic failed (%s); using Calibre", exc)
         return _calibre_fallback(
             input_path, pdf_path, thumb_path, timeout, cancel_check
         )

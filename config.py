@@ -172,18 +172,13 @@ BOOK_CONVERT_TIMEOUT_SECONDS: int = int(
 # How long a pending "What should I do with this file?" choice stays valid.
 BOOK_ASK_TTL_SECONDS: int = int(os.getenv("BOOK_ASK_TTL_SECONDS", "600"))
 # ── Fast EPUB→PDF (WeasyPrint) ────────────────────────────────────────────
-# When enabled, TEXT-HEAVY EPUBs convert to PDF via WeasyPrint (Pango-based;
+# When enabled, ALL EPUBs are attempted via WeasyPrint first (Pango-based;
 # typically 3-10x faster than Calibre's Chromium-per-page rendering).
-# Image-heavy EPUBs always stay on Calibre; any WeasyPrint failure also falls
-# back to Calibre, so enabling this can never regress a conversion.
+# Any WeasyPrint failure — empty merge, blank render, timeout — falls back
+# to Calibre, so enabling this can never regress a conversion.
 EPUB_FAST_CONVERT_ENABLED: bool = os.getenv(
     "EPUB_FAST_CONVERT_ENABLED", "true"
 ).lower() in ("1", "true", "yes")
-# An EPUB with MORE uncompressed image bytes than this is treated as
-# image-heavy and routed to Calibre regardless of ratio.
-EPUB_FAST_IMAGE_BYTES_LIMIT: int = int(
-    os.getenv("EPUB_FAST_IMAGE_BYTES_LIMIT", str(8 * 1024 * 1024))
-)
 # When the fast path gives up because the content was unreadable (an empty
 # merge or a blank render — usually a structurally-broken book, not DRM),
 # the Calibre fallback is capped at this budget instead of inheriting the
