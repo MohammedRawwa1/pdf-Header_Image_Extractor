@@ -66,6 +66,14 @@ _DOCTYPE_RE = re.compile(
 # Content media types accepted in the spine.  EPUB3 XHTML carries
 # ``application/xhtml+xml``; older books may use ``text/html``.
 _CONTENT_PREFIXES = ("application/xhtml", "text/html")
+# C0 control bytes (NUL and friends; tab/LF/CR are legitimate whitespace).
+# Real text chapters — UTF-8, latin-1, windows-1252, the encodings the
+# parser honors — contain essentially none of these; corrupt/truncated EPUB
+# chapters (binary stream data that slipped into the zip) are full of them.
+_C0_CONTROL_RE = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# A chapter with more than this fraction of control bytes is binary garbage,
+# not book content — parsed it would render as mojibake/replacement chars.
+_MAX_CONTROL_RATIO = 0.02
 # Files whose bytes count as "image content" for the text-heavy heuristic.
 _IMAGE_EXTS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
@@ -147,11 +155,30 @@ def _decode_chapter(raw: bytes) -> bytes | str:
         return raw
 
 
+def _is_binary_garbage(raw: bytes) -> bool:
+    """True when chapter bytes look like binary data, not text.
+
+    The lenient HTML5 parser happily turns binary garbage into a ``<body>``
+    of mojibake (latin-1-ish decoding) or U+FFFD replacement chars, which
+    would render as a garbage page instead of falling back to Calibre.
+    NUL/C0 control bytes are the universal marker: they never appear in
+    real chapter text in ANY encoding this pipeline honors, and are
+    ubiquitous in corrupt/truncated binary content.
+    """
+    if not raw:
+        return True
+    return len(_C0_CONTROL_RE.findall(raw)) / len(raw) > _MAX_CONTROL_RATIO
+
+
 def _parse_content_html(raw: bytes) -> ET.Element | None:
     """Parse a chapter's content, preferring the lenient HTML5 parser.
 
     Returns the parsed root element (namespaced), or None when unparseable.
+    Binary-garbage chapters are rejected up front so they can never render
+    as mojibake (the caller falls back to Calibre instead).
     """
+    if _is_binary_garbage(raw):
+        return None
     parser = _get_lenient_parser()
     if parser is None:
         try:
@@ -341,6 +368,10 @@ _RAW_BODY_RE = re.compile(
     rb"<body[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL
 )
 _TAG_RE = re.compile(rb"<[^>]+>")
+_TAG_TEXT_RE = re.compile(r"<[^>]+>")
+# A salvage counts as meaningful only when at least this fraction of its
+# characters are real printable text (not replacement chars / control bytes).
+_MIN_SALVAGE_MEANINGFUL_RATIO = 0.5
 # head/style/script/title blocks must never count as book content during
 # the no-body salvage (titles, CSS, and JS are not the book's text).
 _SKIP_REGION_RE = re.compile(
@@ -390,6 +421,24 @@ def _rebase_salvaged_refs(markup: str, chapter_dir: str, opf_dir: str) -> str:
     )
 
 
+def _is_garbage_text(decoded: str) -> bool:
+    """True when decoded chapter content is mostly binary garbage.
+
+    A corrupt/truncated chapter decodes (``errors="replace"``) into runs of
+    U+FFFD replacement characters plus stray control bytes — that is NOT
+    book text, and rendering it would silently deliver a page of ``\ufffd``.
+    A salvage is accepted only when at least half its characters (tags
+    stripped) are real printable text.
+    """
+    plain = _TAG_TEXT_RE.sub("", decoded)
+    if not plain:
+        return True
+    meaningful = sum(
+        1 for ch in plain if ch.isprintable() and ch != "\ufffd"
+    )
+    return meaningful / len(plain) < _MIN_SALVAGE_MEANINGFUL_RATIO
+
+
 def _salvage_raw_body(raw: bytes) -> str | None:
     """Extract a chapter's raw content when both parsers fail.
 
@@ -400,17 +449,25 @@ def _salvage_raw_body(raw: bytes) -> str | None:
     empty we fall back to stripping head/style/script blocks and ALL tags
     from the whole chapter and returning the plain text (entity-unescaped,
     re-escaped, wrapped in ``<p>``) — a plain-text page beats a silently
-    dropped chapter, but CSS/JS/titles can't fake a salvage.  Returns None
-    only when nothing meaningful can be salvaged.
+    dropped chapter, but CSS/JS/titles can't fake a salvage.  Content that
+    is mostly binary garbage (replacement chars / control bytes) is NEVER
+    salvaged — a corrupted chapter must fall back to Calibre, not deliver a
+    page of ``\ufffd``.  Returns None only when nothing meaningful can be
+    salvaged.
     """
+    if _is_binary_garbage(raw):
+        return None
     m = _RAW_BODY_RE.search(raw)
     if m:
         inner = m.group(1)
         if inner.strip():
             decoded = _decode_chapter(inner)
             if isinstance(decoded, bytes):
-                return decoded.decode("utf-8", errors="replace")
-            return decoded
+                decoded = decoded.decode("utf-8", errors="replace")
+            if not _is_garbage_text(decoded):
+                return decoded
+            # Binary-garbage <body> — fall through to the whole-document
+            # salvage below (it rejects the same garbage and returns None).
         # Empty <body> region — fall through to the whole-document salvage
         # (with head/style/script removed) so content spilled AFTER
         # ``</body>`` is still rescued, while ``<title>`` never is.
@@ -424,7 +481,7 @@ def _salvage_raw_body(raw: bytes) -> str | None:
     if isinstance(decoded, bytes):
         decoded = decoded.decode("utf-8", errors="replace")
     text = html.unescape(decoded).strip()
-    if not text:
+    if not text or _is_garbage_text(text):
         return None
     # Re-escape: stray < > left behind by the tag-strip must not be parsed
     # as markup when the text is injected into the merged document.
@@ -522,9 +579,13 @@ def _merged_html_is_blank(html: str) -> bool:
     chapters are ALL unparseable yields an empty body — WeasyPrint would
     render a single blank page (a silent wrong-success).  Detected BEFORE
     rendering so the caller falls back to Calibre instead of delivering an
-    empty PDF.
+    empty PDF.  Corrupt chapters decode (or are parsed by the lenient HTML5
+    parser) into runs of U+FFFD replacement characters — those are NOT book
+    content and never count toward "meaningful" (a page of ``\ufffd`` must
+    not ship as a successful conversion).
     """
-    text = re.sub(r"<[^>]+>", "", html).strip()
+    text = re.sub(r"<[^>]+>", "", html)
+    text = "".join(ch for ch in text if ch != "\ufffd").strip()
     if len(text) >= _MIN_MERGE_TEXT_CHARS:
         return False
     lowered = html.lower()
@@ -627,8 +688,11 @@ def _pdf_is_degenerate(pdf_path: str) -> bool:
 
         doc = fitz.open(pdf_path)
         try:
+            # U+FFFD replacement chars from corrupt source chapters are NOT
+            # content — a page of ``\ufffd`` must not defeat the blank check.
             text_len = sum(
-                len(page.get_text().strip()) for page in doc
+                len("".join(ch for ch in page.get_text() if ch != "\ufffd").strip())
+                for page in doc
             )
             image_count = sum(
                 len(page.get_images(full=True)) for page in doc

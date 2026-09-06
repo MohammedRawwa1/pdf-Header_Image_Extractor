@@ -59,6 +59,17 @@ _DRM_DOCTYPE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Font files are the ONE legitimate non-DRM use of META-INF/encryption.xml:
+# IDPF font obfuscation ("http://www.idpf.org/2008/embedding") encrypts only
+# the embedded fonts with a key derived from the book's own UUID, and every
+# EPUB reader (and Calibre) transparently de-obfuscates them.  An encryption
+# manifest that references ONLY fonts is therefore NOT DRM and must never be
+# flagged.  (Extensions per the EPUB 3 spec's allowed obfuscated font types.)
+_FONT_EXTS: tuple[str, ...] = (
+    ".ttf", ".otf", ".ttc", ".woff", ".woff2", ".eot", ".pfb", ".pfm",
+    ".dfont",
+)
+
 
 def epub_is_drm_protected(epub_path: str) -> bool:
     """True when an EPUB encrypts its CONTENT (Adobe-ADEPT-style DRM).
@@ -67,9 +78,12 @@ def epub_is_drm_protected(epub_path: str) -> bool:
     encrypts ONLY font files — that is NOT DRM and must not be flagged.
     A book counts as DRM-protected when its encryption manifest references
     content documents (``.xhtml``/``.html``/``.htm``, fragments/query
-    stripped) — the ADEPT signature.  ``rights.xml`` alone is not treated
-    as proof (some non-DRM books carry a rights declaration); it only
-    corroborates when an encryption manifest is also present.
+    stripped) — the ADEPT signature.  Font CipherReferences are NEVER
+    counted as evidence: an EPUB whose only encrypted resources are fonts is
+    font-obfuscated (readable by every reader), not DRM.  ``rights.xml``
+    alone is not treated as proof (some non-DRM books carry a rights
+    declaration); it only corroborates when the manifest also encrypts a
+    NON-font resource under an unconventional URI scheme.
     """
     has_rights = False
     try:
@@ -94,12 +108,18 @@ def epub_is_drm_protected(epub_path: str) -> bool:
             uri = uri.split("#", 1)[0].split("?", 1)[0].rstrip("/")
             if not uri:
                 continue
-            found_any_ref = True
             if uri.endswith(content_exts):
                 return True
+            if uri.endswith(_FONT_EXTS):
+                # Font obfuscation is NOT DRM (IDPF embedding scheme) — it
+                # must neither trigger nor corroborate a DRM flag.
+                continue
+            found_any_ref = True
         # ADEPT always ships rights.xml alongside the encryption manifest;
         # an encrypted manifest + rights.xml is the classic DRM signature
-        # even when the URI scheme is unconventional.
+        # even when the URI scheme is unconventional (content refs that do
+        # not carry a conventional content extension).  Font refs are already
+        # excluded above, so font-obfuscated books never trip this check.
         if has_rights and found_any_ref:
             return True
     except Exception:  # nosec B110 - unparseable manifest is not proof
@@ -108,6 +128,108 @@ def epub_is_drm_protected(epub_path: str) -> bool:
             os.path.basename(epub_path),
         )
     return False
+
+# Kindle-family formats whose DRM is detectable from the PalmDoc/MOBI header.
+_KINDLE_FORMATS = {"mobi", "azw", "azw3", "prc"}
+
+
+def _kindle_is_drm_protected(book_path: str) -> bool:
+    """True when a MOBI/AZW/AZW3/PRC carries Mobipocket DRM.
+
+    Kindle books are PalmDOC containers whose first record carries a MOBI
+    header.  The DRM Offset/Count fields (MOBI-header offsets 0x98/0x9C) are
+    the canonical Mobipocket-DRM signature: a real DRM offset with a
+    positive DRM count means the book is encrypted.  Unprotected books carry
+    ``DRM Offset == 0xFFFFFFFF`` with ``DRM Count == 0`` (and old/short
+    headers have no DRM fields at all).  Calibre has no Kindle DRM plugin in
+    this container, so a protected book would otherwise churn until the full
+    conversion timeout — fail fast instead.
+    """
+    try:
+        with open(book_path, "rb") as fh:
+            head = fh.read(256)
+    except Exception:  # nosec B110 - unreadable file is not proof of DRM
+        return False
+    # PalmDOC header is 78 bytes; the MOBI header (with its 'MOBI' magic at
+    # file offset 0x4E) follows.  Need through DRM Count (0x4E + 0xA0).
+    if len(head) < 0x4E + 0xA0:
+        return False
+    # PalmDOC type/creator at 0x3C/0x40 ('BOOK'/'MOBI'), then the 'MOBI'
+    # magic at 0x4E — anything else is not a Kindle book.
+    if (
+        head[0x3C:0x40] != b"BOOK"
+        or head[0x40:0x44] != b"MOBI"
+        or head[0x4E:0x52] != b"MOBI"
+    ):
+        return False
+    header_len = int.from_bytes(head[0x52:0x56], "big")
+    if header_len < 0xA0:
+        # Old/short MOBI header without DRM fields — no DRM signature.
+        return False
+    drm_offset = int.from_bytes(head[0x4E + 0x98: 0x4E + 0x9C], "big")
+    drm_count = int.from_bytes(head[0x4E + 0x9C: 0x4E + 0xA0], "big")
+    return drm_count > 0 and drm_offset != 0xFFFFFFFF
+
+
+def book_is_drm_protected(book_path: str, ext: str | None = None) -> bool:
+    """True when ``book_path`` carries detectable DRM for its format.
+
+    EPUB uses the ADEPT encryption-manifest check; MOBI/AZW/AZW3/PRC use the
+    Mobipocket DRM header fields.  Best-effort by design: unreadable files,
+    unknown formats and formats without a header signature (FB2/DOCX/RTF/
+    TXT/...) return False and the converter proceeds (they either have no
+    DRM in practice or Calibre fails naturally).
+    """
+    fmt = _normalize_ext(ext or os.path.splitext(book_path)[1])
+    if fmt == "epub":
+        return epub_is_drm_protected(book_path)
+    if fmt in _KINDLE_FORMATS:
+        return _kindle_is_drm_protected(book_path)
+    return False
+
+
+# ── Magic-byte validation for the Calibre path ───────────────────────────
+# Formats with a strong, unambiguous header signature.  A file whose bytes
+# do NOT match its extension is corrupt, truncated or mislabeled — refuse it
+# fast instead of letting ebook-convert churn or emit a confusing error.
+# Formats without a reliable signature (txt/html/snb/tcr) are not validated.
+_MAGIC_PDF = b"%PDF"
+_MAGIC_ZIP = b"PK\x03\x04"
+_MAGIC_OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _magic_matches(book_path: str, ext: str) -> bool:
+    """True when ``book_path``'s first bytes match ``ext``'s signature.
+
+    Conservative by design — only the formats listed below are checked, and
+    each check accepts the full range of headers the format actually allows
+    (e.g. ``%PDF`` anywhere in the first 1KB, ``<?xml`` after an optional
+    BOM/whitespace for FB2).  Returns False only for a definitive mismatch.
+    """
+    try:
+        with open(book_path, "rb") as fh:
+            head = fh.read(1024)
+    except Exception:  # nosec B110 - unreadable file fails the check
+        return False
+    if not head:
+        return False
+    if ext == "pdf":
+        return _MAGIC_PDF in head
+    if ext in ("epub", "docx", "odt"):
+        return head.startswith(_MAGIC_ZIP)
+    if ext == "lit":
+        return head.startswith(_MAGIC_OLE2)
+    if ext == "rtf":
+        return head.lstrip(b"\xef\xbb\xbf ").startswith(b"{\\rtf")
+    if ext == "fb2":
+        stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+        return stripped.startswith((b"<?xml", b"<FictionBook"))
+    if ext in _KINDLE_FORMATS:
+        return head[0x3C:0x44] == b"BOOKMOBI"
+    if ext == "pdb":
+        return head[0x3C:0x44] in (b"BOOKMOBI", b"TEXtREAd")
+    return True  # no signature defined -> never refuse
+
 
 # ── Calibre format support (from Calibre's conversion docs) ──────────────
 # Input formats Calibre can READ.
@@ -245,13 +367,24 @@ def convert_ebook(
             output_path,
         )
         return False
-    # DRM-protected EPUBs are a guaranteed timeout: Calibre has no Adobe DRM
-    # plugin in the container, so ebook-convert churns until its timeout.
-    # Fail fast with a clear error instead of burning the whole budget.
-    if _normalize_ext(os.path.splitext(input_path)[1]) == "epub" and (
-        epub_is_drm_protected(input_path)
-    ):
-        raise DRMProtectedError(f"DRM-protected EPUB: {input_path}")
+    ext = _normalize_ext(os.path.splitext(input_path)[1])
+    # Fail fast on files whose bytes don't match their extension (corrupt,
+    # truncated or mislabeled downloads) — ebook-convert would otherwise
+    # churn or emit a confusing error for a file that can never convert.
+    if not _magic_matches(input_path, ext):
+        logger.warning(
+            "convert_ebook: %s does not match its .%s signature; "
+            "refusing conversion",
+            os.path.basename(input_path),
+            ext,
+        )
+        return False
+    # Fail fast on DRM-encrypted books of ANY detectable format: Calibre has
+    # no decryption plugin in the container (Adobe ADEPT for EPUB, Mobipocket
+    # for Kindle), so ebook-convert would churn until its timeout.  Raise so
+    # callers show the clear "DRM-protected" message instead.
+    if book_is_drm_protected(input_path, ext):
+        raise DRMProtectedError(f"DRM-protected book: {input_path}")
     exe = shutil.which("ebook-convert")
     if not exe:
         logger.warning("convert_ebook: ebook-convert not found on PATH")
