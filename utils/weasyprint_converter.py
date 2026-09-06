@@ -12,6 +12,8 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
+from functools import lru_cache
+from io import BytesIO
 
 from defusedxml import ElementTree
 
@@ -34,6 +36,29 @@ _MAX_CONTROL_RATIO = 0.02
 _MIN_MERGE_TEXT_CHARS = 20
 _MIN_PDF_BYTES = 8 * 1024
 _MIN_PDF_TEXT_CHARS = 40
+_MIN_PAGE_DIM_PT = 150.0
+_MAX_PAGE_DIM_PT = 1400.0
+_PAGE_OVERFLOW_TOLERANCE_PT = 5.0
+
+_PX_PER_MM = 96.0 / 25.4
+_CSS_UNIT_PX = {
+    "px": 1.0,
+    "pt": 96.0 / 72.0,
+    "pc": 16.0,
+    "in": 96.0,
+    "cm": 96.0 / 2.54,
+    "mm": _PX_PER_MM,
+    "q": 96.0 / 101.6,
+}
+_NAMED_PAGE_SIZES_PX: dict[str, tuple[float, float]] = {
+    "a3": (297.0 * _PX_PER_MM, 420.0 * _PX_PER_MM),
+    "a4": (210.0 * _PX_PER_MM, 297.0 * _PX_PER_MM),
+    "a5": (148.0 * _PX_PER_MM, 210.0 * _PX_PER_MM),
+    "b4": (250.0 * _PX_PER_MM, 353.0 * _PX_PER_MM),
+    "b5": (176.0 * _PX_PER_MM, 250.0 * _PX_PER_MM),
+    "letter": (8.5 * 96.0, 11.0 * 96.0),
+    "legal": (8.5 * 96.0, 14.0 * 96.0),
+}
 _XML_ENCODING_RE = re.compile(
     rb"<\?xml[^>]*encoding=[\"']([A-Za-z0-9._-]+)[\"']", re.IGNORECASE
 )
@@ -49,6 +74,10 @@ _UNCLOSED_REGION_RE = re.compile(
 )
 _SALVAGED_REF_RE = re.compile(
     rb"(?P<attr>\b(?:src|href)\s*=\s*)(?P<quote>['\"])(?P<url>[^'\"]+)",
+    re.IGNORECASE,
+)
+_CSS_URL_RE = re.compile(
+    r"url\s*\(\s*(?P<quote>['\"]?)(?P<url>[^'\")]+)(?P=quote)\s*\)",
     re.IGNORECASE,
 )
 
@@ -170,7 +199,11 @@ def _parse_epub_spine(epub_path: str) -> tuple[str, list[str], str]:
                 continue
             for style in ctree.findall(".//{*}style"):
                 if style.text and style.text.strip():
-                    styles.append(style.text)
+                    styles.append(
+                        _rebase_css_urls(
+                            style.text, posixpath.dirname(content_path), opf_dir
+                        )
+                    )
     return opf_dir, spine, "\n".join(styles)
 
 
@@ -204,6 +237,24 @@ def _resolve_ref(href: str, chapter_dir: str, opf_dir: str) -> str:
         return posixpath.relpath(full, opf_dir)
     except ValueError:
         return href
+
+
+def _rebase_css_urls(css: str, chapter_dir: str, opf_dir: str) -> str:
+    """Rewrite url(...) refs in a chapter's <style> block to be opf_dir-relative.
+
+    CSS url() inside an XHTML file resolves against that chapter's directory,
+    so it must be rebased before all chapter styles are concatenated into one
+    blob rendered with base_url = opf_dir.
+    """
+
+    def _sub(m: re.Match[str]) -> str:
+        url = m.group("url").strip()
+        if not url or url.startswith(("#", "data:", "/")) or "://" in url:
+            return m.group(0)
+        rebased = _resolve_ref(url, chapter_dir, opf_dir)
+        return f"url({m.group('quote')}{rebased}{m.group('quote')})"
+
+    return _CSS_URL_RE.sub(_sub, css)
 
 
 def _rebase_salvaged_refs(markup: str, chapter_dir: str, opf_dir: str) -> str:
@@ -249,11 +300,197 @@ def _salvage_raw_body(raw: bytes) -> str | None:
     return f"<p>{html.escape(text)}</p>"
 
 
+def _css_length_to_px(value: str) -> float | None:
+    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(px|pt|pc|in|cm|mm|q)?\s*$", value, re.IGNORECASE)
+    if not m:
+        return None
+    return float(m.group(1)) * _CSS_UNIT_PX[(m.group(2) or "px").lower()]
+
+
+def _css_horizontal_margin_px(margin_css: str) -> float | None:
+    parts = margin_css.strip().split()
+    if not parts:
+        return None
+    if len(parts) >= 2:
+        return _css_length_to_px(parts[1])
+    return _css_length_to_px(parts[0])
+
+
+def _page_size_px(size_css: str) -> tuple[float, float] | None:
+    parts = size_css.strip().lower().split()
+    landscape = False
+    if len(parts) >= 2 and parts[-1] in ("landscape", "portrait"):
+        landscape = parts[-1] == "landscape"
+        parts = parts[:-1]
+    if not parts:
+        return None
+    if len(parts) == 1 and parts[0] in _NAMED_PAGE_SIZES_PX:
+        size = _NAMED_PAGE_SIZES_PX[parts[0]]
+    elif len(parts) == 2:
+        w = _css_length_to_px(parts[0])
+        h = _css_length_to_px(parts[1])
+        if w is None or h is None:
+            return None
+        size = (w, h)
+    else:
+        return None
+    return (size[1], size[0]) if landscape else size
+
+
+@lru_cache(maxsize=1)
+def _render_page_config() -> tuple[str, float]:
+    """Return the @page CSS rule and printable content width (px) for images.
+
+    The @page rule is appended after the EPUB's own <style> blocks so it wins
+    the cascade: an ebook image is never allowed to determine a page dimension
+    larger than the printable page.
+    """
+    import config as _cfg
+    size_css = str(getattr(_cfg, "EPUB_PAGE_SIZE", "A4") or "A4").strip()
+    margin_css = str(getattr(_cfg, "EPUB_PAGE_MARGIN", "15mm") or "15mm").strip()
+    page_css = f"@page {{ size: {size_css}; margin: {margin_css}; }} "
+    margin_px = _css_horizontal_margin_px(margin_css)
+    if margin_px is None:
+        margin_px = 15.0 * _PX_PER_MM
+    size_px = _page_size_px(size_css)
+    if size_px is None:
+        content_w = 680.0
+    else:
+        content_w = size_px[0] - 2.0 * margin_px
+        if content_w <= 0.0:
+            content_w = 680.0
+    return page_css, content_w
+
+
+def _normalize_raster_image(
+    elem: ET.Element,
+    zf: zipfile.ZipFile,
+    zip_path: str,
+    image_dir: str,
+    resolved_ref: str,
+) -> None:
+    """Bound every raster image to the printable page width; downsample the
+    pathological ones so no image can force right-edge clipping or bloat the
+    PDF past Telegram's upload limit. Non-raster / unreadable images are left
+    to the CSS backstop in _build_merged_html."""
+    if not resolved_ref or resolved_ref.startswith(("#", "/", "data:")) or "://" in resolved_ref:
+        return
+    safe = posixpath.normpath(zip_path)
+    if not safe or safe.startswith("..") or safe.startswith("/"):
+        return
+    try:
+        raw = zf.read(safe)
+    except (KeyError, OSError):
+        return
+    try:
+        from PIL import Image
+        im = Image.open(BytesIO(raw))
+        width, height = im.size
+    except Exception:
+        return
+    if width <= 0 or height <= 0:
+        return
+    _page_css, content_w = _render_page_config()
+    max_w = int(round(content_w))
+    if max_w <= 0:
+        return
+    existing = (elem.get("style") or "").strip()
+    inline = f"max-width:{max_w}px;min-width:0;height:auto;"
+    elem.set("style", f"{existing};{inline}" if existing else inline)
+    new_ref = _downsample_image(zf, zip_path, image_dir, resolved_ref)
+    if new_ref:
+        if elem.tag == "image":
+            elem.set("href", new_ref)
+        else:
+            elem.set("src", new_ref)
+
+
+def _downsample_image(
+    zf: zipfile.ZipFile,
+    zip_path: str,
+    image_dir: str,
+    resolved_ref: str,
+) -> str | None:
+    """Re-encode a raster wider than the downsample threshold to ~2x the
+    printable page width; return the new opf_dir-relative ref, or None when
+    the image is small enough, unreadable, or already at a sane size."""
+    safe = posixpath.normpath(zip_path)
+    if not safe or safe.startswith("..") or safe.startswith("/"):
+        return None
+    try:
+        raw = zf.read(safe)
+    except (KeyError, OSError):
+        return None
+    try:
+        from PIL import Image
+        im = Image.open(BytesIO(raw))
+        width, height = im.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    _page_css, content_w = _render_page_config()
+    try:
+        import config as _cfg
+        min_w = int(getattr(_cfg, "EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", 3000) or 3000)
+        quality = int(getattr(_cfg, "EPUB_IMAGE_JPEG_QUALITY", 85) or 85)
+    except Exception:
+        min_w, quality = 3000, 85
+    if width <= min_w:
+        return None
+    target_w = int(round(min(width, content_w * 2.0)))
+    if target_w >= width:
+        return None
+    target_h = max(1, int(round(height * target_w / width)))
+    try:
+        if "A" in im.getbands():
+            rgba = im.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            im = Image.alpha_composite(bg, rgba).convert("RGB")
+        else:
+            im = im.convert("RGB")
+        im = im.resize((target_w, target_h), Image.LANCZOS)
+        stem = os.path.splitext(os.path.basename(resolved_ref))[0]
+        new_ref = posixpath.join(posixpath.dirname(resolved_ref), f"{stem}.wp.jpg")
+        out_path = os.path.join(image_dir, *new_ref.split("/"))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        im.save(out_path, "JPEG", quality=quality, optimize=True)
+        return new_ref
+    except Exception as exc:
+        logger.debug("weasyprint: image downsampling skipped for %s: %s", resolved_ref, exc)
+        return None
+
+
+def _normalize_css_backgrounds(
+    styles: str,
+    zf: zipfile.ZipFile,
+    opf_dir: str,
+    image_dir: str,
+) -> str:
+    """Downsample oversized raster files referenced via CSS url() so giant
+    background images don't bloat the PDF. The urls were already rebased to
+    be opf_dir-relative when the chapter styles were collected."""
+
+    def _sub(m: re.Match[str]) -> str:
+        url = m.group("url").strip()
+        if not url or url.startswith(("#", "data:", "/")) or "://" in url:
+            return m.group(0)
+        new_ref = _downsample_image(
+            zf, posixpath.join(opf_dir, url), image_dir, url
+        )
+        if new_ref:
+            return f"url({m.group('quote')}{new_ref}{m.group('quote')})"
+        return m.group(0)
+
+    return _CSS_URL_RE.sub(_sub, styles)
+
+
 def _build_merged_html(
     epub_path: str,
     content_paths: list[str],
     styles: str,
     opf_dir: str,
+    image_dir: str | None = None,
 ) -> str:
     bodies: list[str] = []
     parsed = salvaged = failed = 0
@@ -285,21 +522,35 @@ def _build_merged_html(
                 if tag in ("img", "source"):
                     src = elem.get("src")
                     if src:
-                        elem.set("src", _resolve_ref(src, chapter_dir, opf_dir))
+                        resolved = _resolve_ref(src, chapter_dir, opf_dir)
+                        elem.set("src", resolved)
+                        if tag == "img" and image_dir:
+                            _normalize_raster_image(
+                                elem, zf, posixpath.join(opf_dir, resolved), image_dir, resolved
+                            )
                 elif tag == "image":
                     src = elem.get("href") or elem.get("src")
                     if src:
-                        elem.set("href", _resolve_ref(src, chapter_dir, opf_dir))
+                        resolved = _resolve_ref(src, chapter_dir, opf_dir)
+                        elem.set("href", resolved)
+                        if image_dir:
+                            _normalize_raster_image(
+                                elem, zf, posixpath.join(opf_dir, resolved), image_dir, resolved
+                            )
             bodies.append(ET.tostring(clean, encoding="unicode"))
+        if image_dir and styles:
+            styles = _normalize_css_backgrounds(styles, zf, opf_dir, image_dir)
     if failed:
         logger.warning(
             "weasyprint: merge for %s: %d parsed, %d salvaged, %d failed (of %d spine chapters)",
             os.path.basename(epub_path), parsed, salvaged, failed, len(content_paths),
         )
     style_block = f"<style>{styles}</style>" if styles else ""
+    page_css, _content_w = _render_page_config()
     _wp_fix = (
         "<style>"
-        "img, image, svg { max-width: 100%%; height: auto; } "
+        f"{page_css}"
+        "img, image, svg { max-width: 100%; height: auto; } "
         "img, image { margin-left: 0 !important; margin-right: 0 !important; } "
         "body { margin: 0; padding: 0; } "
         "</style>"
@@ -380,23 +631,201 @@ def _render_weasyprint(
     return True
 
 
-def _pdf_is_degenerate(pdf_path: str) -> bool:
+def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
+    """Return a reason string when the rendered PDF looks broken, else None.
+
+    Catches blank output, suspiciously large page dimensions, and text/images
+    spilling past the page box (right-edge clipping). Any hit routes the book
+    to the Calibre fallback."""
     try:
-        if os.path.getsize(pdf_path) > _MIN_PDF_BYTES:
-            return False
+        size = os.path.getsize(pdf_path)
+        if size == 0:
+            return "empty PDF file"
         import fitz
         doc = fitz.open(pdf_path)
         try:
-            text_len = sum(
-                len("".join(ch for ch in page.get_text() if ch != "\ufffd").strip())
-                for page in doc
-            )
-            image_count = sum(len(page.get_images(full=True)) for page in doc)
-            return text_len < _MIN_PDF_TEXT_CHARS and image_count == 0
+            if doc.page_count == 0:
+                return "PDF has zero pages"
+            total_text = 0
+            total_images = 0
+            for page in doc:
+                pr = page.rect
+                if (
+                    pr.width < _MIN_PAGE_DIM_PT
+                    or pr.height < _MIN_PAGE_DIM_PT
+                    or pr.width > _MAX_PAGE_DIM_PT
+                    or pr.height > _MAX_PAGE_DIM_PT
+                ):
+                    return (
+                        f"page size {pr.width:.0f}x{pr.height:.0f}pt outside "
+                        f"{_MIN_PAGE_DIM_PT:.0f}-{_MAX_PAGE_DIM_PT:.0f}pt"
+                    )
+                text_dict = page.get_text("dict")
+                for block in text_dict.get("blocks", []):
+                    bbox = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
+                    if (
+                        bbox.x0 < -_PAGE_OVERFLOW_TOLERANCE_PT
+                        or bbox.y0 < -_PAGE_OVERFLOW_TOLERANCE_PT
+                        or bbox.x1 > pr.x1 + _PAGE_OVERFLOW_TOLERANCE_PT
+                        or bbox.y1 > pr.y1 + _PAGE_OVERFLOW_TOLERANCE_PT
+                    ):
+                        return f"text overflows the page box on page {page.number + 1}"
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            total_text += sum(
+                                1 for ch in span.get("text", "") if ch != "\ufffd"
+                            )
+                for img in page.get_images(full=True):
+                    total_images += 1
+                    for rect in page.get_image_rects(img[0]):
+                        if (
+                            rect.x0 < -_PAGE_OVERFLOW_TOLERANCE_PT
+                            or rect.y0 < -_PAGE_OVERFLOW_TOLERANCE_PT
+                            or rect.x1 > pr.x1 + _PAGE_OVERFLOW_TOLERANCE_PT
+                            or rect.y1 > pr.y1 + _PAGE_OVERFLOW_TOLERANCE_PT
+                        ):
+                            return f"image overflows the page box on page {page.number + 1}"
+            if size <= _MIN_PDF_BYTES and total_text < _MIN_PDF_TEXT_CHARS and total_images == 0:
+                return f"blank render ({size} bytes, no text or images)"
+            return None
         finally:
             doc.close()
+    except Exception as exc:
+        return f"PDF inspection failed: {exc}"
+
+
+def _reencode_pdf_image(info: dict, jpg_quality: int) -> bytes | None:
+    """Re-encode one extracted PDF image to a smaller JPEG (None = keep it).
+
+    Images with an alpha mask are skipped (replacing them would break
+    transparency), as are tiny icons not worth the quality loss and exotic
+    color spaces (CMYK/Indexed/ICC) where a re-encode would shift colors.
+    """
+    try:
+        from PIL import Image
+        raw = info.get("image")
+        if not raw:
+            return None
+        im = Image.open(BytesIO(raw))
+        width, height = im.size
+        if width <= 0 or height <= 0:
+            return None
+        if "A" in im.getbands():
+            return None
+        if width < 256 and height < 256:
+            return None
+        cs_name = str(info.get("cs-name") or "").lower()
+        gray = cs_name in ("devicegray", "calgray")
+        rgb = cs_name == "devicergb"
+        if not gray and not rgb:
+            return None
+        buf = BytesIO()
+        im.convert("L" if gray else "RGB").save(
+            buf, "JPEG", quality=jpg_quality, optimize=True
+        )
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _replace_pdf_image(doc, xref: int, new_bytes: bytes) -> bool:
+    """Swap an image's stream data for re-encoded JPEG bytes (PyMuPDF 1.24
+    has no replace_image(); update_stream must stay uncompressed or MuPDF
+    will try to JPEG-decode the zlib wrapper)."""
+    try:
+        doc.update_stream(xref, new_bytes, new=False, compress=False)
+        doc.xref_set_key(xref, "Filter", "/DCTDecode")
+        doc.xref_set_key(xref, "BitsPerComponent", "8")
+        if doc.xref_get_key(xref, "DecodeParms")[1] != "null":
+            doc.xref_set_key(xref, "DecodeParms", "null")
+        return True
     except Exception:
         return False
+
+
+def _shrink_oversized_pdf(pdf_path: str) -> bool:
+    """Post-render pass: re-encode embedded JPEG/PNG images so PDFs that still
+    approach Telegram's upload limit get smaller. Replaces the file in place
+    only when the gain is meaningful."""
+    import config as _cfg
+    try:
+        threshold = int(getattr(_cfg, "PDF_RECOMPRESS_MIN_BYTES", 0) or 0)
+    except Exception:
+        threshold = 0
+    if threshold <= 0:
+        return False
+    try:
+        if os.path.getsize(pdf_path) <= threshold:
+            return False
+    except OSError:
+        return False
+    try:
+        jpg_quality = int(getattr(_cfg, "PDF_RECOMPRESS_JPEG_QUALITY", 70) or 70)
+        min_gain_pct = float(getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_PCT", 5) or 5)
+        min_gain_bytes = int(getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_BYTES", 100000) or 100000)
+    except Exception:
+        jpg_quality, min_gain_pct, min_gain_bytes = 70, 5.0, 100000
+    try:
+        original_size = os.path.getsize(pdf_path)
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return False
+    replaced = 0
+    seen: set[int] = set()
+    try:
+        for page in doc:
+            for img in page.get_images(full=True):
+                xref = img[0]
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                if img[1]:  # SMask (alpha): replacing would break transparency
+                    continue
+                try:
+                    info = doc.extract_image(xref)
+                except Exception:
+                    continue
+                if not info:
+                    continue
+                new_bytes = _reencode_pdf_image(info, jpg_quality)
+                if not new_bytes or len(new_bytes) >= len(info["image"]):
+                    continue
+                if _replace_pdf_image(doc, xref, new_bytes):
+                    replaced += 1
+        if replaced == 0:
+            return False
+        tmp = pdf_path + ".recompress.tmp"
+        try:
+            doc.save(tmp, garbage=4, deflate=True)
+        except Exception:
+            return False
+    finally:
+        doc.close()
+    try:
+        new_size = os.path.getsize(tmp)
+    except OSError:
+        return False
+    gained = original_size - new_size
+    if (
+        new_size < original_size
+        and gained >= min_gain_bytes
+        and (100.0 * gained / original_size) >= min_gain_pct
+    ):
+        try:
+            os.replace(tmp, pdf_path)
+        except OSError:
+            return False
+        logger.info(
+            "weasyprint: recompressed %d image(s) in %s: %d -> %d bytes",
+            replaced, os.path.basename(pdf_path), original_size, new_size,
+        )
+        return True
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
 
 
 def _calibre_fallback(
@@ -408,6 +837,19 @@ def _calibre_fallback(
 ) -> bool:
     from utils.ebook_converter import convert_book_to_pdf_with_thumbnail
     return convert_book_to_pdf_with_thumbnail(input_path, pdf_path, thumb_path, timeout=timeout, cancel_check=cancel_check)
+
+
+def _calibre_fallback_shrunk(
+    input_path: str,
+    pdf_path: str,
+    thumb_path: str,
+    timeout: int,
+    cancel_check: Callable[[], bool] | None,
+) -> bool:
+    if not _calibre_fallback(input_path, pdf_path, thumb_path, timeout, cancel_check):
+        return False
+    _shrink_oversized_pdf(pdf_path)
+    return True
 
 
 def convert_epub_to_pdf_fast(
@@ -423,9 +865,9 @@ def convert_epub_to_pdf_fast(
         raise DRMProtectedError(f"DRM-protected EPUB: {os.path.basename(input_path)}")
 
     if not weasyprint_available():
-        return _calibre_fallback(input_path, pdf_path, thumb_path, timeout, cancel_check)
+        return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, timeout, cancel_check)
     if not getattr(_cfg, "EPUB_FAST_CONVERT_ENABLED", True):
-        return _calibre_fallback(input_path, pdf_path, thumb_path, timeout, cancel_check)
+        return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, timeout, cancel_check)
 
     tmp = tempfile.mkdtemp(prefix="wp_epub_")
     _unreadable = False
@@ -435,22 +877,29 @@ def convert_epub_to_pdf_fast(
         _render_start = time.monotonic()
         opf_dir, spine_paths, styles = _parse_epub_spine(input_path)
         _extract_epub(input_path, tmp)
-        html = _build_merged_html(input_path, spine_paths, styles, opf_dir)
-        base_url = os.path.join(tmp, opf_dir)
+        image_dir = os.path.join(tmp, opf_dir)
+        html = _build_merged_html(input_path, spine_paths, styles, opf_dir, image_dir=image_dir)
+        base_url = image_dir
         if _merged_html_is_blank(html):
             if epub_is_drm_protected(input_path):
                 raise DRMProtectedError(f"DRM-protected EPUB: {os.path.basename(input_path)}")
             _unreadable = True
             logger.warning("weasyprint: merged content for %s is empty; using Calibre", os.path.basename(input_path))
         elif _render_weasyprint(html, base_url, pdf_path, timeout, cancel_check):
-            if _pdf_is_degenerate(pdf_path):
-                _unreadable = True
-                logger.warning("weasyprint: rendered a blank %s-byte PDF for %s; using Calibre", os.path.getsize(pdf_path), os.path.basename(input_path))
+            sanity = _pdf_fails_sanity_check(pdf_path)
+            if sanity:
+                _unreadable = sanity.startswith("blank")
+                logger.warning(
+                    "weasyprint: rendered PDF failed sanity check (%s) for %s; using Calibre",
+                    sanity,
+                    os.path.basename(input_path),
+                )
                 try:
                     os.remove(pdf_path)
                 except OSError:
                     pass
             else:
+                _shrink_oversized_pdf(pdf_path)
                 finalize_cover_thumbnail(input_path, pdf_path, thumb_path)
                 return True
         else:
@@ -470,4 +919,4 @@ def convert_epub_to_pdf_fast(
         _cap = getattr(_cfg, "EPUB_EMPTY_MERGE_FALLBACK_SECONDS", 240)
         logger.warning("weasyprint: capping Calibre fallback for %s at %ss (content was unreadable)", os.path.basename(input_path), min(_cap, max(60, _remain)))
         _remain = min(_cap, max(60, _remain))
-    return _calibre_fallback(input_path, pdf_path, thumb_path, max(60, _remain), cancel_check)
+    return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, max(60, _remain), cancel_check)

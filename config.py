@@ -85,6 +85,20 @@ TMP_DIR: str = os.getenv("TMP_DIR", "")
 PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
 COMPRESS_MIN_GAIN_PCT: float = float(os.getenv("COMPRESS_MIN_GAIN_PCT", "5"))
 COMPRESS_MIN_GAIN_BYTES: int = int(os.getenv("COMPRESS_MIN_GAIN_BYTES", "100000"))
+# Post-render PDF shrink pass (utils/weasyprint_converter.py): when a rendered
+# PDF still approaches Telegram's upload limit, embedded JPEG/PNG images are
+# re-encoded to JPEG at a lower quality. The threshold defaults to 60% of the
+# upload limit (30MB at the default 50MB); set PDF_RECOMPRESS_MIN_MB to override.
+PDF_RECOMPRESS_MIN_MB: float = float(os.getenv("PDF_RECOMPRESS_MIN_MB", "0"))
+PDF_RECOMPRESS_MIN_BYTES: int = max(
+    1,
+    int(PDF_RECOMPRESS_MIN_MB * 1024 * 1024)
+    if PDF_RECOMPRESS_MIN_MB > 0
+    else int(BOT_API_UPLOAD_LIMIT_BYTES * 0.6),
+)
+PDF_RECOMPRESS_JPEG_QUALITY: int = int(os.getenv("PDF_RECOMPRESS_JPEG_QUALITY", "70"))
+PDF_RECOMPRESS_MIN_GAIN_PCT: float = float(os.getenv("PDF_RECOMPRESS_MIN_GAIN_PCT", "5"))
+PDF_RECOMPRESS_MIN_GAIN_BYTES: int = int(os.getenv("PDF_RECOMPRESS_MIN_GAIN_BYTES", "100000"))
 
 ALLOWED_FORMATS_RAW: str = os.getenv("ALLOWED_FORMATS", "")
 ALLOWED_FORMATS: set[str] = {p.strip().lower().lstrip(".") for p in ALLOWED_FORMATS_RAW.split(",") if p.strip()}
@@ -100,6 +114,15 @@ BOOK_CONVERT_TIMEOUT_SECONDS: int = int(os.getenv("BOOK_CONVERT_TIMEOUT_SECONDS"
 BOOK_ASK_TTL_SECONDS: int = int(os.getenv("BOOK_ASK_TTL_SECONDS", "600"))
 EPUB_FAST_CONVERT_ENABLED: bool = os.getenv("EPUB_FAST_CONVERT_ENABLED", "true").lower() in ("1", "true", "yes")
 EPUB_EMPTY_MERGE_FALLBACK_SECONDS: int = int(os.getenv("EPUB_EMPTY_MERGE_FALLBACK_SECONDS", str(240)))
+# WeasyPrint fast-path page geometry (utils/weasyprint_converter.py). Any CSS
+# size works: "A4", "Letter", "6in 9in", "210mm 297mm", "A4 landscape".
+EPUB_PAGE_SIZE: str = os.getenv("EPUB_PAGE_SIZE", "A4")
+EPUB_PAGE_MARGIN: str = os.getenv("EPUB_PAGE_MARGIN", "15mm")
+# Raster images wider than this (px) are re-encoded at ~2x the printable page
+# width before rendering so giant scans don't bloat the PDF past Telegram's
+# upload limit; smaller images keep their original pixels.
+EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX: int = int(os.getenv("EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", "3000"))
+EPUB_IMAGE_JPEG_QUALITY: int = int(os.getenv("EPUB_IMAGE_JPEG_QUALITY", "85"))
 
 ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in ("1", "true", "yes")
 OCR_LANG: str = os.getenv("OCR_LANG", "eng")
