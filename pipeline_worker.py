@@ -95,9 +95,7 @@ def _startup_gate() -> None:
         boto3_err = _check_boto3()
         if not missing and boto3_err is None:
             if attempt:
-                logger.info(
-                    "Startup checks passed after %d retries.", attempt
-                )
+                logger.info("Startup checks passed after %d retries.", attempt)
             return
 
         attempt += 1

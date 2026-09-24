@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import redis
+    import redis.asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,7 @@ def get_sync_redis(decode_responses: bool = True) -> redis.Redis | None:
     url = get_redis_url()
     try:
         import redis
+
         _sync_client = redis.from_url(url, decode_responses=decode_responses)
         logger.info("redis_client: sync Redis connected")
         return _sync_client
@@ -38,6 +44,7 @@ def get_sync_redis_raw() -> redis.Redis | None:
     url = get_redis_url()
     try:
         import redis
+
         _sync_raw_client = redis.from_url(url, decode_responses=False)
         logger.info("redis_client: sync raw Redis connected")
         return _sync_raw_client
@@ -82,7 +89,9 @@ async def get_async_redis(
 ) -> redis.asyncio.Redis | None:
     if max_connections is None:
         try:
-            max_connections = int(os.environ.get("REDIS_MAX_CONNECTIONS", "50"))
+            max_connections = int(
+                os.environ.get("REDIS_MAX_CONNECTIONS", "50")
+            )
         except (ValueError, TypeError):
             max_connections = 50
     global _async_client, _async_wrapper
@@ -91,6 +100,7 @@ async def get_async_redis(
     url = get_redis_url()
     try:
         import redis.asyncio as aioredis
+
         kwargs: dict = {"decode_responses": decode_responses}
         if max_connections is not None:
             kwargs["max_connections"] = max_connections

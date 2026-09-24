@@ -43,9 +43,7 @@ SUPPORTED_EXTENSIONS: set[str] = {
 
 # Video MIME types that are commonly sent as documents on Telegram
 # These are explicitly blocked and logged for visibility
-VIDEO_MIME_PREFIXES: tuple[str, ...] = (
-    "video/",
-)
+VIDEO_MIME_PREFIXES: tuple[str, ...] = ("video/",)
 
 # Stripped image extensions (no leading dot) — hoisted for infer_extension.
 _IMAGE_EXT_STRIPPED: frozenset[str] = frozenset(
@@ -218,7 +216,8 @@ def extract_pdf_metadata(pdf_path: str) -> dict:
                 "keywords": (md.get("keywords") or "").strip() or None,
                 "creator": (md.get("creator") or "").strip() or None,
                 "producer": (md.get("producer") or "").strip() or None,
-                "creation_date": (md.get("creationDate") or "").strip() or None,
+                "creation_date": (md.get("creationDate") or "").strip()
+                or None,
                 "modification_date": (md.get("modDate") or "").strip() or None,
             }
             try:
@@ -551,7 +550,8 @@ def pdf_has_text_layer(
             with_text = sum(
                 1
                 for i in range(total)
-                if len((doc.load_page(i).get_text() or "").strip()) >= min_chars
+                if len((doc.load_page(i).get_text() or "").strip())
+                >= min_chars
             )
             return with_text / total >= min_ratio
         finally:
@@ -665,6 +665,7 @@ def compress_pdf(
 
     Returns True if `output_path` was created (and may be smaller), False on failure.
     """
+    logger = logging.getLogger(__name__)
     # Validate paths to prevent command injection / path traversal
     if not _validate_path_safe(input_path) or not _validate_path_safe(
         output_path
@@ -701,11 +702,14 @@ def compress_pdf(
 
     # 1) Ghostscript: try common executable names (Linux/macOS: 'gs', Windows: 'gswin64c'/'gswin32c')
 
+    gs_timeout = 180
+    gs_attempted = False
     gs_candidates = ["gs", "gswin64c", "gswin32c"]
     for gs_exe in gs_candidates:
         gs_path = shutil.which(gs_exe)
         if not gs_path:
             continue
+        gs_attempted = True
         # Use list form (not string) to avoid shell injection
         gs_cmd = [
             gs_path,
@@ -723,16 +727,58 @@ def compress_pdf(
                 gs_cmd,
                 check=True,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=180,
+                stderr=subprocess.PIPE,
+                timeout=gs_timeout,
             )  # nosec B603 - uses whitelisted exe names + list form (no shell injection)
             return os.path.exists(output_path)
-        except subprocess.CalledProcessError:
-            # Ghostscript ran but failed for this candidate; try next candidate
+        except subprocess.TimeoutExpired as exc:
+            logger.warning(
+                "compress_pdf: Ghostscript (%s) timed out after %ss for %s",
+                gs_exe,
+                gs_timeout,
+                os.path.basename(input_path),
+            )
+            _gs_stderr = exc.stderr or b""
+            if _gs_stderr:
+                logger.warning(
+                    "compress_pdf: Ghostscript (%s) stderr before timeout: %.500s",
+                    gs_exe,
+                    _gs_stderr.decode(errors="replace"),
+                )
+            # Timed out on this candidate; try the next one.
             continue
-        except Exception:  # nosec B112
-            # Could be permission/timeout/etc. Try next candidate
+        except subprocess.CalledProcessError as exc:
+            # Ghostscript ran but failed for this candidate; log why and try
+            # the next candidate instead of failing silently.
+            logger.warning(
+                "compress_pdf: Ghostscript (%s) failed (rc=%s) for %s",
+                gs_exe,
+                exc.returncode,
+                os.path.basename(input_path),
+            )
+            _gs_stderr = exc.stderr or b""
+            if _gs_stderr:
+                logger.warning(
+                    "compress_pdf: Ghostscript (%s) stderr: %.500s",
+                    gs_exe,
+                    _gs_stderr.decode(errors="replace"),
+                )
             continue
+        except Exception as exc:  # nosec B112
+            # Permission/exec-format/etc. Log and try the next candidate.
+            logger.warning(
+                "compress_pdf: Ghostscript (%s) error for %s: %s",
+                gs_exe,
+                os.path.basename(input_path),
+                exc,
+            )
+            continue
+    if gs_attempted:
+        logger.info(
+            "compress_pdf: all Ghostscript candidates failed for %s; "
+            "falling back to PyMuPDF",
+            os.path.basename(input_path),
+        )
 
     # 2) PyMuPDF fallback (best-effort)
     try:

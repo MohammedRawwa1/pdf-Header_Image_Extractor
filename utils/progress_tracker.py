@@ -7,13 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from utils.markdown_utils import safe_code_span
+from utils.rate_limiter import telegram_api_limiter
+from utils.redis_client import get_sync_redis
 
 logger = logging.getLogger(__name__)
 
 PREFIX_PROGRESS = "progress:"
-
-from utils.rate_limiter import telegram_api_limiter
-from utils.redis_client import get_sync_redis
 
 
 @dataclass
@@ -48,7 +47,9 @@ class TaskProgress:
         elapsed = self.elapsed_time
         if elapsed == 0:
             return 0
-        return (elapsed / self.progress_percentage) * (100 - self.progress_percentage)
+        return (elapsed / self.progress_percentage) * (
+            100 - self.progress_percentage
+        )
 
     def update_progress(self, processed_size: int):
         self.processed_size = processed_size
@@ -77,11 +78,17 @@ class TaskProgress:
 
     def to_dict(self) -> dict:
         return {
-            "task_id": self.task_id, "user_id": self.user_id, "file_name": self.file_name,
-            "total_size": self.total_size, "processed_size": self.processed_size,
-            "progress_percentage": self.progress_percentage, "status": self.status,
-            "elapsed_time": self.elapsed_time, "estimated_time_remaining": self.estimated_time_remaining,
-            "error_message": self.error_message, "_last_update": self._last_update,
+            "task_id": self.task_id,
+            "user_id": self.user_id,
+            "file_name": self.file_name,
+            "total_size": self.total_size,
+            "processed_size": self.processed_size,
+            "progress_percentage": self.progress_percentage,
+            "status": self.status,
+            "elapsed_time": self.elapsed_time,
+            "estimated_time_remaining": self.estimated_time_remaining,
+            "error_message": self.error_message,
+            "_last_update": self._last_update,
         }
 
 
@@ -102,8 +109,15 @@ class ProgressTracker:
         except Exception:
             pass
 
-    def create_task(self, task_id: str, user_id: int, file_name: str, total_size: int) -> TaskProgress:
-        task = TaskProgress(task_id=task_id, user_id=user_id, file_name=file_name, total_size=total_size)
+    def create_task(
+        self, task_id: str, user_id: int, file_name: str, total_size: int
+    ) -> TaskProgress:
+        task = TaskProgress(
+            task_id=task_id,
+            user_id=user_id,
+            file_name=file_name,
+            total_size=total_size,
+        )
         task._last_update = time.time()
         self.tasks[task_id] = task
         self._persist_to_redis(task)
@@ -121,10 +135,15 @@ class ProgressTracker:
                 if raw:
                     data = json.loads(raw)
                     task = TaskProgress(
-                        task_id=data["task_id"], user_id=data["user_id"], file_name=data["file_name"],
-                        total_size=data["total_size"], processed_size=data.get("processed_size", 0),
-                        status=data.get("status", "pending"), start_time=data.get("start_time"),
-                        end_time=data.get("end_time"), error_message=data.get("error_message"),
+                        task_id=data["task_id"],
+                        user_id=data["user_id"],
+                        file_name=data["file_name"],
+                        total_size=data["total_size"],
+                        processed_size=data.get("processed_size", 0),
+                        status=data.get("status", "pending"),
+                        start_time=data.get("start_time"),
+                        end_time=data.get("end_time"),
+                        error_message=data.get("error_message"),
                         _last_update=data.get("_last_update"),
                     )
                     self.tasks[task_id] = task
@@ -168,17 +187,30 @@ class ProgressTracker:
     async def _save_to_mongodb(self, task: TaskProgress):
         try:
             from utils.db import save_job_metadata
-            await save_job_metadata(task.task_id, {
-                "type": "progress", "user_id": task.user_id, "file_name": task.file_name,
-                "total_size": task.total_size, "processed_size": task.processed_size,
-                "status": task.status, "elapsed_time": task.elapsed_time, "error_message": task.error_message,
-            })
+
+            await save_job_metadata(
+                task.task_id,
+                {
+                    "type": "progress",
+                    "user_id": task.user_id,
+                    "file_name": task.file_name,
+                    "total_size": task.total_size,
+                    "processed_size": task.processed_size,
+                    "status": task.status,
+                    "elapsed_time": task.elapsed_time,
+                    "error_message": task.error_message,
+                },
+            )
         except Exception:
             pass
 
     def remove_task(self, task_id: str):
         if task_id in self.tasks:
             del self.tasks[task_id]
+        # Drop any registered progress callback too: otherwise every task that
+        # never reaches a final state (so the callback never unregisters
+        # itself) would pin its closure in ``self.callbacks`` forever.
+        self.callbacks.pop(task_id, None)
         try:
             r = get_sync_redis()
             if r:
@@ -211,7 +243,7 @@ class ProgressTracker:
             if r:
                 for key in r.scan_iter(f"{PREFIX_PROGRESS}*", count=100):
                     k = key.decode() if isinstance(key, bytes) else key
-                    tid = k[len(PREFIX_PROGRESS):]
+                    tid = k[len(PREFIX_PROGRESS) :]
                     if tid.startswith(prefix):
                         return tid
         except Exception:
@@ -235,7 +267,9 @@ class ProgressTracker:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, callback, task)
         except Exception as e:
-            logger.error("Error executing callback for task %s: %s", task_id, e)
+            logger.error(
+                "Error executing callback for task %s: %s", task_id, e
+            )
 
     def get_all_tasks(self) -> dict[str, TaskProgress]:
         return self.tasks
@@ -244,13 +278,17 @@ class ProgressTracker:
         current_time = time.time()
         tasks_to_remove = []
         for task_id, task in self.tasks.items():
-            if task.end_time and (current_time - task.end_time) > (max_age_hours * 3600):
+            if task.end_time and (current_time - task.end_time) > (
+                max_age_hours * 3600
+            ):
                 tasks_to_remove.append(task_id)
         for task_id in tasks_to_remove:
             self.remove_task(task_id)
         return len(tasks_to_remove)
 
-    async def watchdog_stale_tasks(self, max_stale_seconds: int = 1800) -> list[str]:
+    async def watchdog_stale_tasks(
+        self, max_stale_seconds: int = 1800
+    ) -> list[str]:
         now = time.time()
         failed: list[str] = []
         for task_id in list(self.tasks):
@@ -262,7 +300,10 @@ class ProgressTracker:
                 continue
             if now - last <= max_stale_seconds:
                 continue
-            await self.fail_task(task_id, f"auto-failed by watchdog: no progress for {max_stale_seconds // 60} min")
+            await self.fail_task(
+                task_id,
+                f"auto-failed by watchdog: no progress for {max_stale_seconds // 60} min",
+            )
             failed.append(task_id)
         return failed
 
@@ -308,9 +349,13 @@ def _format_time(seconds: float) -> str:
         return f"{h}h {m}m"
 
 
-async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id: int | None = None):
+async def send_progress_update(
+    chat_id: int, bot, task: TaskProgress, message_id: int | None = None
+):
     try:
-        await telegram_api_limiter.wait_if_needed(str(getattr(task, "user_id", 0) or 0))
+        await telegram_api_limiter.wait_if_needed(
+            str(getattr(task, "user_id", 0) or 0)
+        )
     except Exception:
         pass
     try:
@@ -318,14 +363,23 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
         bar = _build_progress_bar(total_progress)
         processed = _format_size(task.processed_size)
         total = _format_size(task.total_size)
-        status_emojis = {"pending": "\u23f3", "downloading": "\U0001f4e5", "processing": "\u2699\ufe0f", "uploading": "\U0001f4e4", "completed": "\u2705", "failed": "\u274c"}
+        status_emojis = {
+            "pending": "\u23f3",
+            "downloading": "\U0001f4e5",
+            "processing": "\u2699\ufe0f",
+            "uploading": "\U0001f4e4",
+            "completed": "\u2705",
+            "failed": "\u274c",
+        }
         status_emoji = status_emojis.get(task.status, "\u2753")
         speed_str = ""
         if task.start_time and task.processed_size > 0:
             elapsed = task.elapsed_time
             if elapsed > 0:
                 bytes_per_sec = task.processed_size / elapsed
-                speed_str = f"\U0001f680 Speed: {_format_size(int(bytes_per_sec))}/s\n"
+                speed_str = (
+                    f"\U0001f680 Speed: {_format_size(int(bytes_per_sec))}/s\n"
+                )
         message_text = (
             f"\U0001f4ca **File Processing Progress**\n\n"
             f"\U0001f4c1 File: `{safe_code_span(task.file_name)}`\n"
@@ -339,13 +393,24 @@ async def send_progress_update(chat_id: int, bot, task: TaskProgress, message_id
             f"\U0001f194 ID: `{task.task_id[:8]}`"
         )
         if message_id:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, parse_mode="Markdown")
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=message_text,
+                parse_mode="Markdown",
+            )
         else:
-            msg = await bot.send_message(chat_id=chat_id, text=message_text, parse_mode="Markdown")
+            msg = await bot.send_message(
+                chat_id=chat_id, text=message_text, parse_mode="Markdown"
+            )
             return msg.message_id
     except Exception as e:
         err_msg = str(e).lower()
-        if "message to edit not found" in err_msg or "message not found" in err_msg or "message can't be edited" in err_msg:
+        if (
+            "message to edit not found" in err_msg
+            or "message not found" in err_msg
+            or "message can't be edited" in err_msg
+        ):
             logger.debug("Progress update edit skipped (message gone): %s", e)
         else:
             logger.error("Error sending progress update: %s", e)

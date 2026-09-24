@@ -13,16 +13,45 @@ class RateLimiter:
         self.per_user = per_user
         self.capacity = max(1.0, calls_per_second)
         initial_tokens = float(self.capacity)
-        self.buckets: dict[str, tuple[float, float]] = defaultdict(lambda: (initial_tokens, time.time()))
+        self.buckets: dict[str, tuple[float, float]] = defaultdict(
+            lambda: (initial_tokens, time.time())
+        )
         self._lock = asyncio.Lock()
+        self._ops = 0
 
-    async def acquire(self, user_id: str = "global", tokens: float = 1.0) -> bool:
+    def _prune_stale(self, now: float) -> None:
+        """Drop buckets idle long enough to have fully refilled.
+
+        A bucket that has gone untouched for longer than it takes to refill
+        from empty to capacity is indistinguishable from a freshly created
+        one, so dropping it is behaviour-neutral while bounding memory growth
+        from an unbounded number of distinct user ids.
+        """
+        if self.calls_per_second <= 0:
+            return
+        max_age = max(60.0, (self.capacity / self.calls_per_second) * 2.0)
+        stale = [
+            k for k, (_, last) in self.buckets.items() if now - last > max_age
+        ]
+        for k in stale:
+            self.buckets.pop(k, None)
+
+    async def acquire(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> bool:
         async with self._lock:
+            now = time.time()
+            if self.per_user:
+                self._ops += 1
+                if self._ops % 1024 == 0:
+                    self._prune_stale(now)
             key = user_id if self.per_user else "global"
             current_tokens, last_time = self.buckets[key]
-            now = time.time()
             elapsed = now - last_time
-            new_tokens = min(self.capacity, current_tokens + (elapsed * self.calls_per_second))
+            new_tokens = min(
+                self.capacity,
+                current_tokens + (elapsed * self.calls_per_second),
+            )
             if new_tokens >= tokens:
                 self.buckets[key] = (new_tokens - tokens, now)
                 return True
@@ -30,27 +59,52 @@ class RateLimiter:
                 self.buckets[key] = (new_tokens, now)
                 return False
 
-    async def wait_if_needed(self, user_id: str = "global", tokens: float = 1.0) -> float:
+    async def wait_if_needed(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> float:
         start = time.time()
         while not await self.acquire(user_id, tokens):
             await asyncio.sleep(0.01)
         waited = time.time() - start
         if waited > 2.0:
-            logger.warning("RateLimiter waited %.2fs for key=%s (tokens=%s)", waited, user_id, tokens)
+            logger.warning(
+                "RateLimiter waited %.2fs for key=%s (tokens=%s)",
+                waited,
+                user_id,
+                tokens,
+            )
         return waited
 
     def get_stats(self, user_id: str | None = None) -> dict:
         stats = {}
         if user_id:
-            tokens, last_time = self.buckets.get(user_id, (self.capacity, time.time()))
+            tokens, last_time = self.buckets.get(
+                user_id, (self.capacity, time.time())
+            )
             tokens_needed = max(0.0, 1.0 - tokens)
-            secs = tokens_needed / self.calls_per_second if self.calls_per_second > 0 else float("inf")
-            stats[user_id] = {"available_tokens": tokens, "last_refill": last_time, "seconds_until_refill": max(0.0, secs)}
+            secs = (
+                tokens_needed / self.calls_per_second
+                if self.calls_per_second > 0
+                else float("inf")
+            )
+            stats[user_id] = {
+                "available_tokens": tokens,
+                "last_refill": last_time,
+                "seconds_until_refill": max(0.0, secs),
+            }
         else:
             for key, (tokens, last_time) in self.buckets.items():
                 tokens_needed = max(0.0, 1.0 - tokens)
-                secs = tokens_needed / self.calls_per_second if self.calls_per_second > 0 else float("inf")
-                stats[key] = {"available_tokens": tokens, "last_refill": last_time, "seconds_until_refill": max(0.0, secs)}
+                secs = (
+                    tokens_needed / self.calls_per_second
+                    if self.calls_per_second > 0
+                    else float("inf")
+                )
+                stats[key] = {
+                    "available_tokens": tokens,
+                    "last_refill": last_time,
+                    "seconds_until_refill": max(0.0, secs),
+                }
         return stats
 
 
@@ -64,18 +118,34 @@ class TelegramAPIRateLimiter:
 
     async def acquire(self, user_id: str = "global") -> bool:
         global_ok = await self.global_limiter.acquire(tokens=1)
-        user_ok = await self.per_user_limiter.acquire(user_id=user_id, tokens=1)
+        user_ok = await self.per_user_limiter.acquire(
+            user_id=user_id, tokens=1
+        )
         return global_ok and user_ok
 
-    async def wait_if_needed(self, user_id: str = "global") -> tuple[float, float]:
+    async def wait_if_needed(
+        self, user_id: str = "global"
+    ) -> tuple[float, float]:
         gw = await self.global_limiter.wait_if_needed(tokens=1)
-        uw = await self.per_user_limiter.wait_if_needed(user_id=user_id, tokens=1)
+        uw = await self.per_user_limiter.wait_if_needed(
+            user_id=user_id, tokens=1
+        )
         if gw > 2.0 or uw > 2.0:
-            logger.warning("TelegramAPIRateLimiter: user=%s global_wait=%.2fs user_wait=%.2fs", user_id, gw, uw)
+            logger.warning(
+                "TelegramAPIRateLimiter: user=%s global_wait=%.2fs user_wait=%.2fs",
+                user_id,
+                gw,
+                uw,
+            )
         return gw, uw
 
     def get_stats(self, user_id: str | None = None) -> dict:
-        return {"global": self.global_limiter.get_stats(), "per_user": self.per_user_limiter.get_stats(user_id) if user_id else {}}
+        return {
+            "global": self.global_limiter.get_stats(),
+            "per_user": self.per_user_limiter.get_stats(user_id)
+            if user_id
+            else {},
+        }
 
 
 class RedisSlidingWindowRateLimiter:
@@ -87,10 +157,13 @@ class RedisSlidingWindowRateLimiter:
     async def _get_redis(self):
         if self._redis is None:
             from utils.redis_client import get_async_redis
+
             self._redis = await get_async_redis()
         return self._redis
 
-    async def acquire(self, user_id: str = "global", tokens: float = 1.0) -> tuple[bool, int, float]:
+    async def acquire(
+        self, user_id: str = "global", tokens: float = 1.0
+    ) -> tuple[bool, int, float]:
         redis = await self._get_redis()
         if redis is None:
             return True, self.max_requests, 0.0
@@ -111,7 +184,9 @@ class RedisSlidingWindowRateLimiter:
             oldest = results[4]
             if oldest and oldest[0]:
                 _, oldest_score = oldest[0]
-                reset_seconds = max(0.0, (oldest_score + self.window_seconds) - now)
+                reset_seconds = max(
+                    0.0, (oldest_score + self.window_seconds) - now
+                )
             else:
                 reset_seconds = 0.0
             if count > self.max_requests:
@@ -137,18 +212,29 @@ class ConversionRateLimiter:
         now = time.time()
         cutoff = now - 3600
         recent = [t for t in self.history.get(user_id, []) if t > cutoff]
+        if recent:
+            self.history[user_id] = recent
+        else:
+            # Drop users with no in-window conversions so the history map
+            # cannot grow without bound as users come and go.
+            self.history.pop(user_id, None)
         if len(recent) < self.conversions_per_hour:
             return True, "Allowed"
         earliest = min(recent) if recent else now
         wait = max(0.0, (earliest + 3600) - now)
-        return False, f"\u274c Rate limit reached ({len(recent)}/{self.conversions_per_hour} per hour)\nPlease wait {wait:.1f} seconds."
+        return (
+            False,
+            f"\u274c Rate limit reached ({len(recent)}/{self.conversions_per_hour} per hour)\nPlease wait {wait:.1f} seconds.",
+        )
 
     async def mark_conversion_started(self, user_id: str) -> bool:
         allowed = await self.limiter.acquire(user_id=user_id, tokens=1)
         if allowed:
             self.history[user_id].append(time.time())
             cutoff = time.time() - 3600
-            self.history[user_id] = [t for t in self.history[user_id] if t > cutoff]
+            self.history[user_id] = [
+                t for t in self.history[user_id] if t > cutoff
+            ]
             return True
         return False
 

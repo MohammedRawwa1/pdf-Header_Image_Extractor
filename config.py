@@ -15,7 +15,11 @@ def _load_environment_file() -> None:
     if load_dotenv is None:
         return
     _root = os.path.dirname(os.path.abspath(__file__))
-    candidates = [os.path.join(_root, ".env"), os.path.join(os.getcwd(), ".env"), os.path.join(_root, ".env.local")]
+    candidates = [
+        os.path.join(_root, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(_root, ".env.local"),
+    ]
     seen = set()
     for candidate in candidates:
         if not candidate or candidate in seen:
@@ -36,7 +40,11 @@ if not WEBHOOK_URL:
     _railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
     if _railway_domain:
         WEBHOOK_URL = f"https://{_railway_domain}"
-USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in ("1", "true", "yes")
+USE_POLLING: bool = os.getenv("USE_POLLING", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -78,13 +86,19 @@ def _cap_by_max_file_size(limit_bytes: int) -> int:
     return limit_bytes
 
 
-BOT_API_UPLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(_BOT_API_MB_EFFECTIVE * 1024 * 1024)
-BOT_API_DOWNLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(_BOT_API_DL_MB_EFFECTIVE * 1024 * 1024)
+BOT_API_UPLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(
+    _BOT_API_MB_EFFECTIVE * 1024 * 1024
+)
+BOT_API_DOWNLOAD_LIMIT_BYTES: int = _cap_by_max_file_size(
+    _BOT_API_DL_MB_EFFECTIVE * 1024 * 1024
+)
 
 TMP_DIR: str = os.getenv("TMP_DIR", "")
 PDF_COMPRESS_QUALITY: str = os.getenv("PDF_COMPRESS_QUALITY", "/ebook")
 COMPRESS_MIN_GAIN_PCT: float = float(os.getenv("COMPRESS_MIN_GAIN_PCT", "5"))
-COMPRESS_MIN_GAIN_BYTES: int = int(os.getenv("COMPRESS_MIN_GAIN_BYTES", "100000"))
+COMPRESS_MIN_GAIN_BYTES: int = int(
+    os.getenv("COMPRESS_MIN_GAIN_BYTES", "100000")
+)
 # Post-render PDF shrink pass (utils/weasyprint_converter.py): when a rendered
 # PDF still approaches Telegram's upload limit, embedded JPEG/PNG images are
 # re-encoded to JPEG at a lower quality. The threshold defaults to 60% of the
@@ -96,15 +110,23 @@ PDF_RECOMPRESS_MIN_BYTES: int = max(
     if PDF_RECOMPRESS_MIN_MB > 0
     else int(BOT_API_UPLOAD_LIMIT_BYTES * 0.6),
 )
-PDF_RECOMPRESS_JPEG_QUALITY: int = int(os.getenv("PDF_RECOMPRESS_JPEG_QUALITY", "70"))
-PDF_RECOMPRESS_MIN_GAIN_PCT: float = float(os.getenv("PDF_RECOMPRESS_MIN_GAIN_PCT", "5"))
-PDF_RECOMPRESS_MIN_GAIN_BYTES: int = int(os.getenv("PDF_RECOMPRESS_MIN_GAIN_BYTES", "100000"))
+PDF_RECOMPRESS_JPEG_QUALITY: int = int(
+    os.getenv("PDF_RECOMPRESS_JPEG_QUALITY", "70")
+)
+PDF_RECOMPRESS_MIN_GAIN_PCT: float = float(
+    os.getenv("PDF_RECOMPRESS_MIN_GAIN_PCT", "5")
+)
+PDF_RECOMPRESS_MIN_GAIN_BYTES: int = int(
+    os.getenv("PDF_RECOMPRESS_MIN_GAIN_BYTES", "100000")
+)
 # Post-render sanity scan (utils/weasyprint_converter.py): wall-clock cap on
 # inspecting the rendered PDF (seconds), and the overflow threshold (pt) beyond
 # which an image sticking out of the page box still routes the render to the
 # Calibre fallback. Smaller overflows are logged and accepted so a borderline
 # render ships instead of dying in the fallback.
-PDF_SANITY_CHECK_BUDGET_S: float = float(os.getenv("PDF_SANITY_CHECK_BUDGET_S", "15"))
+PDF_SANITY_CHECK_BUDGET_S: float = float(
+    os.getenv("PDF_SANITY_CHECK_BUDGET_S", "15")
+)
 PDF_OVERFLOW_FATAL_PT: float = float(os.getenv("PDF_OVERFLOW_FATAL_PT", "30"))
 # Calibre fallback memory guard (utils/ebook_converter.py): ebook-convert is
 # memory-hungry, and spawning it while the worker still holds a WeasyPrint
@@ -112,23 +134,40 @@ PDF_OVERFLOW_FATAL_PT: float = float(os.getenv("PDF_OVERFLOW_FATAL_PT", "30"))
 # guard refuses the spawn when current RSS + reserve would exceed the cgroup
 # memory limit. Set CALIBRE_FALLBACK_MAX_RSS_MB for an absolute cap; set both
 # to 0 to disable the guard entirely.
-CALIBRE_FALLBACK_MEM_RESERVE_MB: float = float(os.getenv("CALIBRE_FALLBACK_MEM_RESERVE_MB", "200"))
-CALIBRE_FALLBACK_MAX_RSS_MB: float = float(os.getenv("CALIBRE_FALLBACK_MAX_RSS_MB", "0"))
+CALIBRE_FALLBACK_MEM_RESERVE_MB: float = float(
+    os.getenv("CALIBRE_FALLBACK_MEM_RESERVE_MB", "200")
+)
+CALIBRE_FALLBACK_MAX_RSS_MB: float = float(
+    os.getenv("CALIBRE_FALLBACK_MAX_RSS_MB", "0")
+)
 
 ALLOWED_FORMATS_RAW: str = os.getenv("ALLOWED_FORMATS", "")
-ALLOWED_FORMATS: set[str] = {p.strip().lower().lstrip(".") for p in ALLOWED_FORMATS_RAW.split(",") if p.strip()}
+ALLOWED_FORMATS: set[str] = {
+    p.strip().lower().lstrip(".")
+    for p in ALLOWED_FORMATS_RAW.split(",")
+    if p.strip()
+}
 if not ALLOWED_FORMATS:
     try:
         from utils.ebook_converter import DEFAULT_ALLOWED_FORMATS
+
         ALLOWED_FORMATS = set(DEFAULT_ALLOWED_FORMATS)
     except Exception:
         ALLOWED_FORMATS = set()
 
-ENABLE_BOOK_CONVERSION: bool = os.getenv("ENABLE_BOOK_CONVERSION", "true").lower() in ("1", "true", "yes")
-BOOK_CONVERT_TIMEOUT_SECONDS: int = int(os.getenv("BOOK_CONVERT_TIMEOUT_SECONDS", "600"))
+ENABLE_BOOK_CONVERSION: bool = os.getenv(
+    "ENABLE_BOOK_CONVERSION", "true"
+).lower() in ("1", "true", "yes")
+BOOK_CONVERT_TIMEOUT_SECONDS: int = int(
+    os.getenv("BOOK_CONVERT_TIMEOUT_SECONDS", "600")
+)
 BOOK_ASK_TTL_SECONDS: int = int(os.getenv("BOOK_ASK_TTL_SECONDS", "600"))
-EPUB_FAST_CONVERT_ENABLED: bool = os.getenv("EPUB_FAST_CONVERT_ENABLED", "true").lower() in ("1", "true", "yes")
-EPUB_EMPTY_MERGE_FALLBACK_SECONDS: int = int(os.getenv("EPUB_EMPTY_MERGE_FALLBACK_SECONDS", str(240)))
+EPUB_FAST_CONVERT_ENABLED: bool = os.getenv(
+    "EPUB_FAST_CONVERT_ENABLED", "true"
+).lower() in ("1", "true", "yes")
+EPUB_EMPTY_MERGE_FALLBACK_SECONDS: int = int(
+    os.getenv("EPUB_EMPTY_MERGE_FALLBACK_SECONDS", str(240))
+)
 # WeasyPrint fast-path page geometry (utils/weasyprint_converter.py). Any CSS
 # size works: "A4", "Letter", "6in 9in", "210mm 297mm", "A4 landscape".
 EPUB_PAGE_SIZE: str = os.getenv("EPUB_PAGE_SIZE", "A4")
@@ -136,23 +175,37 @@ EPUB_PAGE_MARGIN: str = os.getenv("EPUB_PAGE_MARGIN", "15mm")
 # Raster images wider than this (px) are re-encoded at ~2x the printable page
 # width before rendering so giant scans don't bloat the PDF past Telegram's
 # upload limit; smaller images keep their original pixels.
-EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX: int = int(os.getenv("EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", "3000"))
+EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX: int = int(
+    os.getenv("EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", "3000")
+)
 EPUB_IMAGE_JPEG_QUALITY: int = int(os.getenv("EPUB_IMAGE_JPEG_QUALITY", "85"))
 
-ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in ("1", "true", "yes")
+ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 OCR_LANG: str = os.getenv("OCR_LANG", "eng")
 OCR_TIMEOUT_SECONDS: int = int(os.getenv("OCR_TIMEOUT_SECONDS", "600"))
 OCR_DPI: int = int(os.getenv("OCR_DPI", "200"))
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
-STORAGE_PATH: str = os.getenv("STORAGE_PATH", os.path.join(ROOT_DIR, "storage"))
+STORAGE_PATH: str = os.getenv(
+    "STORAGE_PATH", os.path.join(ROOT_DIR, "storage")
+)
 INPUT_PATH: str = os.getenv("INPUT_PATH", os.path.join(STORAGE_PATH, "input"))
-OUTPUT_PATH: str = os.getenv("OUTPUT_PATH", os.path.join(STORAGE_PATH, "output"))
+OUTPUT_PATH: str = os.getenv(
+    "OUTPUT_PATH", os.path.join(STORAGE_PATH, "output")
+)
 TEMP_PATH: str = os.getenv("TEMP_PATH", os.path.join(STORAGE_PATH, "temp"))
-THUMBNAIL_PATH: str = os.getenv("THUMBNAIL_PATH", os.path.join(STORAGE_PATH, "thumbnails"))
+THUMBNAIL_PATH: str = os.getenv(
+    "THUMBNAIL_PATH", os.path.join(STORAGE_PATH, "thumbnails")
+)
 
-ENABLE_S3_FALLBACK: bool = os.getenv("ENABLE_S3_FALLBACK", "false").lower() in ("1", "true", "yes")
+ENABLE_S3_FALLBACK: bool = os.getenv(
+    "ENABLE_S3_FALLBACK", "false"
+).lower() in ("1", "true", "yes")
 S3_BUCKET: str = os.getenv("S3_BUCKET", "")
 AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -160,15 +213,26 @@ S3_REGION: str = os.getenv("S3_REGION", "")
 S3_ENDPOINT: str = os.getenv("S3_ENDPOINT", "")
 S3_PRESIGNED_EXPIRY: int = int(os.getenv("S3_PRESIGNED_EXPIRY", "3600"))
 S3_SIGNATURE_VERSION: str = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
-S3_USE_SSL: bool = os.getenv("S3_USE_SSL", "1") not in ("0", "false", "False", "no")
+S3_USE_SSL: bool = os.getenv("S3_USE_SSL", "1") not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
 PRESIGN_EXPIRES: int = int(os.getenv("PRESIGN_EXPIRES", "3600"))
 
 RELAY_CHAT_ID: str = os.getenv("RELAY_CHAT_ID", "")
 
 _ENABLE_USERBOT_EXPLICIT = os.getenv("ENABLE_USERBOT", "").lower()
-ENABLE_USERBOT: bool = (
-    _ENABLE_USERBOT_EXPLICIT in ("1", "true", "yes")
-    or bool(os.getenv("API_ID") or os.getenv("api_id") or os.getenv("USERBOT_API_ID") or os.getenv("userbot_api_id"))
+ENABLE_USERBOT: bool = _ENABLE_USERBOT_EXPLICIT in (
+    "1",
+    "true",
+    "yes",
+) or bool(
+    os.getenv("API_ID")
+    or os.getenv("api_id")
+    or os.getenv("USERBOT_API_ID")
+    or os.getenv("userbot_api_id")
 )
 
 _allowed_file = os.path.join(STORAGE_PATH, "allowed_users.json")
@@ -230,7 +294,9 @@ def is_user_allowed(user_id: int) -> bool:
             return True
         return user_id in ALLOWED_USER_IDS
     except Exception:
-        logger.warning("ACL check failed for user %s; defaulting to allowed", user_id)
+        logger.warning(
+            "ACL check failed for user %s; defaulting to allowed", user_id
+        )
         return True
 
 

@@ -143,7 +143,11 @@ class BigFilePipeline:
             _, ext = os.path.splitext(original_filename)
         # Whitelist the extension so a hostile filename can't smuggle path
         # separators into the temp path below (e.g. `..\evil`).
-        if not ext or len(ext) > 12 or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
+        if (
+            not ext
+            or len(ext) > 12
+            or not re.fullmatch(r"\.[A-Za-z0-9]+", ext)
+        ):
             ext = ".pdf"
 
         actual_size = 0

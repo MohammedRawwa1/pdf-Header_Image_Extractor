@@ -122,7 +122,9 @@ def _parse_proxy_config():
             )
         return (parsed.scheme, host, port)
     except Exception as exc:
-        logger.warning("proxy: failed to parse TELETHON_PROXY='%s': %s", raw, exc)
+        logger.warning(
+            "proxy: failed to parse TELETHON_PROXY='%s': %s", raw, exc
+        )
         return None
 
 
@@ -150,7 +152,10 @@ def _get_api_credentials() -> tuple:
 
 
 async def _persist_session_to_mongo(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int, data: dict, phone: str | None = None
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    data: dict,
+    phone: str | None = None,
 ) -> bool:
     """Persist a session dict to MongoDB (best-effort, multi-backend).
 
@@ -255,7 +260,9 @@ def _get_futures(
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _login_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """``/login [phone]`` — start the Telethon login flow (per-user)."""
     # ACL: only allowed users may start a login flow (prevents abuse of a
     # private bot by strangers consuming API codes / rate limits).
@@ -275,7 +282,11 @@ async def _login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check for existing active flow
     existing = _get_futures(context, uid)
-    if existing and existing.get("task") is not None and not existing["task"].done():
+    if (
+        existing
+        and existing.get("task") is not None
+        and not existing["task"].done()
+    ):
         await update.message.reply_text(
             "⏳ You already have an active login flow. Use /cancel to abort it first."
         )
@@ -367,7 +378,9 @@ async def _load_any_session(
         )
         if saved:
             return saved
-        saved = await _load_session_string_from_file_async(client_type="telethon")
+        saved = await _load_session_string_from_file_async(
+            client_type="telethon"
+        )
         if saved:
             return saved
     except Exception:  # nosec B110
@@ -377,14 +390,18 @@ async def _load_any_session(
         if db_model is not None and hasattr(db_model, "load_session"):
             sess = await db_model.load_session(user_id)
             if isinstance(sess, dict):
-                return sess.get("telethon_session") or sess.get("string_session")
+                return sess.get("telethon_session") or sess.get(
+                    "string_session"
+                )
         else:
             from utils.db import get_user_session
 
             sess = await get_user_session(user_id)
             if isinstance(sess, dict):
                 return (
-                    sess.get("telethon_session") or sess.get("string_session") or None
+                    sess.get("telethon_session")
+                    or sess.get("string_session")
+                    or None
                 )
     except Exception:  # nosec B110
         pass
@@ -396,7 +413,9 @@ async def _load_any_session(
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_login_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Intercept text messages that may be login input (phone / code / password).
 
     This handler is registered with ``group=0`` so it fires before other
@@ -480,7 +499,9 @@ async def _handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pwd_fut = entry.get("password")
     if pwd_fut is not None and not pwd_fut.done():
         if not text:
-            await update.message.reply_text("❌ Password cannot be empty. Please try again:")
+            await update.message.reply_text(
+                "❌ Password cannot be empty. Please try again:"
+            )
             return False  # consumed
         pwd_fut.set_result(text)
         return False  # consumed
@@ -529,7 +550,9 @@ async def _run_login_task(
             elapsed(),
             proxy_config is not None,
         )
-        client = TelegramClient(StringSession(), api_id, api_hash, proxy=proxy_config)
+        client = TelegramClient(
+            StringSession(), api_id, api_hash, proxy=proxy_config
+        )
         entry["client"] = client
         await client.connect()
         dc_id = client.session.dc_id
@@ -569,16 +592,23 @@ async def _run_login_task(
         if status_msg:
             await status_msg.edit_text(msg_text, parse_mode="Markdown")
         else:
-            status_msg = await bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+            status_msg = await bot.send_message(
+                chat_id, msg_text, parse_mode="Markdown"
+            )
 
         # ── Wait for code ────────────────────────────────────────
         entry["code"] = asyncio.get_running_loop().create_future()
 
         try:
-            code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
+            code = await asyncio.wait_for(
+                entry["code"], timeout=TIMEOUT_SECONDS
+            )
         except TimeoutError:
             await _login_fail(
-                bot, chat_id, status_msg, "⏰ Login timed out (no code received within 5 minutes)."
+                bot,
+                chat_id,
+                status_msg,
+                "⏰ Login timed out (no code received within 5 minutes).",
             )
             return
 
@@ -591,7 +621,9 @@ async def _run_login_task(
         )
 
         if entry["cancel"].is_set():
-            logger.debug("login [%s]: cancelled after code received", elapsed())
+            logger.debug(
+                "login [%s]: cancelled after code received", elapsed()
+            )
             return
 
         # ── Sign in with code (NO polling gap!) ──────────────────
@@ -614,7 +646,9 @@ async def _run_login_task(
                 )
                 sign_in_duration = time.monotonic() - sign_in_t0
                 logger.info(
-                    "login [%s]: sign_in SUCCEEDED in %.2fs", elapsed(), sign_in_duration
+                    "login [%s]: sign_in SUCCEEDED in %.2fs",
+                    elapsed(),
+                    sign_in_duration,
                 )
                 break  # success
             except Exception as exc:
@@ -661,9 +695,13 @@ async def _run_login_task(
                         return
                     # Wait before resending — gives Telegram's backend time to
                     # cool down and gives the user time to see the new code.
-                    logger.debug("login [%s]: sleeping 15s before resend...", elapsed())
+                    logger.debug(
+                        "login [%s]: sleeping 15s before resend...", elapsed()
+                    )
                     await asyncio.sleep(15)
-                    logger.debug("login [%s]: sending new code request...", elapsed())
+                    logger.debug(
+                        "login [%s]: sending new code request...", elapsed()
+                    )
                     sent = await client.send_code_request(phone)
                     phone_code_hash = str(sent.phone_code_hash)
                     entry["phone_code_hash"] = phone_code_hash
@@ -690,7 +728,9 @@ async def _run_login_task(
                             entry["code"], timeout=TIMEOUT_SECONDS
                         )
                     except TimeoutError:
-                        await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                        await _login_fail(
+                            bot, chat_id, status_msg, "⏰ Login timed out."
+                        )
                         return
                     continue  # retry sign_in with new code
 
@@ -700,21 +740,30 @@ async def _run_login_task(
                     try:
                         if status_msg:
                             await status_msg.edit_text(
-                                "❌ Invalid code. Please try again:", parse_mode="Markdown"
+                                "❌ Invalid code. Please try again:",
+                                parse_mode="Markdown",
                             )
                     except Exception:
-                        await bot.send_message(chat_id, "❌ Invalid code. Please try again:")
+                        await bot.send_message(
+                            chat_id, "❌ Invalid code. Please try again:"
+                        )
                     try:
                         code = await asyncio.wait_for(
                             entry["code"], timeout=TIMEOUT_SECONDS
                         )
                     except TimeoutError:
-                        await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                        await _login_fail(
+                            bot, chat_id, status_msg, "⏰ Login timed out."
+                        )
                         return
                     continue
 
                 if "FloodWaitError" in exc_name:
-                    wait = getattr(exc, "seconds", None) or getattr(exc, "timeout", None) or 60
+                    wait = (
+                        getattr(exc, "seconds", None)
+                        or getattr(exc, "timeout", None)
+                        or 60
+                    )
                     await _login_fail(
                         bot,
                         chat_id,
@@ -725,7 +774,10 @@ async def _run_login_task(
 
                 # Unhandled error
                 await _login_fail(
-                    bot, chat_id, status_msg, f"❌ Login failed: {_escape_markdown(exc)}"
+                    bot,
+                    chat_id,
+                    status_msg,
+                    f"❌ Login failed: {_escape_markdown(exc)}",
                 )
                 logger.exception("login: sign_in failed: %s", exc)
                 return
@@ -746,7 +798,9 @@ async def _run_login_task(
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:
-                status_msg = await bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+                status_msg = await bot.send_message(
+                    chat_id, msg_text, parse_mode="Markdown"
+                )
 
             entry["password"] = asyncio.get_running_loop().create_future()
             try:
@@ -770,19 +824,26 @@ async def _run_login_task(
             except Exception as exc:
                 if "PasswordHashInvalidError" in type(exc).__name__:
                     # Allow retry
-                    entry["password"] = asyncio.get_running_loop().create_future()
+                    entry["password"] = (
+                        asyncio.get_running_loop().create_future()
+                    )
                     try:
                         await status_msg.edit_text(
-                            "❌ Incorrect password. Please try again:", parse_mode="Markdown"
+                            "❌ Incorrect password. Please try again:",
+                            parse_mode="Markdown",
                         )
                     except Exception:
-                        await bot.send_message(chat_id, "❌ Incorrect password. Please try again:")
+                        await bot.send_message(
+                            chat_id, "❌ Incorrect password. Please try again:"
+                        )
                     try:
                         password = await asyncio.wait_for(
                             entry["password"], timeout=TIMEOUT_SECONDS
                         )
                     except TimeoutError:
-                        await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                        await _login_fail(
+                            bot, chat_id, status_msg, "⏰ Login timed out."
+                        )
                         return
                     # Retry with new password
                     await client.sign_in(password=password)
@@ -815,7 +876,9 @@ async def _run_login_task(
             logger.warning("login: JSON save failed: %s", exc)
 
         me = await client.get_me()
-        uname = getattr(me, "first_name", "") or getattr(me, "username", "user")
+        uname = getattr(me, "first_name", "") or getattr(
+            me, "username", "user"
+        )
         summary = ", ".join(saved_to) if saved_to else "memory"
         try:
             await status_msg.edit_text(
@@ -836,14 +899,18 @@ async def _run_login_task(
                 f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
-        logger.info("Login successful for %s (DC=%s)", phone, client.session.dc_id)
+        logger.info(
+            "Login successful for %s (DC=%s)", phone, client.session.dc_id
+        )
 
     except asyncio.CancelledError:
         logger.info("login: task cancelled for %s", phone)
     except Exception as exc:
         logger.exception("login: unexpected error: %s", exc)
         with contextlib.suppress(Exception):
-            await bot.send_message(chat_id, f"❌ Login failed unexpectedly: {exc}")
+            await bot.send_message(
+                chat_id, f"❌ Login failed unexpectedly: {exc}"
+            )
     finally:
         # Clean up
         client = entry.get("client")
@@ -873,7 +940,9 @@ async def _login_fail(bot, chat_id, status_msg, text: str):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _pyro_login_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """``/loginpyro [phone]`` — start the Pyrogram login flow (per-user).
 
     Uses Pyrogram's ``send_code()`` / ``sign_in()`` / ``check_password()``
@@ -898,7 +967,11 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Check for existing active flow
     existing = _get_futures(context, uid)
-    if existing and existing.get("task") is not None and not existing["task"].done():
+    if (
+        existing
+        and existing.get("task") is not None
+        and not existing["task"].done()
+    ):
         client_type = existing.get("client_type", "unknown")
         await update.message.reply_text(
             f"⏳ You already have an active {client_type} login flow. Use /cancel to abort it first."
@@ -924,7 +997,9 @@ async def _pyro_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown",
         )
         entry["task"] = asyncio.create_task(
-            _run_pyro_login_task(uid, phone, api_id, api_hash, entry, context, msg)
+            _run_pyro_login_task(
+                uid, phone, api_id, api_hash, entry, context, msg
+            )
         )
     else:
         entry["phone"] = asyncio.get_running_loop().create_future()
@@ -976,7 +1051,9 @@ async def _run_pyro_login_task(
         from pyrogram import Client as PyrogramClient  # noqa: PLC0415
         from pyrogram import errors as pyro_errors
 
-        logger.debug("login [%s]: building Pyrogram client (in-memory)...", elapsed())
+        logger.debug(
+            "login [%s]: building Pyrogram client (in-memory)...", elapsed()
+        )
 
         # Create an in-memory Pyrogram client (no file storage needed)
         client = PyrogramClient(
@@ -987,7 +1064,11 @@ async def _run_pyro_login_task(
         )
         entry["pyro_client"] = client
         await client.connect()
-        logger.info("login [%s]: Pyrogram connected to DC%s", elapsed(), client.session.dc_id)
+        logger.info(
+            "login [%s]: Pyrogram connected to DC%s",
+            elapsed(),
+            client.session.dc_id,
+        )
 
         # ── Send code request ────────────────────────────────────
         logger.debug("login [%s]: calling send_code...", elapsed())
@@ -1013,15 +1094,22 @@ async def _run_pyro_login_task(
         if status_msg:
             await status_msg.edit_text(msg_text, parse_mode="Markdown")
         else:
-            status_msg = await bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+            status_msg = await bot.send_message(
+                chat_id, msg_text, parse_mode="Markdown"
+            )
 
         # ── Wait for code ────────────────────────────────────────
         entry["code"] = asyncio.get_running_loop().create_future()
         try:
-            code = await asyncio.wait_for(entry["code"], timeout=TIMEOUT_SECONDS)
+            code = await asyncio.wait_for(
+                entry["code"], timeout=TIMEOUT_SECONDS
+            )
         except TimeoutError:
             await _login_fail(
-                bot, chat_id, status_msg, "⏰ Login timed out (no code received within 5 minutes)."
+                bot,
+                chat_id,
+                status_msg,
+                "⏰ Login timed out (no code received within 5 minutes).",
             )
             return
 
@@ -1034,7 +1122,9 @@ async def _run_pyro_login_task(
         )
 
         if entry["cancel"].is_set():
-            logger.debug("login [%s]: cancelled after code received", elapsed())
+            logger.debug(
+                "login [%s]: cancelled after code received", elapsed()
+            )
             return
 
         # ── Sign in with code ────────────────────────────────────
@@ -1052,7 +1142,9 @@ async def _run_pyro_login_task(
                 await client.sign_in(phone, phone_code_hash, code)
                 sign_in_duration = time.monotonic() - sign_in_t0
                 logger.info(
-                    "login [%s]: sign_in SUCCEEDED in %.2fs", elapsed(), sign_in_duration
+                    "login [%s]: sign_in SUCCEEDED in %.2fs",
+                    elapsed(),
+                    sign_in_duration,
                 )
                 break  # success
             except pyro_errors.SessionPasswordNeeded:
@@ -1102,7 +1194,9 @@ async def _run_pyro_login_task(
                         entry["code"], timeout=TIMEOUT_SECONDS
                     )
                 except TimeoutError:
-                    await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                    await _login_fail(
+                        bot, chat_id, status_msg, "⏰ Login timed out."
+                    )
                     return
                 continue
             except pyro_errors.PhoneCodeInvalid:
@@ -1110,16 +1204,21 @@ async def _run_pyro_login_task(
                 try:
                     if status_msg:
                         await status_msg.edit_text(
-                            "❌ Invalid code. Please try again:", parse_mode="Markdown"
+                            "❌ Invalid code. Please try again:",
+                            parse_mode="Markdown",
                         )
                 except Exception:
-                    await bot.send_message(chat_id, "❌ Invalid code. Please try again:")
+                    await bot.send_message(
+                        chat_id, "❌ Invalid code. Please try again:"
+                    )
                 try:
                     code = await asyncio.wait_for(
                         entry["code"], timeout=TIMEOUT_SECONDS
                     )
                 except TimeoutError:
-                    await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                    await _login_fail(
+                        bot, chat_id, status_msg, "⏰ Login timed out."
+                    )
                     return
                 continue
             except pyro_errors.FloodWait as e:
@@ -1142,7 +1241,10 @@ async def _run_pyro_login_task(
                     exc,
                 )
                 await _login_fail(
-                    bot, chat_id, status_msg, f"❌ Login failed: {_escape_markdown(exc)}"
+                    bot,
+                    chat_id,
+                    status_msg,
+                    f"❌ Login failed: {_escape_markdown(exc)}",
                 )
                 return
 
@@ -1159,7 +1261,9 @@ async def _run_pyro_login_task(
             try:
                 await status_msg.edit_text(msg_text, parse_mode="Markdown")
             except Exception:
-                status_msg = await bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+                status_msg = await bot.send_message(
+                    chat_id, msg_text, parse_mode="Markdown"
+                )
 
             entry["password"] = asyncio.get_running_loop().create_future()
             try:
@@ -1185,22 +1289,32 @@ async def _run_pyro_login_task(
                 entry["password"] = asyncio.get_running_loop().create_future()
                 try:
                     await status_msg.edit_text(
-                        "❌ Incorrect password. Please try again:", parse_mode="Markdown"
+                        "❌ Incorrect password. Please try again:",
+                        parse_mode="Markdown",
                     )
                 except Exception:
-                    await bot.send_message(chat_id, "❌ Incorrect password. Please try again:")
+                    await bot.send_message(
+                        chat_id, "❌ Incorrect password. Please try again:"
+                    )
                 try:
                     password = await asyncio.wait_for(
                         entry["password"], timeout=TIMEOUT_SECONDS
                     )
                 except TimeoutError:
-                    await _login_fail(bot, chat_id, status_msg, "⏰ Login timed out.")
+                    await _login_fail(
+                        bot, chat_id, status_msg, "⏰ Login timed out."
+                    )
                     return
                 await client.check_password(password)
             except Exception as exc:
-                logger.warning("login [%s]: 2FA password failed: %s", elapsed(), exc)
+                logger.warning(
+                    "login [%s]: 2FA password failed: %s", elapsed(), exc
+                )
                 await _login_fail(
-                    bot, chat_id, status_msg, f"❌ 2FA failed: {_escape_markdown(exc)}"
+                    bot,
+                    chat_id,
+                    status_msg,
+                    f"❌ 2FA failed: {_escape_markdown(exc)}",
                 )
                 return
 
@@ -1227,7 +1341,9 @@ async def _run_pyro_login_task(
             logger.warning("login: JSON Pyrogram save failed: %s", exc)
 
         me = await client.get_me()
-        uname = getattr(me, "first_name", "") or getattr(me, "username", "user")
+        uname = getattr(me, "first_name", "") or getattr(
+            me, "username", "user"
+        )
         summary = ", ".join(saved_to) if saved_to else "memory"
         try:
             await status_msg.edit_text(
@@ -1248,14 +1364,20 @@ async def _run_pyro_login_task(
                 f"Saved to: {_escape_markdown(summary)}",
                 parse_mode="Markdown",
             )
-        logger.info("Pyrogram login successful for %s (DC=%s)", phone, client.session.dc_id)
+        logger.info(
+            "Pyrogram login successful for %s (DC=%s)",
+            phone,
+            client.session.dc_id,
+        )
 
     except asyncio.CancelledError:
         logger.info("login: Pyrogram task cancelled for %s", phone)
     except Exception as exc:
         logger.exception("login: Pyrogram unexpected error: %s", exc)
         with contextlib.suppress(Exception):
-            await bot.send_message(chat_id, f"❌ Pyrogram login failed unexpectedly: {exc}")
+            await bot.send_message(
+                chat_id, f"❌ Pyrogram login failed unexpectedly: {exc}"
+            )
     finally:
         # Clean up Pyrogram client
         pyro_client = entry.get("pyro_client")

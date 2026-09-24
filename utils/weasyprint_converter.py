@@ -71,7 +71,9 @@ _NAMED_PAGE_SIZES_PX: dict[str, tuple[float, float]] = {
 _XML_ENCODING_RE = re.compile(
     rb"<\?xml[^>]*encoding=[\"']([A-Za-z0-9._-]+)[\"']", re.IGNORECASE
 )
-_RAW_BODY_RE = re.compile(rb"<body[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
+_RAW_BODY_RE = re.compile(
+    rb"<body[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL
+)
 _TAG_RE = re.compile(rb"<[^>]+>")
 _TAG_TEXT_RE = re.compile(r"<[^>]+>")
 _MIN_SALVAGE_MEANINGFUL_RATIO = 0.5
@@ -103,11 +105,23 @@ def _get_lenient_parser() -> Callable[[bytes], ET.Element] | None:
         return _HTML_PARSER if _HTML_PARSER is not False else None
     try:
         import tinyhtml5
-        _HTML_PARSER = lambda raw: tinyhtml5.parse(raw, treebuilder="etree", namespaceHTMLElements=True)
+
+        def _parse_with_tinyhtml5(raw: bytes) -> ET.Element:
+            return tinyhtml5.parse(
+                raw, treebuilder="etree", namespaceHTMLElements=True
+            )
+
+        _HTML_PARSER = _parse_with_tinyhtml5
     except Exception:
         try:
             import html5lib
-            _HTML_PARSER = lambda raw: html5lib.parse(raw, treebuilder="etree", namespaceHTMLElements=True)
+
+            def _parse_with_html5lib(raw: bytes) -> ET.Element:
+                return html5lib.parse(
+                    raw, treebuilder="etree", namespaceHTMLElements=True
+                )
+
+            _HTML_PARSER = _parse_with_html5lib
         except Exception:
             _HTML_PARSER = False
     return _HTML_PARSER if _HTML_PARSER is not False else None
@@ -146,7 +160,8 @@ def _parse_content_html(raw: bytes) -> ET.Element | None:
 
 def weasyprint_available() -> bool:
     try:
-        import weasyprint
+        import weasyprint  # noqa: F401  (import probe: validates native deps too)
+
         return True
     except Exception:
         return False
@@ -210,7 +225,9 @@ def _parse_epub_spine(epub_path: str) -> tuple[str, list[str], str]:
                 if style.text and style.text.strip():
                     styles.append(
                         _rebase_css_urls(
-                            style.text, posixpath.dirname(content_path), opf_dir
+                            style.text,
+                            posixpath.dirname(content_path),
+                            opf_dir,
                         )
                     )
     return opf_dir, spine, "\n".join(styles)
@@ -271,9 +288,14 @@ def _rebase_salvaged_refs(markup: str, chapter_dir: str, opf_dir: str) -> str:
         url = m.group("url")
         if url.startswith((b"#", b"data:", b"/")) or b"://" in url or not url:
             return m.group(0)
-        rebased = _resolve_ref(url.decode("utf-8", errors="replace"), chapter_dir, opf_dir).encode("utf-8", errors="replace")
+        rebased = _resolve_ref(
+            url.decode("utf-8", errors="replace"), chapter_dir, opf_dir
+        ).encode("utf-8", errors="replace")
         return m.group("attr") + m.group("quote") + rebased + m.group("quote")
-    return _SALVAGED_REF_RE.sub(_sub, markup.encode("utf-8")).decode("utf-8", errors="replace")
+
+    return _SALVAGED_REF_RE.sub(_sub, markup.encode("utf-8")).decode(
+        "utf-8", errors="replace"
+    )
 
 
 def _is_garbage_text(decoded: str) -> bool:
@@ -310,7 +332,11 @@ def _salvage_raw_body(raw: bytes) -> str | None:
 
 
 def _css_length_to_px(value: str) -> float | None:
-    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(px|pt|pc|in|cm|mm|q)?\s*$", value, re.IGNORECASE)
+    m = re.match(
+        r"^\s*([0-9]*\.?[0-9]+)\s*(px|pt|pc|in|cm|mm|q)?\s*$",
+        value,
+        re.IGNORECASE,
+    )
     if not m:
         return None
     return float(m.group(1)) * _CSS_UNIT_PX[(m.group(2) or "px").lower()]
@@ -355,8 +381,11 @@ def _render_page_config() -> tuple[str, float]:
     larger than the printable page.
     """
     import config as _cfg
+
     size_css = str(getattr(_cfg, "EPUB_PAGE_SIZE", "A4") or "A4").strip()
-    margin_css = str(getattr(_cfg, "EPUB_PAGE_MARGIN", "15mm") or "15mm").strip()
+    margin_css = str(
+        getattr(_cfg, "EPUB_PAGE_MARGIN", "15mm") or "15mm"
+    ).strip()
     page_css = f"@page {{ size: {size_css}; margin: {margin_css}; }} "
     margin_px = _css_horizontal_margin_px(margin_css)
     if margin_px is None:
@@ -382,7 +411,11 @@ def _normalize_raster_image(
     pathological ones so no image can force right-edge clipping or bloat the
     PDF past Telegram's upload limit. Non-raster / unreadable images are left
     to the CSS backstop in _build_merged_html."""
-    if not resolved_ref or resolved_ref.startswith(("#", "/", "data:")) or "://" in resolved_ref:
+    if (
+        not resolved_ref
+        or resolved_ref.startswith(("#", "/", "data:"))
+        or "://" in resolved_ref
+    ):
         return
     safe = posixpath.normpath(zip_path)
     if not safe or safe.startswith("..") or safe.startswith("/"):
@@ -393,6 +426,7 @@ def _normalize_raster_image(
         return
     try:
         from PIL import Image
+
         im = Image.open(BytesIO(raw))
         width, height = im.size
     except Exception:
@@ -434,6 +468,7 @@ def _downsample_image(
         return None
     try:
         from PIL import Image
+
         im = Image.open(BytesIO(raw))
         width, height = im.size
     except Exception:
@@ -443,7 +478,10 @@ def _downsample_image(
     _page_css, content_w = _render_page_config()
     try:
         import config as _cfg
-        min_w = int(getattr(_cfg, "EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", 3000) or 3000)
+
+        min_w = int(
+            getattr(_cfg, "EPUB_IMAGE_DOWNSAMPLE_MIN_WIDTH_PX", 3000) or 3000
+        )
         quality = int(getattr(_cfg, "EPUB_IMAGE_JPEG_QUALITY", 85) or 85)
     except Exception:
         min_w, quality = 3000, 85
@@ -462,13 +500,19 @@ def _downsample_image(
             im = im.convert("RGB")
         im = im.resize((target_w, target_h), Image.LANCZOS)
         stem = os.path.splitext(os.path.basename(resolved_ref))[0]
-        new_ref = posixpath.join(posixpath.dirname(resolved_ref), f"{stem}.wp.jpg")
+        new_ref = posixpath.join(
+            posixpath.dirname(resolved_ref), f"{stem}.wp.jpg"
+        )
         out_path = os.path.join(image_dir, *new_ref.split("/"))
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         im.save(out_path, "JPEG", quality=quality, optimize=True)
         return new_ref
     except Exception as exc:
-        logger.debug("weasyprint: image downsampling skipped for %s: %s", resolved_ref, exc)
+        logger.debug(
+            "weasyprint: image downsampling skipped for %s: %s",
+            resolved_ref,
+            exc,
+        )
         return None
 
 
@@ -517,7 +561,11 @@ def _build_merged_html(
             if body is None:
                 raw_body = _salvage_raw_body(raw)
                 if raw_body is not None:
-                    bodies.append(_rebase_salvaged_refs(raw_body, posixpath.dirname(content_path), opf_dir))
+                    bodies.append(
+                        _rebase_salvaged_refs(
+                            raw_body, posixpath.dirname(content_path), opf_dir
+                        )
+                    )
                     salvaged += 1
                 else:
                     failed += 1
@@ -537,7 +585,11 @@ def _build_merged_html(
                         elem.set("src", resolved)
                         if tag == "img" and image_dir:
                             _normalize_raster_image(
-                                elem, zf, posixpath.join(opf_dir, resolved), image_dir, resolved
+                                elem,
+                                zf,
+                                posixpath.join(opf_dir, resolved),
+                                image_dir,
+                                resolved,
                             )
                 elif tag == "image":
                     src = elem.get("href") or elem.get("src")
@@ -546,7 +598,11 @@ def _build_merged_html(
                         elem.set("href", resolved)
                         if image_dir:
                             _normalize_raster_image(
-                                elem, zf, posixpath.join(opf_dir, resolved), image_dir, resolved
+                                elem,
+                                zf,
+                                posixpath.join(opf_dir, resolved),
+                                image_dir,
+                                resolved,
                             )
             bodies.append(ET.tostring(clean, encoding="unicode"))
         if image_dir and styles:
@@ -554,7 +610,11 @@ def _build_merged_html(
     if failed:
         logger.warning(
             "weasyprint: merge for %s: %d parsed, %d salvaged, %d failed (of %d spine chapters)",
-            os.path.basename(epub_path), parsed, salvaged, failed, len(content_paths),
+            os.path.basename(epub_path),
+            parsed,
+            salvaged,
+            failed,
+            len(content_paths),
         )
     style_block = f"<style>{styles}</style>" if styles else ""
     page_css, _content_w = _render_page_config()
@@ -582,7 +642,13 @@ def _merged_html_is_blank(html: str) -> bool:
     if len(text) >= _MIN_MERGE_TEXT_CHARS:
         return False
     lowered = html.lower()
-    return not ("<img" in lowered or "<image" in lowered or "<svg" in lowered or "<picture" in lowered or "url(" in lowered)
+    return not (
+        "<img" in lowered
+        or "<image" in lowered
+        or "<svg" in lowered
+        or "<picture" in lowered
+        or "url(" in lowered
+    )
 
 
 def _extract_epub(epub_path: str, dest_dir: str) -> None:
@@ -611,12 +677,21 @@ def _render_weasyprint(
     from weasyprint import HTML
 
     temp_pdf = pdf_path + ".wp.tmp"
-    state: dict = {"ok": False}
+    state: dict = {"ok": False, "abandoned": False}
     done = threading.Event()
 
     def _run() -> None:
         try:
             HTML(string=html, base_url=base_url).write_pdf(temp_pdf)
+            if state.get("abandoned"):
+                # The caller already gave up (timeout/cancel); the render must
+                # not leave its temp PDF behind, since nothing will reap it.
+                try:
+                    if os.path.exists(temp_pdf):
+                        os.remove(temp_pdf)
+                except Exception:
+                    pass
+                return
             if os.path.exists(temp_pdf) and os.path.getsize(temp_pdf) > 0:
                 state["ok"] = True
         except Exception as exc:
@@ -633,6 +708,9 @@ def _render_weasyprint(
             logger.warning("weasyprint: timed out after %ss", timeout)
             break
     if not state.get("ok"):
+        # Flag the still-running render as abandoned so it cleans up its own
+        # temp file when it eventually finishes (a thread cannot be killed).
+        state["abandoned"] = True
         try:
             if os.path.exists(temp_pdf):
                 os.remove(temp_pdf)
@@ -659,6 +737,7 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
     page instead of per-image get_image_rects() re-walks.
     """
     import config as _cfg
+
     try:
         budget_s = float(getattr(_cfg, "PDF_SANITY_CHECK_BUDGET_S", 0) or 0)
         fatal_pt = float(getattr(_cfg, "PDF_OVERFLOW_FATAL_PT", 0) or 0)
@@ -673,6 +752,7 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
         if size == 0:
             return "empty PDF file"
         import fitz
+
         doc = fitz.open(pdf_path)
         try:
             if doc.page_count == 0:
@@ -684,7 +764,8 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
                 if time.monotonic() - start > budget_s:
                     logger.warning(
                         "weasyprint: sanity scan of %s exceeded %ss budget; accepting render",
-                        os.path.basename(pdf_path), budget_s,
+                        os.path.basename(pdf_path),
+                        budget_s,
                     )
                     return None
                 pr = page.rect
@@ -698,7 +779,9 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
                         f"page size {pr.width:.0f}x{pr.height:.0f}pt outside "
                         f"{_MIN_PAGE_DIM_PT:.0f}-{_MAX_PAGE_DIM_PT:.0f}pt"
                     )
-                total_text += sum(1 for ch in page.get_text() if ch != "\ufffd")
+                total_text += sum(
+                    1 for ch in page.get_text() if ch != "\ufffd"
+                )
                 for info in page.get_image_info(xrefs=True):
                     total_images += 1
                     bbox = fitz.Rect(info.get("bbox", (0, 0, 0, 0)))
@@ -718,9 +801,16 @@ def _pdf_fails_sanity_check(pdf_path: str) -> str | None:
                         logger.warning(
                             "weasyprint: image on page %d of %s sticks out %.1fpt "
                             "past the page box (accepted; fatal threshold %.0fpt)",
-                            page.number + 1, os.path.basename(pdf_path), overflow, fatal_pt,
+                            page.number + 1,
+                            os.path.basename(pdf_path),
+                            overflow,
+                            fatal_pt,
                         )
-            if size <= _MIN_PDF_BYTES and total_text < _MIN_PDF_TEXT_CHARS and total_images == 0:
+            if (
+                size <= _MIN_PDF_BYTES
+                and total_text < _MIN_PDF_TEXT_CHARS
+                and total_images == 0
+            ):
                 return f"blank render ({size} bytes, no text or images)"
             return None
         finally:
@@ -738,6 +828,7 @@ def _reencode_pdf_image(info: dict, jpg_quality: int) -> bytes | None:
     """
     try:
         from PIL import Image
+
         raw = info.get("image")
         if not raw:
             return None
@@ -783,6 +874,7 @@ def _shrink_oversized_pdf(pdf_path: str) -> bool:
     approach Telegram's upload limit get smaller. Replaces the file in place
     only when the gain is meaningful."""
     import config as _cfg
+
     try:
         threshold = int(getattr(_cfg, "PDF_RECOMPRESS_MIN_BYTES", 0) or 0)
     except Exception:
@@ -795,14 +887,21 @@ def _shrink_oversized_pdf(pdf_path: str) -> bool:
     except OSError:
         return False
     try:
-        jpg_quality = int(getattr(_cfg, "PDF_RECOMPRESS_JPEG_QUALITY", 70) or 70)
-        min_gain_pct = float(getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_PCT", 5) or 5)
-        min_gain_bytes = int(getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_BYTES", 100000) or 100000)
+        jpg_quality = int(
+            getattr(_cfg, "PDF_RECOMPRESS_JPEG_QUALITY", 70) or 70
+        )
+        min_gain_pct = float(
+            getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_PCT", 5) or 5
+        )
+        min_gain_bytes = int(
+            getattr(_cfg, "PDF_RECOMPRESS_MIN_GAIN_BYTES", 100000) or 100000
+        )
     except Exception:
         jpg_quality, min_gain_pct, min_gain_bytes = 70, 5.0, 100000
     try:
         original_size = os.path.getsize(pdf_path)
         import fitz
+
         doc = fitz.open(pdf_path)
     except Exception:
         return False
@@ -853,7 +952,10 @@ def _shrink_oversized_pdf(pdf_path: str) -> bool:
             return False
         logger.info(
             "weasyprint: recompressed %d image(s) in %s: %d -> %d bytes",
-            replaced, os.path.basename(pdf_path), original_size, new_size,
+            replaced,
+            os.path.basename(pdf_path),
+            original_size,
+            new_size,
         )
         return True
     try:
@@ -871,7 +973,14 @@ def _calibre_fallback(
     cancel_check: Callable[[], bool] | None,
 ) -> bool:
     from utils.ebook_converter import convert_book_to_pdf_with_thumbnail
-    return convert_book_to_pdf_with_thumbnail(input_path, pdf_path, thumb_path, timeout=timeout, cancel_check=cancel_check)
+
+    return convert_book_to_pdf_with_thumbnail(
+        input_path,
+        pdf_path,
+        thumb_path,
+        timeout=timeout,
+        cancel_check=cancel_check,
+    )
 
 
 def _calibre_fallback_shrunk(
@@ -885,7 +994,9 @@ def _calibre_fallback_shrunk(
     # MB) before ebook-convert starts; running both in the same container is
     # what previously OOM-killed the worker.
     gc.collect()
-    if not _calibre_fallback(input_path, pdf_path, thumb_path, timeout, cancel_check):
+    if not _calibre_fallback(
+        input_path, pdf_path, thumb_path, timeout, cancel_check
+    ):
         return False
     _shrink_oversized_pdf(pdf_path)
     return True
@@ -901,30 +1012,47 @@ def convert_epub_to_pdf_fast(
     import config as _cfg
 
     if epub_is_drm_protected(input_path):
-        raise DRMProtectedError(f"DRM-protected EPUB: {os.path.basename(input_path)}")
+        raise DRMProtectedError(
+            f"DRM-protected EPUB: {os.path.basename(input_path)}"
+        )
 
     if not weasyprint_available():
-        return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, timeout, cancel_check)
+        return _calibre_fallback_shrunk(
+            input_path, pdf_path, thumb_path, timeout, cancel_check
+        )
     if not getattr(_cfg, "EPUB_FAST_CONVERT_ENABLED", True):
-        return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, timeout, cancel_check)
+        return _calibre_fallback_shrunk(
+            input_path, pdf_path, thumb_path, timeout, cancel_check
+        )
 
     tmp = tempfile.mkdtemp(prefix="wp_epub_")
     _unreadable = False
     try:
         if cancel_check is not None and cancel_check():
-            raise ConversionCancelledError(f"conversion cancelled: {input_path}")
+            raise ConversionCancelledError(
+                f"conversion cancelled: {input_path}"
+            )
         _render_start = time.monotonic()
         opf_dir, spine_paths, styles = _parse_epub_spine(input_path)
         _extract_epub(input_path, tmp)
         image_dir = os.path.join(tmp, opf_dir)
-        html = _build_merged_html(input_path, spine_paths, styles, opf_dir, image_dir=image_dir)
+        html = _build_merged_html(
+            input_path, spine_paths, styles, opf_dir, image_dir=image_dir
+        )
         base_url = image_dir
         if _merged_html_is_blank(html):
             if epub_is_drm_protected(input_path):
-                raise DRMProtectedError(f"DRM-protected EPUB: {os.path.basename(input_path)}")
+                raise DRMProtectedError(
+                    f"DRM-protected EPUB: {os.path.basename(input_path)}"
+                )
             _unreadable = True
-            logger.warning("weasyprint: merged content for %s is empty; using Calibre", os.path.basename(input_path))
-        elif _render_weasyprint(html, base_url, pdf_path, timeout, cancel_check):
+            logger.warning(
+                "weasyprint: merged content for %s is empty; using Calibre",
+                os.path.basename(input_path),
+            )
+        elif _render_weasyprint(
+            html, base_url, pdf_path, timeout, cancel_check
+        ):
             sanity = _pdf_fails_sanity_check(pdf_path)
             if sanity:
                 _unreadable = sanity.startswith("blank")
@@ -943,19 +1071,35 @@ def convert_epub_to_pdf_fast(
                 return True
         else:
             if cancel_check is not None and cancel_check():
-                raise ConversionCancelledError(f"conversion cancelled: {input_path}")
-            logger.warning("weasyprint: render failed/timed out after %ss for %s; using Calibre", int(time.monotonic() - _render_start), os.path.basename(input_path))
+                raise ConversionCancelledError(
+                    f"conversion cancelled: {input_path}"
+                )
+            logger.warning(
+                "weasyprint: render failed/timed out after %ss for %s; using Calibre",
+                int(time.monotonic() - _render_start),
+                os.path.basename(input_path),
+            )
     except ConversionCancelledError:
         raise
     except DRMProtectedError:
         raise
     except Exception as exc:
-        logger.warning("weasyprint: fast path failed (%s) for %s; using Calibre", exc, os.path.basename(input_path))
+        logger.warning(
+            "weasyprint: fast path failed (%s) for %s; using Calibre",
+            exc,
+            os.path.basename(input_path),
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     _remain = timeout - int(time.monotonic() - _render_start)
     if _unreadable:
         _cap = getattr(_cfg, "EPUB_EMPTY_MERGE_FALLBACK_SECONDS", 240)
-        logger.warning("weasyprint: capping Calibre fallback for %s at %ss (content was unreadable)", os.path.basename(input_path), min(_cap, max(60, _remain)))
+        logger.warning(
+            "weasyprint: capping Calibre fallback for %s at %ss (content was unreadable)",
+            os.path.basename(input_path),
+            min(_cap, max(60, _remain)),
+        )
         _remain = min(_cap, max(60, _remain))
-    return _calibre_fallback_shrunk(input_path, pdf_path, thumb_path, max(60, _remain), cancel_check)
+    return _calibre_fallback_shrunk(
+        input_path, pdf_path, thumb_path, max(60, _remain), cancel_check
+    )

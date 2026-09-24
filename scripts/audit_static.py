@@ -321,7 +321,9 @@ def _resolve_callable(
             return funcs[func.id]
         mod = _module_for_name(func.id, imports)
         if mod:
-            return _MODULE_DATA.get(mod, (None, None, {}, {}, {}))[2].get(func.id)
+            return _MODULE_DATA.get(mod, (None, None, {}, {}, {}))[2].get(
+                func.id
+            )
         return None
     if isinstance(func, ast.Attribute):
         value = func.value
@@ -345,7 +347,11 @@ def _resolve_callable(
                 mod = _module_for_name(root.id, imports)
                 if mod:
                     dotted = _DOTTED_BY_PATH.get(mod)
-                    sub_mod = _MODULES.get(f"{dotted}.{value.attr}") if dotted else None
+                    sub_mod = (
+                        _MODULES.get(f"{dotted}.{value.attr}")
+                        if dotted
+                        else None
+                    )
                     if sub_mod:
                         return _MODULE_DATA.get(
                             sub_mod, (None, None, {}, {}, {})
@@ -371,10 +377,13 @@ def _unawaited(node, parents) -> bool:
             if isinstance(fn, ast.Name) and fn.id in _COROUTINE_CONSUMERS:
                 return False
             if isinstance(fn, ast.Attribute) and (
-                fn.attr in _COROUTINE_CONSUMERS or fn.attr in ("append", "extend")
+                fn.attr in _COROUTINE_CONSUMERS
+                or fn.attr in ("append", "extend")
             ):
                 return False
-        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        if isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        ):
             return True
         child = cur
         cur = parents.get(cur)
@@ -405,7 +414,11 @@ def _check_kwargs(path, node, params, kwarg_var, findings, lines) -> None:
         return
     for kw in node.keywords:
         if kw.arg and kw.arg not in params:
-            code = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+            code = (
+                lines[node.lineno - 1].strip()
+                if node.lineno <= len(lines)
+                else ""
+            )
             findings.append(
                 (
                     path,
@@ -430,7 +443,9 @@ def _check_download_media_kwargs(path, node, func, findings, lines) -> None:
     for kw in node.keywords:
         if kw.arg != "part_size_kb":
             continue  # also skips **kwargs splats (kw.arg is None)
-        code = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        code = (
+            lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        )
         findings.append(
             (
                 path,
@@ -484,7 +499,9 @@ def _check_module(path, src, tree, funcs, classes, imports, findings) -> None:
         func = node.func
 
         if isinstance(func, (ast.Name, ast.Attribute)):
-            sig = _resolve_callable(path, func, parents, funcs, classes, imports)
+            sig = _resolve_callable(
+                path, func, parents, funcs, classes, imports
+            )
             if sig is not None:
                 is_async, params, kwarg_var = sig
                 _check_kwargs(path, node, params, kwarg_var, findings, lines)

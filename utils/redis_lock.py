@@ -11,7 +11,13 @@ logger = logging.getLogger(__name__)
 
 
 class RedisLock:
-    def __init__(self, name: str, ttl: int = 30, redis_url: str | None = None, owner: str | None = None):
+    def __init__(
+        self,
+        name: str,
+        ttl: int = 30,
+        redis_url: str | None = None,
+        owner: str | None = None,
+    ):
         self._name = f"lock:{name}"
         self._ttl = ttl
         self._redis_url = redis_url or os.getenv("REDIS_URL") or ""
@@ -30,7 +36,12 @@ class RedisLock:
         if not self._redis_url or aioredis is None:
             return None
         try:
-            self._client = aioredis.from_url(self._redis_url, decode_responses=True, socket_connect_timeout=3, socket_timeout=3)
+            self._client = aioredis.from_url(
+                self._redis_url,
+                decode_responses=True,
+                socket_connect_timeout=3,
+                socket_timeout=3,
+            )
             return self._client
         except Exception as e:
             logger.debug("RedisLock: failed to create client: %s", e)
@@ -43,7 +54,9 @@ class RedisLock:
             self._acquired = True
             return True
         try:
-            acquired = await client.set(self._name, self._owner, nx=True, ex=self._ttl)
+            acquired = await client.set(
+                self._name, self._owner, nx=True, ex=self._ttl
+            )
             if acquired:
                 self._acquired = True
             return bool(acquired)
@@ -77,7 +90,9 @@ class RedisLock:
             return True
         try:
             script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
-            result = await client.eval(script, 1, self._name, self._owner, self._ttl)
+            result = await client.eval(
+                script, 1, self._name, self._owner, self._ttl
+            )
             return bool(result)
         except Exception as e:
             logger.debug("RedisLock(%s): renew failed: %s", self._name, e)

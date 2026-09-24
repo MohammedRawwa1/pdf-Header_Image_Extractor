@@ -27,6 +27,7 @@ def ocr_available() -> bool:
 def ocr_enabled() -> bool:
     try:
         import config as _cfg
+
         if not getattr(_cfg, "ENABLE_OCR", True):
             return False
     except Exception:
@@ -50,22 +51,44 @@ def _raise_if_cancelled(cancel_check) -> None:
 def _import_ocr_deps():
     import pytesseract
     from PIL import Image
+
     return pytesseract, Image
 
 
-def _ocr_image_text(pytesseract, image_path: str, lang: str, cancel_check=None, timeout: int = 0) -> str:
+def _ocr_image_text(
+    pytesseract,
+    image_path: str,
+    lang: str,
+    cancel_check=None,
+    timeout: int = 0,
+) -> str:
     try:
         from PIL import Image
+
         with Image.open(image_path) as im:
             _raise_if_cancelled(cancel_check)
             rgb = im.convert("RGB")
-            return (pytesseract.image_to_string(rgb, lang=lang, timeout=timeout or None) or "").strip()
+            return (
+                pytesseract.image_to_string(
+                    rgb, lang=lang, timeout=timeout or None
+                )
+                or ""
+            ).strip()
     except Exception:
-        logger.warning("ocr: failed to OCR image %s", image_path, exc_info=True)
+        logger.warning(
+            "ocr: failed to OCR image %s", image_path, exc_info=True
+        )
         return ""
 
 
-def _ocr_pdf_text(pytesseract, pdf_path: str, lang: str, dpi: int, cancel_check=None, timeout: int = 0) -> str:
+def _ocr_pdf_text(
+    pytesseract,
+    pdf_path: str,
+    lang: str,
+    dpi: int,
+    cancel_check=None,
+    timeout: int = 0,
+) -> str:
     try:
         import fitz
         from PIL import Image
@@ -83,10 +106,19 @@ def _ocr_pdf_text(pytesseract, pdf_path: str, lang: str, dpi: int, cancel_check=
             try:
                 page = doc.load_page(page_num)
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                text = (pytesseract.image_to_string(img, lang=lang, timeout=timeout or None) or "").strip()
+                img = Image.frombytes(
+                    "RGB", (pix.width, pix.height), pix.samples
+                )
+                text = (
+                    pytesseract.image_to_string(
+                        img, lang=lang, timeout=timeout or None
+                    )
+                    or ""
+                ).strip()
             except Exception:
-                logger.warning("ocr: page %d failed for %s", page_num + 1, pdf_path)
+                logger.warning(
+                    "ocr: page %d failed for %s", page_num + 1, pdf_path
+                )
                 text = ""
             if text:
                 chunks.append(f"--- Page {page_num + 1} ---\n{text}")
@@ -95,7 +127,14 @@ def _ocr_pdf_text(pytesseract, pdf_path: str, lang: str, dpi: int, cancel_check=
     return "\n\n".join(chunks)
 
 
-def run_ocr(input_path: str, filename: str, lang: str | None = None, dpi: int = 200, timeout: int = 0, cancel_check=None) -> str:
+def run_ocr(
+    input_path: str,
+    filename: str,
+    lang: str | None = None,
+    dpi: int = 200,
+    timeout: int = 0,
+    cancel_check=None,
+) -> str:
     lang = _resolve_lang(lang)
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
         return ""
@@ -106,19 +145,54 @@ def run_ocr(input_path: str, filename: str, lang: str | None = None, dpi: int = 
         return ""
     ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
     if ext == "pdf":
-        return _ocr_pdf_text(pytesseract, input_path, lang, dpi=dpi, timeout=timeout, cancel_check=cancel_check)
-    return _ocr_image_text(pytesseract, input_path, lang, timeout=timeout, cancel_check=cancel_check)
+        return _ocr_pdf_text(
+            pytesseract,
+            input_path,
+            lang,
+            dpi=dpi,
+            timeout=timeout,
+            cancel_check=cancel_check,
+        )
+    return _ocr_image_text(
+        pytesseract,
+        input_path,
+        lang,
+        timeout=timeout,
+        cancel_check=cancel_check,
+    )
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:
-    try:
-        if os.name == "posix" and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:
-                proc.kill()
-        else:
+    """Kill a child and its whole process group, then reap it.
+
+    ocrmypdf drives tesseract as a child; killing only the direct process
+    would leave the OCR child orphaned.  Escalates SIGTERM \u2192 SIGKILL and
+    always waits so the child cannot linger as a zombie.
+    """
+    if proc.poll() is not None:
+        return
+
+    def _signal(sig: int) -> None:
+        try:
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(proc.pid), sig)
+                    return
+                except Exception:
+                    pass
             proc.kill()
+        except Exception:
+            pass
+
+    _signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5.0)
+        return
+    except Exception:
+        pass
+    _signal(signal.SIGKILL)
+    try:
+        proc.wait(timeout=5.0)
     except Exception:
         pass
 
@@ -146,12 +220,32 @@ def _extract_pdf_text(pdf_path: str) -> str:
     return "\n\n".join(chunks)
 
 
-def run_ocr_pdf(input_path: str, filename: str, output_path: str, lang: str | None = None, dpi: int = 200, timeout: int = 0, cancel_check=None) -> str | None:
+def run_ocr_pdf(
+    input_path: str,
+    filename: str,
+    output_path: str,
+    lang: str | None = None,
+    dpi: int = 200,
+    timeout: int = 0,
+    cancel_check=None,
+) -> str | None:
     lang = _resolve_lang(lang)
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
         return None
     ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
-    cmd = ["ocrmypdf", "--quiet", "--redo-ocr", "--output-type", "pdf", "--optimize", "1", "--jobs", "1", "--language", lang]
+    cmd = [
+        "ocrmypdf",
+        "--quiet",
+        "--redo-ocr",
+        "--output-type",
+        "pdf",
+        "--optimize",
+        "1",
+        "--jobs",
+        "1",
+        "--language",
+        lang,
+    ]
     if timeout and timeout > 0:
         cmd += ["--tesseract-timeout", str(int(timeout))]
     if ext in ("jpg", "jpeg", "png", "webp"):
@@ -161,33 +255,65 @@ def run_ocr_pdf(input_path: str, filename: str, output_path: str, lang: str | No
     if ext == "webp":
         try:
             from PIL import Image
+
             _png = output_path + ".webp_input.png"
             with Image.open(input_path) as _im:
                 _im.convert("RGB").save(_png, "PNG")
             _real_input = _png
             _cleanup_png = _png
         except Exception:
-            logger.warning("ocr: failed to pre-convert webp %s for ocrmypdf", filename)
+            logger.warning(
+                "ocr: failed to pre-convert webp %s for ocrmypdf", filename
+            )
     cmd += [_real_input, output_path]
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name == "posix")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
     except Exception:
-        logger.warning("ocr: failed to start ocrmypdf for %s", filename, exc_info=True)
+        logger.warning(
+            "ocr: failed to start ocrmypdf for %s", filename, exc_info=True
+        )
         return None
+    # Enforce a wall-clock deadline: the caller's ``timeout`` used to only be
+    # forwarded to tesseract (``--tesseract-timeout``), so a wedged ocrmypdf
+    # could spin this loop forever.
+    _deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
     try:
         while True:
-            _rc = proc.poll()
-            if _rc is not None:
+            try:
+                # communicate() keeps draining stdout/stderr, so a chatty
+                # ocrmypdf can never block on a full pipe while we poll.
+                _out, _err = proc.communicate(timeout=0.5)
                 break
-            if cancel_check and cancel_check():
-                _terminate_process_group(proc)
-                raise OCRCancelledError("OCR cancelled")
-            time.sleep(0.5)
-        _out, _err = proc.communicate()
+            except subprocess.TimeoutExpired:
+                if cancel_check and cancel_check():
+                    _terminate_process_group(proc)
+                    raise OCRCancelledError("OCR cancelled")
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    _terminate_process_group(proc)
+                    logger.warning(
+                        "ocr: ocrmypdf timed out after %ss for %s",
+                        timeout,
+                        filename,
+                    )
+                    return None
+        _rc = proc.returncode
         if _rc != 0:
-            logger.warning("ocr: ocrmypdf failed (rc=%s) for %s: %s", _rc, filename, (_err or b"").decode(errors="replace")[-500:])
+            logger.warning(
+                "ocr: ocrmypdf failed (rc=%s) for %s: %s",
+                _rc,
+                filename,
+                (_err or b"").decode(errors="replace")[-500:],
+            )
             return None
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        if (
+            not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0
+        ):
             logger.warning("ocr: ocrmypdf produced no output for %s", filename)
             return None
         return _extract_pdf_text(output_path)

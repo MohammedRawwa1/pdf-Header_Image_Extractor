@@ -46,13 +46,22 @@ def _get_pdf_checks(file_unique_id: str | None) -> dict | None:
             return str(v) in ("1", "true", "True")
 
         _ch = _raw.get("content_hash")
-        return {"has_thumb": _b(_raw.get("has_thumb")), "has_text_layer": _b(_raw.get("has_text_layer")), "content_hash": str(_ch) if _ch else None}
+        return {
+            "has_thumb": _b(_raw.get("has_thumb")),
+            "has_text_layer": _b(_raw.get("has_text_layer")),
+            "content_hash": str(_ch) if _ch else None,
+        }
     except Exception:
         logger.debug("Failed to read pdf check cache for %s", file_unique_id)
         return None
 
 
-def _store_pdf_checks(file_unique_id: str | None, has_thumb: bool | None = None, has_text_layer: bool | None = None, content_hash: str | None = None) -> None:
+def _store_pdf_checks(
+    file_unique_id: str | None,
+    has_thumb: bool | None = None,
+    has_text_layer: bool | None = None,
+    content_hash: str | None = None,
+) -> None:
     if not file_unique_id:
         return
     try:
@@ -73,7 +82,9 @@ def _store_pdf_checks(file_unique_id: str | None, has_thumb: bool | None = None,
         logger.debug("Failed to cache pdf checks for %s", file_unique_id)
 
 
-def _store_fuid_binding(file_unique_id: str | None, content_hash: str | None) -> None:
+def _store_fuid_binding(
+    file_unique_id: str | None, content_hash: str | None
+) -> None:
     if not file_unique_id or not content_hash:
         return
     try:
@@ -109,7 +120,9 @@ def processed_op_field(op: str, target: str | None = None) -> str:
     return f"{op}:{target}" if target else op
 
 
-def get_processed_op(rec: dict | None, op: str, target: str | None = None) -> dict | None:
+def get_processed_op(
+    rec: dict | None, op: str, target: str | None = None
+) -> dict | None:
     if not rec:
         return None
     ops = rec.get("ops") or {}
@@ -173,11 +186,20 @@ def get_processed_by_file_unique_id(file_unique_id: str | None) -> dict | None:
 
 
 def upsert_processed_record(
-    content_hash: str | None, op: str, status: str, *,
-    filename: str | None = None, file_size: int | None = None, file_id: str | None = None,
-    thumb_file_id: str | None = None, delivery: str | None = None,
-    src_chat_id: int | str | None = None, src_message_id: int | None = None,
-    user_id: int | None = None, chat_id: int | None = None, target: str | None = None,
+    content_hash: str | None,
+    op: str,
+    status: str,
+    *,
+    filename: str | None = None,
+    file_size: int | None = None,
+    file_id: str | None = None,
+    thumb_file_id: str | None = None,
+    delivery: str | None = None,
+    src_chat_id: int | str | None = None,
+    src_message_id: int | None = None,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    target: str | None = None,
 ) -> None:
     key = processed_key(content_hash)
     if not key:
@@ -199,12 +221,22 @@ def upsert_processed_record(
             entry["src_message_id"] = int(src_message_id)
         if target:
             entry["target"] = target
-        meta = {"filename": filename, "size": int(file_size or 0), "at": int(time.time())}
+        meta = {
+            "filename": filename,
+            "size": int(file_size or 0),
+            "at": int(time.time()),
+        }
         if user_id is not None:
             meta["user_id"] = user_id
         if chat_id is not None:
             meta["chat_id"] = chat_id
-        r.hset(key, mapping={f"ops:{processed_op_field(op, target)}": json.dumps(entry), "meta": json.dumps(meta)})
+        r.hset(
+            key,
+            mapping={
+                f"ops:{processed_op_field(op, target)}": json.dumps(entry),
+                "meta": json.dumps(meta),
+            },
+        )
         r.expire(key, PROCESSED_TTL)
     except Exception:
         logger.debug("Failed to cache processed result for %s", key)

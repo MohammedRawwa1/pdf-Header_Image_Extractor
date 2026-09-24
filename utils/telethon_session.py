@@ -8,13 +8,13 @@ import time
 try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
-except Exception:                                          
+except Exception:
     TelegramClient = None
     StringSession = None
 
 try:
     from pyrogram import Client as PyrogramClient
-except Exception:                                          
+except Exception:
     PyrogramClient = None
 
 logger = logging.getLogger(__name__)
@@ -52,51 +52,28 @@ def get_telethon_session_path() -> str:
     session_dir = get_telethon_session_dir()
     try:
         os.makedirs(session_dir, exist_ok=True)
-    except Exception:              
+    except Exception:
         pass
     return os.path.join(session_dir, get_telethon_session_name())
 
 
-                                                                           
- 
-                                                                    
-                                                                       
-                                                                      
- 
-                                                                       
-                                                                    
-                                                                            
-                                                  
-                                                                    
-
-                                
 _KEY_TELETHON = "telethon_session"
 _KEY_PYROGRAM = "pyrogram_session"
 
-                                                                          
- 
-                                                                         
-                                                                    
-                                                                      
-                                                                    
- 
-                                                                  
-                                                                 
-                                                              
-                                                                    
+
 _SESSION_CACHE_DATA = {}
 _SESSION_CACHE_EXPIRES = {}
-_SESSION_CACHE_TTL = 60           
+_SESSION_CACHE_TTL = 60
 _SESSION_CACHE_LOCK = threading.Lock()
 
 
 def _cache_key(user_id: int | None = None) -> str:
-                                                                              
+
     return "global" if user_id is None else f"user:{user_id}"
 
 
 def _get_cached_sessions(user_id: int | None = None) -> dict | None:
-                                                                             
+
     k = _cache_key(user_id)
     with _SESSION_CACHE_LOCK:
         entry = _SESSION_CACHE_DATA.get(k)
@@ -106,19 +83,30 @@ def _get_cached_sessions(user_id: int | None = None) -> dict | None:
         return None
 
 
+def _prune_session_cache_locked(now: float) -> None:
+    """Drop expired cache entries (must be called with the lock held).
+
+    Expiry is otherwise only checked on read, so entries for users that never
+    come back would pin their data (and expiry record) in the module dicts for
+    the lifetime of the process.
+    """
+    stale = [k for k, exp in _SESSION_CACHE_EXPIRES.items() if exp <= now]
+    for k in stale:
+        _SESSION_CACHE_DATA.pop(k, None)
+        _SESSION_CACHE_EXPIRES.pop(k, None)
+
+
 def _set_cached_sessions(data: dict, user_id: int | None = None):
-                                                                     
     k = _cache_key(user_id)
+    now = time.time()
     with _SESSION_CACHE_LOCK:
+        _prune_session_cache_locked(now)
         _SESSION_CACHE_DATA[k] = data
-        _SESSION_CACHE_EXPIRES[k] = time.time() + _SESSION_CACHE_TTL
+        _SESSION_CACHE_EXPIRES[k] = now + _SESSION_CACHE_TTL
 
 
 def _invalidate_session_cache(user_id: int | None = None):
-\
-\
-\
-       
+
     with _SESSION_CACHE_LOCK:
         if user_id is not None:
             k = _cache_key(user_id)
@@ -130,14 +118,7 @@ def _invalidate_session_cache(user_id: int | None = None):
 
 
 def _get_persisted_session_path(user_id: int | None = None) -> str:
-\
-\
-\
-\
-\
-\
-\
-       
+
     base = get_telethon_session_path() + ".session"
     if user_id is not None:
         return f"{base}.{user_id}.json"
@@ -145,20 +126,7 @@ def _get_persisted_session_path(user_id: int | None = None) -> str:
 
 
 def _load_all_sessions_from_file(user_id: int | None = None) -> dict:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
-                                                             
+
     cached = _get_cached_sessions(user_id=user_id)
     if cached is not None:
         return cached
@@ -177,24 +145,14 @@ def _load_all_sessions_from_file(user_id: int | None = None) -> dict:
         logger.debug(
             "session: failed to read persisted session file %s: %s", path, exc
         )
-                                                                                     
-                                                                                    
-                                                                                     
-                                                                                   
-                                                                                      
-                                                                                   
+
         return {}
 
 
 async def _load_all_sessions_from_file_async(
     user_id: int | None = None,
 ) -> dict:
-\
-\
-\
-\
-\
-       
+
     return await asyncio.to_thread(_load_all_sessions_from_file, user_id)
 
 
@@ -203,32 +161,9 @@ def save_session_string_to_file(
     client_type: str = "telethon",
     user_id: int | None = None,
 ) -> bool:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     path = _get_persisted_session_path(user_id=user_id)
     try:
-                                                                               
         existing = {}
         if os.path.exists(path):
             try:
@@ -254,7 +189,7 @@ def save_session_string_to_file(
             path,
             len(session_str),
         )
-                                                                         
+
         _invalidate_session_cache(user_id=user_id)
         return True
     except Exception as exc:
@@ -272,12 +207,7 @@ async def save_session_string_to_file_async(
     client_type: str = "telethon",
     user_id: int | None = None,
 ) -> bool:
-\
-\
-\
-\
-\
-       
+
     return await asyncio.to_thread(
         save_session_string_to_file,
         session_str,
@@ -290,21 +220,7 @@ def _load_session_string_from_file(
     client_type: str = "telethon",
     user_id: int | None = None,
 ) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     data = _load_all_sessions_from_file(user_id=user_id)
     if not data:
         return None
@@ -325,12 +241,7 @@ async def _load_session_string_from_file_async(
     client_type: str = "telethon",
     user_id: int | None = None,
 ) -> str | None:
-\
-\
-\
-\
-\
-       
+
     data = await _load_all_sessions_from_file_async(user_id=user_id)
     if not data:
         return None
@@ -348,18 +259,7 @@ async def _load_session_string_from_file_async(
 
 
 def _get_configured_session_string(user_id: int | None = None) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
-                                                                          
+
     if user_id is not None:
         file_str = _load_session_string_from_file(
             client_type="telethon", user_id=user_id
@@ -367,7 +267,6 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
         if file_str:
             return file_str
 
-                                                        
     env_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -380,7 +279,6 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-                                                                           
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return file_str
@@ -391,23 +289,7 @@ def _get_configured_session_string(user_id: int | None = None) -> str | None:
 async def _resolve_telethon_session_with_source(
     user_id: int | None = None, db_model: object | None = None
 ) -> tuple[str | None, str]:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
-                                                                          
+
     if user_id is not None:
         file_str = _load_session_string_from_file(
             client_type="telethon", user_id=user_id
@@ -415,11 +297,8 @@ async def _resolve_telethon_session_with_source(
         if file_str:
             return file_str, "json"
 
-                                                                           
-                                                                      
     if user_id is not None:
         try:
-                                                                             
             if db_model is not None and hasattr(db_model, "load_session"):
                 saved_session = await db_model.load_session(user_id)
             else:
@@ -447,7 +326,6 @@ async def _resolve_telethon_session_with_source(
                 )
                 return str(session_value), "mongodb"
 
-                                                              
     env_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -460,7 +338,6 @@ async def _resolve_telethon_session_with_source(
     if env_str:
         return env_str, "env"
 
-                                                                           
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return file_str, "global-json"
@@ -474,10 +351,7 @@ async def _resolve_telethon_session_with_source(
 async def get_telethon_session_string_for_user(
     user_id: int | None = None, db_model: object | None = None
 ) -> str | None:
-\
-\
-\
-       
+
     value, _source = await _resolve_telethon_session_with_source(
         user_id, db_model
     )
@@ -487,14 +361,7 @@ async def get_telethon_session_string_for_user(
 async def get_telethon_session_status(
     user_id: int | None = None, db_model: object | None = None
 ) -> dict:
-\
-\
-\
-\
-\
-\
-\
-       
+
     session_path = get_telethon_session_path()
     session_str = await get_telethon_session_string_for_user(
         user_id=user_id, db_model=db_model
@@ -559,31 +426,12 @@ async def get_telethon_session_status(
 def build_telethon_client(
     api_id: int, api_hash: str, session_str: str | None = None
 ):
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if TelegramClient is None:
         raise RuntimeError(
             "Telethon is not installed. Install telethon to use userbot fallback."
         )
 
-                                                                                     
     try:
         _timeout = int(os.getenv("TELETHON_TIMEOUT", "120"))
     except (TypeError, ValueError):
@@ -601,7 +449,6 @@ def build_telethon_client(
     except (TypeError, ValueError):
         _retry_delay = 3
 
-                                                                         
     resolved_session = session_str or _get_configured_session_string()
 
     if resolved_session:
@@ -630,9 +477,7 @@ def build_telethon_client(
                 "session at %s.session",
                 get_telethon_session_path(),
             )
-                                                      
 
-                                                                         
     session_path = get_telethon_session_path()
     logger.info(
         "session: building Telethon client with file-based session at %s.session",
@@ -650,18 +495,7 @@ def build_telethon_client(
 
 
 def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
-                                                                          
+
     if user_id is not None:
         file_str = _load_session_string_from_file(
             client_type="pyrogram", user_id=user_id
@@ -669,7 +503,6 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
         if file_str:
             return file_str
 
-                                                        
     env_str = _get_env_value(
         "PYROGRAM_SESSION",
         "pyrogram_session",
@@ -679,7 +512,6 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
     if env_str:
         return env_str
 
-                                                                           
     file_str = _load_session_string_from_file(client_type="pyrogram")
     if file_str:
         return file_str
@@ -690,23 +522,7 @@ def get_pyrogram_session_string(user_id: int | None = None) -> str | None:
 async def _resolve_pyrogram_session_with_source(
     user_id: int | None = None, db_model: object | None = None
 ) -> tuple[str | None, str]:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
-                                                                          
+
     if user_id is not None:
         file_str = _load_session_string_from_file(
             client_type="pyrogram", user_id=user_id
@@ -714,8 +530,6 @@ async def _resolve_pyrogram_session_with_source(
         if file_str:
             return file_str, "json"
 
-                                                                           
-                                                                      
     if user_id is not None:
         try:
             if db_model is not None and hasattr(db_model, "load_session"):
@@ -741,7 +555,6 @@ async def _resolve_pyrogram_session_with_source(
                 )
                 return str(session_value), "mongodb"
 
-                                                              
     env_str = _get_env_value(
         "PYROGRAM_SESSION",
         "pyrogram_session",
@@ -751,7 +564,6 @@ async def _resolve_pyrogram_session_with_source(
     if env_str:
         return env_str, "env"
 
-                                                                           
     file_str = _load_session_string_from_file(client_type="pyrogram")
     if file_str:
         return file_str, "global-json"
@@ -765,10 +577,7 @@ async def _resolve_pyrogram_session_with_source(
 async def get_pyrogram_session_string_for_user(
     user_id: int | None = None, db_model: object | None = None
 ) -> str | None:
-\
-\
-\
-       
+
     value, _source = await _resolve_pyrogram_session_with_source(
         user_id, db_model
     )
@@ -781,17 +590,7 @@ async def resolve_session_string(
     user_id: int | None = None,
     db_model: object | None = None,
 ) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if session_str is not None:
         return session_str
     if client_type == "telethon":
@@ -806,16 +605,7 @@ async def resolve_session_string(
 
 
 async def restore_per_user_session_files() -> int:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     restored = 0
     try:
         from utils.db import COL_SESSIONS, get_db, query
@@ -824,16 +614,18 @@ async def restore_per_user_session_files() -> int:
         if db is None:
             return 0
 
-        docs = await (
-            query(COL_SESSIONS, db)
+        docs = (
+            await query(COL_SESSIONS, db)
             .where("telethon_session", "!=", "")
             .get()
-        ) or []
-        pyro_docs = await (
-            query(COL_SESSIONS, db)
+            or []
+        )
+        pyro_docs = (
+            await query(COL_SESSIONS, db)
             .where("pyrogram_session", "!=", "")
             .get()
-        ) or []
+            or []
+        )
 
         seen: set = set()
         for doc in list(docs) + list(pyro_docs):
@@ -849,10 +641,7 @@ async def restore_per_user_session_files() -> int:
             seen.add(uid)
 
             written = False
-                                                                              
-                                                                            
-                                                                                
-                                                                               
+
             tele = doc.get("telethon_session")
             pyro = doc.get("pyrogram_session")
             if not tele and not pyro:
@@ -882,7 +671,8 @@ async def restore_per_user_session_files() -> int:
         return restored
     except Exception as exc:
         logger.debug(
-            "session: restore per-user session files from MongoDB failed: %s", exc
+            "session: restore per-user session files from MongoDB failed: %s",
+            exc,
         )
         return 0
 
@@ -890,31 +680,7 @@ async def restore_per_user_session_files() -> int:
 def build_pyrogram_client(
     api_id: int, api_hash: str, session_str: str | None = None
 ) -> object | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if PyrogramClient is None:
         logger.debug(
             "Pyrogram is not installed; cannot use Pyrogram session string."
@@ -926,7 +692,6 @@ def build_pyrogram_client(
     if not session_str:
         return None
 
-                                                    
     try:
         sleep_threshold = int(os.getenv("PYROGRAM_SLEEP_THRESHOLD", "30"))
     except (TypeError, ValueError):
@@ -945,7 +710,7 @@ def build_pyrogram_client(
             in_memory=True,
             sleep_threshold=sleep_threshold,
         )
-                                                    
+
         client.MAX_RETRIES = max_retries
         logger.info(
             "userbot: Pyrogram client configured with sleep_threshold=%s max_retries=%s",
@@ -961,23 +726,17 @@ def build_pyrogram_client(
 
 
 def is_pyrogram_available(user_id: int | None = None) -> bool:
-\
-\
-\
-\
-       
+
     if PyrogramClient is None:
         return False
     return bool(get_pyrogram_session_string(user_id=user_id))
 
 
 def has_usable_telethon_session(user_id: int | None = None) -> bool:
-                                                                                               
+
     if TelegramClient is None:
         return False
 
-                                                                        
-                                                                     
     if user_id is not None:
         file_str = _load_session_string_from_file(
             client_type="telethon", user_id=user_id
@@ -985,7 +744,6 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
         if file_str:
             return True
 
-                                                        
     session_str = _get_env_value(
         "API_SESSION",
         "SESSION",
@@ -998,12 +756,10 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
     if session_str:
         return True
 
-                                                                    
     file_str = _load_session_string_from_file(client_type="telethon")
     if file_str:
         return True
 
-                                                
     session_path = get_telethon_session_path()
     return os.path.exists(session_path) or os.path.exists(
         session_path + ".session"
@@ -1011,22 +767,19 @@ def has_usable_telethon_session(user_id: int | None = None) -> bool:
 
 
 def is_telethon_available(user_id: int | None = None) -> bool:
-                                                              
+
     return has_usable_telethon_session(user_id=user_id)
 
 
 def get_preferred_client_type(user_id: int | None = None) -> str:
-                                                                                
+
     if is_pyrogram_available(user_id=user_id):
         return "pyrogram"
     return "telethon"
 
 
 def get_userbot_credentials():
-\
-\
-\
-       
+
     api_id = (
         os.getenv("API_ID")
         or os.getenv("api_id")
@@ -1051,7 +804,7 @@ def get_userbot_credentials():
 
 
 def normalize_target(chat_id: int | str) -> int | str:
-                                                                             
+
     if isinstance(chat_id, str) and chat_id.startswith("@"):
         return chat_id
     try:

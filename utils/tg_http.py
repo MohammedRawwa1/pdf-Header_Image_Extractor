@@ -34,37 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 def _sanitize_outbound(text: str | None) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if text is None:
         return None
     return sanitize_text(text)
 
-                                                                        
-                                                                               
-                                                                            
-                                                                         
-                                                                              
-                                                        
+
 _SESSION = requests.Session()
 atexit.register(_SESSION.close)
 
 
 def _get_bot_token(bot_token: str | None = None) -> str | None:
-\
-\
-\
-\
-\
-\
-       
+
     if bot_token:
         return bot_token
     try:
@@ -76,13 +57,6 @@ def _get_bot_token(bot_token: str | None = None) -> str | None:
 
 
 class _BinaryFile(Protocol):
-\
-\
-\
-\
-\
-       
-
     def read(self, size: int = -1) -> bytes: ...
 
     def seek(self, offset: int, whence: int = 0) -> int: ...
@@ -93,26 +67,16 @@ class _BinaryFile(Protocol):
 
 
 class _ProgressCallback(Protocol):
-\
-\
-\
-\
-\
-       
-
     def __call__(self, current: int, total: int) -> None: ...
 
 
 class _ProgressFileReader:
-\
-\
-\
-\
-\
-       
-
     def __init__(
-        self, fh: _BinaryFile, total: int, callback: _ProgressCallback, throttle: float = 0.7
+        self,
+        fh: _BinaryFile,
+        total: int,
+        callback: _ProgressCallback,
+        throttle: float = 0.7,
     ):
         self._fh = fh
         self._total = total or 0
@@ -145,13 +109,11 @@ class _ProgressFileReader:
         if self._callback is None:
             return
         now = time.time()
-        if self._read >= self._total or (
-            now - self._last_t
-        ) >= self._throttle:
+        if self._read >= self._total or (now - self._last_t) >= self._throttle:
             self._last_t = now
             try:
                 self._callback(self._read, self._total)
-            except Exception:                                        
+            except Exception:
                 pass
 
 
@@ -168,21 +130,9 @@ def _tg_send_document(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> dict:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     if progress_callback is not None:
-                                                                           
         try:
             _doc_total = os.fstat(doc_fileobj.fileno()).st_size
         except Exception:
@@ -191,11 +141,7 @@ def _tg_send_document(
             doc_fileobj, _doc_total, progress_callback
         )
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-                                                                    
-                                                                           
-                                                                     
-                                                                         
-                                   
+
     filename = _sanitize_outbound(filename) or "file"
     caption = _sanitize_outbound(caption)
     files: dict[str, Any] = {"document": (filename, doc_fileobj)}
@@ -204,20 +150,15 @@ def _tg_send_document(
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-                                                                            
-                                                                              
-                                                             
+
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-                                                                      
-                                                                         
-                                             
             try:
                 doc_fileobj.seek(0)
                 if thumb_fileobj is not None:
                     thumb_fileobj.seek(0)
-            except Exception:                                     
+            except Exception:
                 pass
             r = _SESSION.post(url, data=data, files=files, timeout=120)
             if r.status_code in (429,) or r.status_code >= 500:
@@ -230,13 +171,10 @@ def _tg_send_document(
                     attempt + 1,
                     filename,
                 )
-                                                                            
-                                                                             
-                                                                            
-                                                                    
+
                 try:
                     r.close()
-                except Exception:                                    
+                except Exception:
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -244,9 +182,7 @@ def _tg_send_document(
                 raise last_exc
             r.raise_for_status()
             _res = r.json()
-                                                                          
-                                                                          
-                                                         
+
             if _res and _res.get("ok"):
                 _attach_send_buttons(
                     chat_id,
@@ -284,19 +220,7 @@ def _attach_send_buttons(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if not res or not res.get("ok"):
         return
     try:
@@ -310,9 +234,6 @@ def _attach_send_buttons(
             and filename.lower().endswith(".pdf")
             and "compress" not in done_ops
         ):
-                                                                           
-                                                                            
-                                     
             _actions.append(
                 (
                     COMPRESS_PDF_ACTION[0],
@@ -326,8 +247,6 @@ def _attach_send_buttons(
             and not filename.lower().endswith(".pdf")
             and "convert" not in done_ops
         ):
-                                                                       
-                                             
             _actions.append(
                 (
                     BOOK_CONVERT_ACTION[0],
@@ -341,8 +260,6 @@ def _attach_send_buttons(
             and ocr_enabled()
             and "ocr" not in done_ops
         ):
-                                                                          
-                                                                     
             _actions.append((OCR_ACTION[0], OCR_ACTION[1], OCR_ACTION[2]))
         if _actions:
             _attach_pending_buttons(
@@ -355,7 +272,7 @@ def _attach_send_buttons(
                 _doc.get("file_size"),
                 tuple(_actions),
             )
-    except Exception:                                   
+    except Exception:
         pass
 
 
@@ -370,18 +287,10 @@ def _tg_send_document_by_id(
     ocr_user_id: int | None = None,
     done_ops: tuple[str, ...] = (),
 ) -> dict:
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-                                                                           
-                                                                          
-                                                          
+
     filename = _sanitize_outbound(filename) or "file"
     caption = _sanitize_outbound(caption)
     data: dict[str, Any] = {
@@ -405,7 +314,7 @@ def _tg_send_document_by_id(
                 )
                 try:
                     r.close()
-                except Exception:                                    
+                except Exception:
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -451,19 +360,13 @@ def _tg_send_message(
 ):
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                                                                          
-                                                                          
-                                                            
+
     data = {"chat_id": str(chat_id), "text": _sanitize_outbound(text) or ""}
     if reply_markup is not None:
-                                                                           
-                                                                       
-                                                      
         data["reply_markup"] = json.dumps(reply_markup)
     if parse_mode:
         data["parse_mode"] = parse_mode
-                                                                        
-                                                                           
+
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -478,14 +381,10 @@ def _tg_send_message(
                     attempt + 1,
                     chat_id,
                 )
-                                                                            
-                                                                              
-                                                                         
-                                                                            
-                                             
+
                 try:
                     r.close()
-                except Exception:                                    
+                except Exception:
                     pass
                 if attempt < 2:
                     time.sleep(2**attempt)
@@ -517,13 +416,7 @@ def _tg_edit_message_text(
     parse_mode: str = "Markdown",
     reply_markup: dict | None = None,
 ):
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token()
     if not bot_token:
         return None
@@ -532,12 +425,10 @@ def _tg_edit_message_text(
         data = {
             "chat_id": str(chat_id),
             "message_id": message_id,
-                                                                          
             "text": _sanitize_outbound(text) or "",
             "parse_mode": parse_mode,
         }
         if reply_markup is not None:
-                                                                
             data["reply_markup"] = json.dumps(reply_markup)
         r = _SESSION.post(url, data=data, timeout=15)
         r.raise_for_status()
@@ -549,14 +440,7 @@ def _tg_edit_message_text(
 def _tg_edit_message_reply_markup(
     chat_id: int, message_id: int | None, reply_markup: dict | None = None
 ) -> bool:
-\
-\
-\
-\
-\
-\
-\
-       
+
     if not message_id:
         return False
     bot_token = _get_bot_token()
@@ -569,7 +453,6 @@ def _tg_edit_message_reply_markup(
             data={
                 "chat_id": str(chat_id),
                 "message_id": message_id,
-                                                                    
                 "reply_markup": json.dumps(
                     reply_markup or {"inline_keyboard": []}
                 ),
@@ -592,14 +475,7 @@ def _attach_pending_buttons(
     file_size: int | None,
     actions: tuple[tuple[str, str, str], ...],
 ) -> None:
-\
-\
-\
-\
-\
-\
-\
-       
+
     if not message_id or not file_id or not actions:
         return
     try:
@@ -630,14 +506,10 @@ def _attach_pending_buttons(
         _tg_edit_message_reply_markup(
             chat_id, message_id, {"inline_keyboard": kb_rows}
         )
-    except Exception:                                          
+    except Exception:
         pass
 
 
-                                                                             
-                                                                               
-                                                                     
-                                                                           
 BOOK_CONVERT_ACTION: tuple[str, str, str, str] = (
     "bookconvert",
     "\U0001f501 Convert",
@@ -676,16 +548,7 @@ def _store_pending_record(
     mime: str = "",
     source_chat_id: int | str | None = None,
 ) -> None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     try:
         from utils.redis_client import get_sync_redis
 
@@ -695,7 +558,7 @@ def _store_pending_record(
                 import config as _cfg
 
                 _ttl = getattr(_cfg, "BOOK_ASK_TTL_SECONDS", 600)
-            except Exception:              
+            except Exception:
                 _ttl = 600
             r.setex(
                 f"{prefix}:{token}",
@@ -714,23 +577,12 @@ def _store_pending_record(
                     }
                 ),
             )
-    except Exception:              
+    except Exception:
         pass
 
 
-
-
-
 def sent_doc_file_unique_id(msg: Any | None) -> str | None:
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if msg is None:
         return None
     _doc = getattr(msg, "document", None)
@@ -755,15 +607,7 @@ def _tg_send_pending_prompt(
     mime: str = "",
     extra_action: tuple[str, str, str] | None = None,
 ) -> None:
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     if not src_message_id:
         return
     try:
@@ -815,12 +659,12 @@ def _tg_send_pending_prompt(
             reply_markup={"inline_keyboard": kb_rows},
             parse_mode="Markdown",
         )
-    except Exception:                                   
+    except Exception:
         pass
 
 
 def _tg_delete_message(chat_id: int, message_id: int | None) -> bool:
-                                                                                    
+
     if not message_id:
         return False
     bot_token = _get_bot_token()
@@ -844,20 +688,10 @@ def _tg_get_file_path(
     file_id: str,
     diagnostic: Callable[[dict], None] | None = None,
 ) -> str:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/bot{bot_token}/getFile"
-                                                                           
+
     for attempt in range(3):
         try:
             r = _SESSION.get(url, params={"file_id": file_id}, timeout=30)
@@ -873,7 +707,6 @@ def _tg_get_file_path(
             raise
 
         if r.status_code != 200:
-                                                                        
             try:
                 body = r.json()
                 desc = body.get("description") or body
@@ -883,7 +716,7 @@ def _tg_get_file_path(
                 f"Telegram getFile failed: status={r.status_code} desc={desc}"
             )
             logger.error(msg)
-                                                                                
+
             if diagnostic is not None:
                 try:
                     diagnostic(
@@ -894,14 +727,14 @@ def _tg_get_file_path(
                             "timestamp": int(time.time()),
                         }
                     )
-                except Exception:              
+                except Exception:
                     pass
-                                                                    
+
             if r.status_code >= 500 or r.status_code == 429:
                 if attempt < 2:
                     time.sleep(1 + attempt)
                     continue
-                                                                                         
+
             raise requests.exceptions.HTTPError(msg)
 
         try:
@@ -909,7 +742,7 @@ def _tg_get_file_path(
             return data["result"]["file_path"]
         except Exception as e:
             logger.exception("Failed parsing getFile JSON for %s", file_id)
-                                                                         
+
             if diagnostic is not None:
                 try:
                     diagnostic(
@@ -921,24 +754,15 @@ def _tg_get_file_path(
                             "timestamp": int(time.time()),
                         }
                     )
-                except Exception:              
+                except Exception:
                     pass
             raise
 
-                                                                              
-                                                         
     raise RuntimeError(f"Failed to resolve file_path for {file_id}")
 
 
 def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
-\
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
     last_exc: Exception | None = None
@@ -946,7 +770,6 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
         try:
             with _SESSION.get(url, stream=True, timeout=60) as r:
                 if r.status_code >= 500 or r.status_code == 429:
-                                                                     
                     last_exc = requests.exceptions.HTTPError(
                         f"Telegram download failed: status={r.status_code}"
                     )
@@ -971,7 +794,6 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
             requests.exceptions.Timeout,
             requests.exceptions.ChunkedEncodingError,
         ) as e:
-                                                                       
             last_exc = e
             logger.warning(
                 "_tg_download_to_bytes: transient error %s on attempt %d for %s",
@@ -983,7 +805,6 @@ def _tg_download_to_bytes(bot_token: str | None, tg_file_path: str) -> bytes:
                 time.sleep(2**attempt)
                 continue
         except requests.exceptions.HTTPError:
-                                                                            
             raise
     raise last_exc or RuntimeError(
         f"Failed to download {tg_file_path} after 3 attempts"
@@ -997,14 +818,7 @@ def _tg_download_to_file(
     total: int = 0,
     progress_callback: _ProgressCallback | None = None,
 ) -> int:
-\
-\
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
     seen = 0
@@ -1018,7 +832,7 @@ def _tg_download_to_file(
                     if total and progress_callback is not None:
                         try:
                             progress_callback(seen, total)
-                        except Exception:                                        
+                        except Exception:
                             pass
     return seen
 
@@ -1029,12 +843,7 @@ def _tg_forward_message(
     from_chat_id: int,
     message_id: int,
 ) -> int | None:
-\
-\
-\
-\
-\
-       
+
     bot_token = _get_bot_token(bot_token)
     try:
         url = f"https://api.telegram.org/bot{bot_token}/forwardMessage"
@@ -1069,10 +878,6 @@ def _tg_forward_message(
         return None
 
 
-                                                                   
-                                                                             
-                                                
-
 _PROGRESS_STAGES = {
     "queued": 0,
     "downloading": 25,
@@ -1096,24 +901,7 @@ def _tg_send_progress(
     progress_pct: int | None = None,
     reply_markup: dict | None = None,
 ) -> int | None:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-       
+
     pct = _PROGRESS_STAGES.get(stage, 0)
     if progress_pct is not None:
         pct = max(0, min(100, int(progress_pct)))
@@ -1134,9 +922,6 @@ def _tg_send_progress(
     emoji = emojis.get(stage, "\u2753")
 
     lines = [
-                                                                             
-                                                                             
-                                                                        
         f"\U0001f4c1 **{escape_markdown(filename)}**",
         f"{bar} `{pct}%`",
     ]
@@ -1159,11 +944,6 @@ def _tg_send_progress(
                 chat_id,
                 text,
                 reply_markup=reply_markup,
-                                                               
-                                                                             
-                                                                              
-                                                                           
-                                                                 
                 parse_mode="Markdown",
             )
             if res and "result" in res and "message_id" in res["result"]:

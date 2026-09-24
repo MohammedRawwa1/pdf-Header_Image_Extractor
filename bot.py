@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -382,8 +383,7 @@ async def _send_with_upload_progress(
     # userbot delivers without a white cover thumbnail.
     if not thumbnail_is_usable(thumb_path):
         logger.info(
-            "_send_with_upload_progress: skipping unusable thumbnail "
-            "for %s",
+            "_send_with_upload_progress: skipping unusable thumbnail for %s",
             filename,
         )
         thumb_path = None
@@ -433,9 +433,7 @@ async def _send_with_upload_progress(
                 and ocr_enabled()
                 and "ocr" not in done_ops
             )
-            _want_convert = (
-                bool(convert_user_id) and "convert" not in done_ops
-            )
+            _want_convert = bool(convert_user_id) and "convert" not in done_ops
             if _want_compress or _want_ocr or _want_convert:
                 _msg_chat = getattr(_sent_msg, "chat_id", None)
                 if _msg_chat is None:
@@ -1055,9 +1053,7 @@ def _store_queued_message(job_id, chat_id, message_id) -> None:
             r.setex(
                 QUEUED_MSG_KEY.format(job_id),
                 QUEUED_MSG_TTL,
-                json.dumps(
-                    {"chat_id": chat_id, "message_ids": [message_id]}
-                ),
+                json.dumps({"chat_id": chat_id, "message_ids": [message_id]}),
             )
     except Exception:  # nosec B110
         pass
@@ -1252,7 +1248,6 @@ USE_POLLING = config.USE_POLLING
 # If not configured via WEBHOOK_SECRET env var, generate a random one on startup.
 WEBHOOK_SECRET = config.WEBHOOK_SECRET
 if not WEBHOOK_SECRET:
-
     WEBHOOK_SECRET = secrets.token_urlsafe(32)
     logger.warning(
         "WEBHOOK_SECRET not set in env! Auto-generated to %s... "
@@ -1602,7 +1597,11 @@ async def handle_document(
 
         if use_userbot_download:
             # ── Big file download: forward source → relay → direct → pipeline ──
-            _dl_result, _dl_task, _dl_msg_id = await _userbot_download_fallback(
+            (
+                _dl_result,
+                _dl_task,
+                _dl_msg_id,
+            ) = await _userbot_download_fallback(
                 msg,
                 file_path,
                 filename,
@@ -1763,20 +1762,22 @@ async def handle_document(
                 filename,
             )
             try:
-                _dl_result, _dl_task, _dl_msg_id = (
-                    await _userbot_download_fallback(
-                        msg,
-                        file_path,
-                        filename,
-                        mime,
-                        file_size or 0,
-                        getattr(doc, "file_unique_id", None),
-                        user_id,
-                        chat_id,
-                        _loop,
-                        forward_info=forward_info,
-                        file_id=doc.file_id,
-                    )
+                (
+                    _dl_result,
+                    _dl_task,
+                    _dl_msg_id,
+                ) = await _userbot_download_fallback(
+                    msg,
+                    file_path,
+                    filename,
+                    mime,
+                    file_size or 0,
+                    getattr(doc, "file_unique_id", None),
+                    user_id,
+                    chat_id,
+                    _loop,
+                    forward_info=forward_info,
+                    file_id=doc.file_id,
                 )
                 if _dl_result == "pipeline":
                     # Handed off to the BigFilePipeline; progress message was
@@ -1831,7 +1832,9 @@ async def handle_document(
                     )
                     _fb_size = os.path.getsize(file_path)
                     _fb_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
-                    if _fb_size > _fb_limit and _check_userbot_available(user_id):
+                    if _fb_size > _fb_limit and _check_userbot_available(
+                        user_id
+                    ):
                         await _send_with_upload_progress(
                             bot=context.bot,
                             chat_id=chat_id,
@@ -2031,20 +2034,22 @@ async def handle_photo(
 
         if photo_size > download_limit and _check_userbot_available(user_id):
             # ── Userbot download path for large photos ──
-            _dl_result, _dl_task, _dl_msg_id = (
-                await _userbot_download_fallback(
-                    msg,
-                    file_path,
-                    filename,
-                    "image/jpeg",
-                    photo_size,
-                    getattr(photo, "file_unique_id", None),
-                    user_id,
-                    chat_id,
-                    _loop,
-                    forward_info=photo_forward_info,
-                    file_id=photo.file_id,
-                )
+            (
+                _dl_result,
+                _dl_task,
+                _dl_msg_id,
+            ) = await _userbot_download_fallback(
+                msg,
+                file_path,
+                filename,
+                "image/jpeg",
+                photo_size,
+                getattr(photo, "file_unique_id", None),
+                user_id,
+                chat_id,
+                _loop,
+                forward_info=photo_forward_info,
+                file_id=photo.file_id,
             )
             if _dl_result == "pipeline":
                 return
@@ -2135,20 +2140,22 @@ async def handle_photo(
                 "Bot API download failed for photo, falling back to userbot"
             )
             try:
-                _dl_result, _dl_task, _dl_msg_id = (
-                    await _userbot_download_fallback(
-                        msg,
-                        file_path,
-                        filename,
-                        "image/jpeg",
-                        photo_size or 0,
-                        getattr(photo, "file_unique_id", None),
-                        user_id,
-                        chat_id,
-                        _loop,
-                        forward_info=photo_forward_info,
-                        file_id=photo.file_id,
-                    )
+                (
+                    _dl_result,
+                    _dl_task,
+                    _dl_msg_id,
+                ) = await _userbot_download_fallback(
+                    msg,
+                    file_path,
+                    filename,
+                    "image/jpeg",
+                    photo_size or 0,
+                    getattr(photo, "file_unique_id", None),
+                    user_id,
+                    chat_id,
+                    _loop,
+                    forward_info=photo_forward_info,
+                    file_id=photo.file_id,
                 )
                 if _dl_result == "pipeline":
                     # Handed off to the BigFilePipeline; progress message was
@@ -2187,9 +2194,8 @@ async def handle_photo(
                     create_thumbnail_from_image(file_path, thumb_path)
                     _ph_fb_size = os.path.getsize(file_path)
                     _ph_fb_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
-                    if (
-                        _ph_fb_size > _ph_fb_limit
-                        and _check_userbot_available(user_id)
+                    if _ph_fb_size > _ph_fb_limit and _check_userbot_available(
+                        user_id
                     ):
                         await _send_with_upload_progress(
                             bot=context.bot,
@@ -2385,7 +2391,9 @@ def _job_user_id(job: object) -> int | None:
             return args[0].get("user_id")
         if len(args) >= 9 and isinstance(args[8], int):  # process_document_job
             return args[8]
-        if len(args) >= 7 and isinstance(args[6], dict):  # forward_info fallback
+        if len(args) >= 7 and isinstance(
+            args[6], dict
+        ):  # forward_info fallback
             return args[6].get("user_id")
         if len(args) >= 4 and isinstance(args[3], int):  # process_url_job
             return args[3]
@@ -2466,12 +2474,9 @@ def _cancel_status_reply(
     """
     summary, has_jobs = _build_status_summary(uid, config.is_owner(uid))
     text = header + "\n\n" + summary
-    kb = (
-        _cancel_all_kb()
-        if has_jobs and config.is_admin_user(uid)
-        else None
-    )
+    kb = _cancel_all_kb() if has_jobs and config.is_admin_user(uid) else None
     return text, kb
+
 
 # ── Token-based pending-action state ───────────────────────────────────
 # Input context menus (``ctxfile:<token>``) and delivered-file buttons
@@ -2531,7 +2536,6 @@ def _consume_pending_record(key: str) -> str | None:
         return raw if isinstance(raw, str) else raw.decode(errors="replace")
     except Exception:  # nosec B110
         return None
-
 
 
 def _book_conv_kb(
@@ -2672,7 +2676,9 @@ def _store_ctx_record(
         )
         return token
     except Exception:  # nosec B110 - record store is best-effort
-        logger.exception("Failed to store context-menu record for %s", filename)
+        logger.exception(
+            "Failed to store context-menu record for %s", filename
+        )
         return None
 
 
@@ -2737,7 +2743,10 @@ def _ctx_menu_kb(
                 ]
             )
     elif kind == "book":
-        if getattr(config, "ENABLE_BOOK_CONVERSION", False) and calibre_available():
+        if (
+            getattr(config, "ENABLE_BOOK_CONVERSION", False)
+            and calibre_available()
+        ):
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -2747,7 +2756,10 @@ def _ctx_menu_kb(
                 ]
             )
         # 🗜 Compress for a book = convert-to-PDF then shrink (needs Calibre).
-        if getattr(config, "ENABLE_BOOK_CONVERSION", False) and calibre_available():
+        if (
+            getattr(config, "ENABLE_BOOK_CONVERSION", False)
+            and calibre_available()
+        ):
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -2781,7 +2793,9 @@ def _ctx_menu_kb(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-def _queued_cancel_kb(user_id: int | None, job_id: str) -> InlineKeyboardMarkup | None:
+def _queued_cancel_kb(
+    user_id: int | None, job_id: str
+) -> InlineKeyboardMarkup | None:
     """The ❌ cancel button attached to a 'Queued...' reply.
 
     ``callback_data`` is ``canceljob:<user_id>:<job_id>`` — tapping it arms a
@@ -2840,7 +2854,10 @@ def _build_status_summary(uid: int | None, is_owner: bool) -> str:
             """Most recent ``num`` members of a registry zset (id, score)."""
             try:
                 return [
-                    (m.decode() if isinstance(m, bytes) else str(m), float(score))
+                    (
+                        m.decode() if isinstance(m, bytes) else str(m),
+                        float(score),
+                    )
                     for m, score in r.zrevrangebyscore(
                         key, now, since, start=0, num=num, withscores=True
                     )
@@ -2869,7 +2886,9 @@ def _build_status_summary(uid: int | None, is_owner: bool) -> str:
         failed_total = _zcount("rq:failed:default", now - 86400)
 
         per_user: dict[int, dict[str, int]] = {}
-        mine: list[tuple[str, str, str, float | None]] = []  # (label, status, cancel_id, ts)
+        mine: list[
+            tuple[str, str, str, float | None]
+        ] = []  # (label, status, cancel_id, ts)
 
         def _tally(job_id: str, status: str, ts: float | None = None) -> None:
             job = _fetch(job_id)
@@ -2883,7 +2902,12 @@ def _build_status_summary(uid: int | None, is_owner: bool) -> str:
                 bucket[status] += 1
                 if u == uid and status in ("queued", "running"):
                     mine.append(
-                        (_job_label(job), status, _job_cancel_id(job, job_id), ts)
+                        (
+                            _job_label(job),
+                            status,
+                            _job_cancel_id(job, job_id),
+                            ts,
+                        )
                     )
 
         for jid in queued_ids:
@@ -2905,7 +2929,9 @@ def _build_status_summary(uid: int | None, is_owner: bool) -> str:
             parts.append(f"{finished_total} finished (24h)")
         if failed_total:
             parts.append(f"{failed_total} failed (24h)")
-        lines.append(" \u00b7 ".join(parts) if parts else "No jobs in the last 24h")
+        lines.append(
+            " \u00b7 ".join(parts) if parts else "No jobs in the last 24h"
+        )
 
         if uid is not None:
             b = per_user.get(uid, {})
@@ -3107,9 +3133,7 @@ async def cmd_setcommands(
         BotCommand("logoutpyro", "Logout your Pyrogram session"),
         BotCommand("clearflood", "Clear an active login flow"),
         BotCommand("admin", "Manage allowed users"),
-        BotCommand(
-            "clear_cache", "(admin) Clear cached results & thumbnails"
-        ),
+        BotCommand("clear_cache", "(admin) Clear cached results & thumbnails"),
         BotCommand("startbatch", "Start collecting forwarded files"),
         BotCommand("endbatch", "Process collected batch"),
         BotCommand("cancelbatch", "Cancel batch collection"),
@@ -3180,9 +3204,7 @@ async def cmd_endbatch(
             "Unable to finish batch here."
         )
         return
-    items = await asyncio.to_thread(
-        get_forward_items, chat_id, user_id
-    )
+    items = await asyncio.to_thread(get_forward_items, chat_id, user_id)
     if not items:
         await update.effective_message.reply_text(
             "No forwarded items were collected in the batch."
@@ -3192,7 +3214,11 @@ async def cmd_endbatch(
     # enqueue a single batch job which processes items in order
     if config.REDIS_URL:
         ok = await asyncio.to_thread(
-            enqueue_job, "process_document_batch_job",            chat_id, items, user_id,
+            enqueue_job,
+            "process_document_batch_job",
+            chat_id,
+            items,
+            user_id,
             owner_user_id=user_id,
             # job_timeout > RQ's 180s default: batches can contain large
             # e-books whose inline deliver_book_job (download + echo) must not
@@ -3462,7 +3488,9 @@ async def cmd_logoutpyro(
         except Exception as exc:
             logger.debug("logoutpyro: JSON per-user clear failed: %s", exc)
         try:
-            if await save_session_string_to_file_async("", client_type="pyrogram"):
+            if await save_session_string_to_file_async(
+                "", client_type="pyrogram"
+            ):
                 removed.append("Global JSON file (pyrogram_session cleared)")
         except Exception as exc:
             logger.debug("logoutpyro: JSON global clear failed: %s", exc)
@@ -3581,12 +3609,8 @@ async def cmd_loginstatus(
         mongo_session = await get_user_session(calling_user_id)
     except Exception:
         logger.debug("bot: Mongo session state check failed")
-    tele_mongo = bool(
-        mongo_session and mongo_session.get("telethon_session")
-    )
-    pyro_mongo = bool(
-        mongo_session and mongo_session.get("pyrogram_session")
-    )
+    tele_mongo = bool(mongo_session and mongo_session.get("telethon_session"))
+    pyro_mongo = bool(mongo_session and mongo_session.get("pyrogram_session"))
     mongo_legacy_only = bool(
         mongo_session
         and mongo_session.get("string_session")
@@ -3666,7 +3690,11 @@ async def cmd_loginstatus(
         "",
         "**Userbot enabled:** " + ("✅ Yes" if userbot_enabled else "❌ No"),
         "**API credentials:** "
-        + ("✅ Set" if has_api_id and has_api_hash else "⚠️ Missing API_ID/API_HASH"),
+        + (
+            "✅ Set"
+            if has_api_id and has_api_hash
+            else "⚠️ Missing API_ID/API_HASH"
+        ),
         "",
         _session_line("Telethon", tele),
         "",
@@ -3693,7 +3721,9 @@ async def cmd_admin(
 
     args = context.args if hasattr(context, "args") else []
     if not args:
-        await update.message.reply_text("Usage: /admin add|remove|list <user_id>")
+        await update.message.reply_text(
+            "Usage: /admin add|remove|list <user_id>"
+        )
         return
 
     cmd = args[0].lower()
@@ -3790,9 +3820,7 @@ async def cmd_clearcache(
     """Clear cached results, job leftovers and cached files (admin only)."""
     await _track_user_session(update, "/clear_cache")
     if not config.is_admin_user(getattr(update.effective_user, "id", None)):
-        await update.effective_message.reply_text(
-            "Unauthorized: admin only"
-        )
+        await update.effective_message.reply_text("Unauthorized: admin only")
         return
     uid = getattr(update.effective_user, "id", None)
     args = context.args if hasattr(context, "args") else []
@@ -3936,10 +3964,7 @@ async def cmd_clearflood(
         return
     user_id = update.effective_user.id
     futures_map = context.application.bot_data.get("login_futures", {})
-    if (
-        user_id in futures_map
-        and futures_map[user_id].get("task") is not None
-    ):
+    if user_id in futures_map and futures_map[user_id].get("task") is not None:
         await cleanup_login_flow(context, user_id)
         await update.message.reply_text(
             "✅ Cleared active login flow. You can run /login or /loginpyro again."
@@ -4083,7 +4108,9 @@ def _resolve_rq_job(
                 # Ownership: only cancel jobs from the caller's chat — keep
                 # looking if the first prefix candidate belongs to someone else.
                 c_args = list(getattr(cand, "args", None) or [])
-                if chat_id is not None and (not c_args or c_args[0] != chat_id):
+                if chat_id is not None and (
+                    not c_args or c_args[0] != chat_id
+                ):
                     continue
                 if not _rq_job_owned_by(cand, user_id):
                     continue
@@ -4412,9 +4439,7 @@ async def _do_cancel_job(
 
     # 2) RQ job (queued/started Bot API pipeline) — caller's chat + user only.
     # _cancel_rq_job resolves the full id internally and returns it.
-    full_rq_id = await asyncio.to_thread(
-        _cancel_rq_job, job_id, chat_id, uid
-    )
+    full_rq_id = await asyncio.to_thread(_cancel_rq_job, job_id, chat_id, uid)
     if full_rq_id:
         owned = True
         cleanup_id = full_rq_id
@@ -4561,7 +4586,7 @@ async def _cancel_all_stalled() -> tuple[int, int, int]:
                 f"{progress_tracker.PREFIX_PROGRESS}*", count=100
             ):
                 k = key.decode() if isinstance(key, bytes) else key
-                tid = k[len(progress_tracker.PREFIX_PROGRESS):]
+                tid = k[len(progress_tracker.PREFIX_PROGRESS) :]
                 # Skip tasks the in-memory loop already cancelled (their
                 # Redis record may still exist) and stale orphans with no
                 # task record at all.
@@ -4678,7 +4703,7 @@ async def _cancel_all_stalled() -> tuple[int, int, int]:
             try:
                 for key in r.scan_iter("pdf:job:*", count=200):
                     k = key.decode() if isinstance(key, bytes) else key
-                    _jid = k[len("pdf:job:"):]
+                    _jid = k[len("pdf:job:") :]
                     if not _jid or _jid in pipe_ids:
                         continue
                     try:
@@ -4734,9 +4759,7 @@ async def cmd_cancelall(
     """
     await _track_user_session(update, "/cancelall")
     if not config.is_admin_user(getattr(update.effective_user, "id", None)):
-        await update.effective_message.reply_text(
-            "Unauthorized: admin only"
-        )
+        await update.effective_message.reply_text("Unauthorized: admin only")
         return
     uid = getattr(update.effective_user, "id", None)
     args = context.args if hasattr(context, "args") else []
@@ -4758,9 +4781,7 @@ async def cmd_cancelall(
             reply_markup=confirm_kb,
         )
         return
-    tasks_cancelled, rq_cancelled, pipe_cancelled = (
-        await _cancel_all_stalled()
-    )
+    tasks_cancelled, rq_cancelled, pipe_cancelled = await _cancel_all_stalled()
     total = tasks_cancelled + rq_cancelled + pipe_cancelled
     if total:
         bits = []
@@ -4846,9 +4867,11 @@ async def handle_cancelall_confirm_callback(
         pass
     await _track_user_session(update, "/cancelall")
     try:
-        tasks_cancelled, rq_cancelled, pipe_cancelled = (
-            await _cancel_all_stalled()
-        )
+        (
+            tasks_cancelled,
+            rq_cancelled,
+            pipe_cancelled,
+        ) = await _cancel_all_stalled()
     except Exception:
         logger.exception("cancelall: confirm-callback cancellation failed")
         try:
@@ -4887,7 +4910,8 @@ async def handle_cancelall_stale_callback(
         return
     try:
         await query.answer(
-            "This button is outdated \u2014 run /cancelall instead", show_alert=True
+            "This button is outdated \u2014 run /cancelall instead",
+            show_alert=True,
         )
     except Exception:  # nosec B110
         pass
@@ -4997,11 +5021,11 @@ async def handle_canceljob_arm_callback(
     # flow edits the NEW confirmation message, which is never deleted by the
     # cancel cleanup — only the original 'Queued...' message is).
     try:
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
-    except Exception as e:
-        logger.debug(
-            "canceljob: could not remove queued cancel button: %s", e
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([])
         )
+    except Exception as e:
+        logger.debug("canceljob: could not remove queued cancel button: %s", e)
     try:
         if query.message is not None:
             await query.message.reply_text(
@@ -5260,9 +5284,7 @@ async def handle_ctx_thumb_callback(
             pass
 
 
-async def _replace_tapped_text(
-    query, text: str, reply_markup
-) -> int | None:
+async def _replace_tapped_text(query, text: str, reply_markup) -> int | None:
     """Replace a tapped callback message's text in place when possible.
 
     Input context menus are plain TEXT messages, so the action confirmation
@@ -5677,7 +5699,8 @@ async def handle_compress_callback(
     rec = _load_pending_token(token, True, "bookcompress", "ctxfile")
     if not rec:
         await query.answer(
-            "This compress link has expired. Send the file again.", show_alert=True
+            "This compress link has expired. Send the file again.",
+            show_alert=True,
         )
         return
     await _track_user_session(update, "compress_pdf")
@@ -6154,9 +6177,7 @@ async def handle_ocr_pick_callback(
     await _enqueue_ocr_job(query, rec, armer, target)
 
 
-async def _enqueue_ocr_job(
-    query, rec: dict, uid: int, target: str
-) -> bool:
+async def _enqueue_ocr_job(query, rec: dict, uid: int, target: str) -> bool:
     """Enqueue ``ocr_job`` for an already-validated pending record.
 
     Shared by the format-picker tap and the direct (default-skip) path so both
@@ -6203,7 +6224,9 @@ async def _enqueue_ocr_job(
     )
     if ok:
         try:
-            await query.answer("\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail queued")
+            await query.answer(
+                "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail queued"
+            )
         except Exception:  # nosec B110
             pass
         _label = (
@@ -6474,8 +6497,13 @@ async def _security_headers_middleware(request: Request, call_next):
     )
     # Proxies may send a comma-separated list (e.g. "https, http"); the first
     # entry is the scheme the client used.
-    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0]
-    if request.url.scheme == "https" or forwarded_proto.strip().lower() == "https":
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[
+        0
+    ]
+    if (
+        request.url.scheme == "https"
+        or forwarded_proto.strip().lower() == "https"
+    ):
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
@@ -6501,6 +6529,45 @@ _cleanup_task = None
 _longpoll_task = None
 _watchdog_task = None
 _shutdown_event = asyncio.Event()
+
+
+def _terminate_worker_process() -> None:
+    """Stop the supervised RQ worker and its whole process group, then reap.
+
+    ``worker.py`` forks a job horse per task, so signalling only the parent
+    can orphan the horses (and leave the parent unreaped).  Sends SIGTERM to
+    the group, escalates to SIGKILL, and always waits.
+    """
+    proc = _worker_proc
+    if proc is None or proc.poll() is not None:
+        return
+
+    def _signal(sig: int) -> None:
+        try:
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(proc.pid), sig)
+                    return
+                except Exception:
+                    pass
+            if sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except Exception:  # nosec B110 - process already gone
+            pass
+
+    _signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    _signal(signal.SIGKILL)
+    try:
+        proc.wait(timeout=3)
+    except Exception:  # nosec B110 - best-effort reaping
+        pass
 
 
 async def on_startup() -> None:
@@ -6619,13 +6686,18 @@ async def on_startup() -> None:
             if _v:
                 _telethon_env = _v
                 break
-        if _telethon_env and _existing_json.get("telethon_session") != _telethon_env:
+        if (
+            _telethon_env
+            and _existing_json.get("telethon_session") != _telethon_env
+        ):
             await save_session_string_to_file_async(
                 _telethon_env, client_type="telethon"
             )
         if _telethon_env and _admin_persist_id:
             await save_session_string_to_file_async(
-                _telethon_env, client_type="telethon", user_id=_admin_persist_id
+                _telethon_env,
+                client_type="telethon",
+                user_id=_admin_persist_id,
             )
             try:
                 from utils.db import save_user_session
@@ -6669,26 +6741,43 @@ async def on_startup() -> None:
             import sys as _sys
 
             worker_path = os.path.join(os.getcwd(), "worker.py")
-            restart_delay = 5
+            base_delay = 5
+            max_delay = 300
+            stable_after = 60.0  # a run this long resets the backoff
+            restart_delay = base_delay
 
             while not _shutdown_event.is_set():
+                started = time.monotonic()
                 try:
                     global _worker_proc
                     _worker_proc = _sub.Popen(  # nosec - B603: list form, no shell=True, fixed worker path
                         [_sys.executable, worker_path],
                         env=os.environ.copy(),
                         close_fds=True,
+                        # Own session on POSIX so a kill takes the RQ worker's
+                        # forked job horses down with it instead of orphaning
+                        # them if the worker has to be force-killed.
+                        start_new_session=(os.name == "posix"),
                     )
                     logger.info(
                         "Worker subprocess started pid=%s", _worker_proc.pid
                     )
                     loop = asyncio.get_running_loop()
                     rc = await loop.run_in_executor(None, _worker_proc.wait)
+                    ran_for = time.monotonic() - started
+                    if ran_for >= stable_after:
+                        # Healthy run: clear accumulated backoff so one late
+                        # crash does not slow recovery.
+                        restart_delay = base_delay
                     logger.warning(
-                        "Worker subprocess exited (rc=%s), restarting in %ds...",
+                        "Worker subprocess exited (rc=%s) after %.0fs, "
+                        "restarting in %ds...",
                         rc,
+                        ran_for,
                         restart_delay,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.exception("Worker supervisor error: %s", e)
 
@@ -6701,6 +6790,10 @@ async def on_startup() -> None:
                     )
                     break
                 except TimeoutError:
+                    # Back off when the worker keeps dying quickly so a crash
+                    # loop cannot thrash process creation and log volume.
+                    if time.monotonic() - started < stable_after:
+                        restart_delay = min(restart_delay * 2, max_delay)
                     continue
 
         _worker_task = asyncio.create_task(_worker_supervisor())
@@ -6883,9 +6976,7 @@ async def on_startup() -> None:
         _wd_interval = int(
             os.getenv("PROGRESS_WATCHDOG_INTERVAL_SECONDS", "300")
         )
-        _wd_stale = int(
-            os.getenv("PROGRESS_WATCHDOG_STALE_SECONDS", "1800")
-        )
+        _wd_stale = int(os.getenv("PROGRESS_WATCHDOG_STALE_SECONDS", "1800"))
         # 0 disables the watchdog; otherwise enforce a sane floor so a
         # misconfigured tiny interval can't hammer Redis/Mongo.
         if _wd_interval > 0:
@@ -6908,10 +6999,8 @@ async def on_startup() -> None:
                     except asyncio.CancelledError:
                         break
                     try:
-                        _failed = (
-                            await progress_tracker.watchdog_stale_tasks(
-                                _wd_stale
-                            )
+                        _failed = await progress_tracker.watchdog_stale_tasks(
+                            _wd_stale
                         )
                         if _failed:
                             logger.warning(
@@ -6920,10 +7009,16 @@ async def on_startup() -> None:
                                 len(_failed),
                                 _failed,
                             )
+                        # Reap finished tasks so the in-memory tracker cannot
+                        # grow without bound over the process lifetime.
+                        _purged = progress_tracker.cleanup_old_tasks()
+                        if _purged:
+                            logger.info(
+                                "Progress watchdog purged %d old task(s)",
+                                _purged,
+                            )
                     except Exception:
-                        logger.exception(
-                            "Progress watchdog iteration failed"
-                        )
+                        logger.exception("Progress watchdog iteration failed")
                 logger.info("Progress watchdog stopped")
 
             _watchdog_task = asyncio.create_task(_progress_watchdog_loop())
@@ -6950,18 +7045,13 @@ async def on_shutdown() -> None:
                     pass
                 logger.info("Shutdown: %s task stopped", name)
 
-        # Terminate worker subprocess
-        if _worker_proc is not None:
-            try:
-                _worker_proc.terminate()
-                try:
-                    _worker_proc.wait(timeout=5)
-                except Exception:
-                    _worker_proc.kill()
-                    _worker_proc.wait(timeout=3)
+        # Terminate the worker subprocess and its whole process group
+        try:
+            _terminate_worker_process()
+            if _worker_proc is not None:
                 logger.info("Shutdown: worker subprocess terminated")
-            except Exception:  # nosec B110
-                pass
+        except Exception:  # nosec B110
+            pass
 
         # Stop cleanup manager
         try:
@@ -7112,9 +7202,7 @@ async def handle_text_with_url(
                     "Failed to notify about disabled book conversion"
                 )
             continue  # keep processing the other URLs in the message
-        chat_id = (
-            msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
-        )
+        chat_id = msg.chat.id if getattr(msg, "chat", None) else msg.chat_id
         if config.REDIS_URL:
             # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
             try:
@@ -7166,9 +7254,8 @@ async def handle_text_with_url(
                     if _convert_uid
                     else "\U0001f4da Here's your book."
                 )
-                if (
-                    _url_file_size > _url_limit
-                    and _check_userbot_available(user_id)
+                if _url_file_size > _url_limit and _check_userbot_available(
+                    user_id
                 ):
                     await _send_with_upload_progress(
                         bot=context.bot,
@@ -7176,9 +7263,7 @@ async def handle_text_with_url(
                         file_path=file_path,
                         caption=_book_caption,
                         thumb_path=None,
-                        user_id=getattr(
-                            update.effective_user, "id", None
-                        ),
+                        user_id=getattr(update.effective_user, "id", None),
                         filename=base,
                         file_size=_url_file_size,
                         loop=_loop,
@@ -7202,7 +7287,9 @@ async def handle_text_with_url(
                 continue  # next URL in the message (finally cleans tmpdir)
             thumb_path = os.path.join(tmpdir, "thumb.jpg")
             create_thumbnail_from_pdf(file_path, thumb_path)
-            if _url_file_size > _url_limit and _check_userbot_available(user_id):
+            if _url_file_size > _url_limit and _check_userbot_available(
+                user_id
+            ):
                 await _send_with_upload_progress(
                     bot=context.bot,
                     chat_id=chat_id,
@@ -7248,9 +7335,7 @@ async def handle_text_with_url(
                     raise
                 else:
                     if _url_task:
-                        await progress_tracker.complete_task(
-                            _url_task.task_id
-                        )
+                        await progress_tracker.complete_task(_url_task.task_id)
                 finally:
                     if _url_msg_id:
                         try:

@@ -35,15 +35,15 @@ logger = logging.getLogger(__name__)
 
 # Bucket 1: pure caches — safe to delete unconditionally.
 CACHE_PREFIXES = (
-    "processed:",      # re-send/dedup records (30-day TTL)
-    "pfuid:",          # file_unique_id -> content_hash index (30-day)
-    "pdfcheck:",       # PDF validator results (7-day)
-    "cache:job:",      # generic job-metadata cache
-    "cache:file:",     # generic file-info cache (+ cached file bytes)
-    "cache:user:",     # user-session cache
-    "cache:meta:",     # media-analysis cache
-    "cache:resp:",     # bot-response cache
-    "ctxfile:",        # pending action-menu records
+    "processed:",  # re-send/dedup records (30-day TTL)
+    "pfuid:",  # file_unique_id -> content_hash index (30-day)
+    "pdfcheck:",  # PDF validator results (7-day)
+    "cache:job:",  # generic job-metadata cache
+    "cache:file:",  # generic file-info cache (+ cached file bytes)
+    "cache:user:",  # user-session cache
+    "cache:meta:",  # media-analysis cache
+    "cache:resp:",  # bot-response cache
+    "ctxfile:",  # pending action-menu records
     "forward_batch:",  # batch-collection state
 )
 
@@ -89,7 +89,11 @@ DEFAULT_FILE_GRACE_SECONDS = 600.0
 
 def _decode(value) -> str:
     """Decode a possibly-bytes Redis value to str."""
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+    return (
+        value.decode("utf-8", "replace")
+        if isinstance(value, bytes)
+        else str(value)
+    )
 
 
 def _pipe_queue_items(r, key: str) -> list[dict]:
@@ -155,7 +159,9 @@ def collect_live_job_ids(r) -> set[str]:
                 if _jid:
                     live.add(str(_jid))
     except Exception:
-        logger.debug("collect_live_job_ids: pipeline pass failed", exc_info=True)
+        logger.debug(
+            "collect_live_job_ids: pipeline pass failed", exc_info=True
+        )
     # In-flight BigFile pipeline jobs: the pipeline worker ``brpop``s jobs
     # off ``pdf:jobs`` the moment it starts, so a processing job exists ONLY
     # as its ``pdf:job:<id>`` hash (24h TTL, status "queued" until it
@@ -163,7 +169,7 @@ def collect_live_job_ids(r) -> set[str]:
     # status means the job is done and its leftovers are fair game.
     try:
         for key in r.scan_iter("pdf:job:*", count=200):
-            _jid = _decode(key)[len("pdf:job:"):]
+            _jid = _decode(key)[len("pdf:job:") :]
             if not _jid:
                 continue
             try:
@@ -223,7 +229,7 @@ def clear_redis_caches(r, live_ids: set[str]) -> dict:
 
     for prefix in JOB_KEY_PREFIXES:
         for key in r.scan_iter(f"{prefix}*", count=200):
-            _job_id = _decode(key)[len(prefix):]
+            _job_id = _decode(key)[len(prefix) :]
             if _job_id in live_ids:
                 skipped_live += 1
                 continue

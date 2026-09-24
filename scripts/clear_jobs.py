@@ -126,12 +126,10 @@ def _s3_client():
     if _env("S3_ENDPOINT"):
         client_kwargs["endpoint_url"] = _env("S3_ENDPOINT")
     if _env("AWS_ACCESS_KEY_ID") or _env("AWS_SECRET_ACCESS_KEY"):
-        client_kwargs["aws_access_key_id"] = _env(
-            "AWS_ACCESS_KEY_ID"
-        ) or None
-        client_kwargs["aws_secret_access_key"] = _env(
-            "AWS_SECRET_ACCESS_KEY"
-        ) or None
+        client_kwargs["aws_access_key_id"] = _env("AWS_ACCESS_KEY_ID") or None
+        client_kwargs["aws_secret_access_key"] = (
+            _env("AWS_SECRET_ACCESS_KEY") or None
+        )
     if _env("AWS_SESSION_TOKEN"):
         client_kwargs["aws_session_token"] = _env("AWS_SESSION_TOKEN")
     try:
@@ -375,7 +373,9 @@ def main() -> None:
     sub.add_parser("list", help="Show jobs in both queues")
 
     clear = sub.add_parser("clear", help="Remove job(s) from both pipes")
-    clear.add_argument("job_id", nargs="?", help="Job id to remove from both pipes")
+    clear.add_argument(
+        "job_id", nargs="?", help="Job id to remove from both pipes"
+    )
     clear.add_argument(
         "--all", action="store_true", help="Clear BOTH queues entirely"
     )
@@ -401,7 +401,9 @@ def main() -> None:
             if removed == 0:
                 print(f"Job {args.job_id} not found in either pipe.")
             else:
-                print(f"Done. Removed {removed} key(s)/entry(ies) for {args.job_id}.")
+                print(
+                    f"Done. Removed {removed} key(s)/entry(ies) for {args.job_id}."
+                )
         else:
             parser.error("clear requires a <job_id> or --all")
     else:

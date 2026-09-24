@@ -245,11 +245,16 @@ class CleanupManager:
                         try:
                             _meta = json.loads(_raw)
                             _at = (
-                                _meta.get("at") if isinstance(_meta, dict) else None
+                                _meta.get("at")
+                                if isinstance(_meta, dict)
+                                else None
                             )
                         except Exception:  # nosec B110 - unreadable meta
                             _at = None
-                    if _at is not None and now - float(_at) > self.processed_ttl:
+                    if (
+                        _at is not None
+                        and now - float(_at) > self.processed_ttl
+                    ):
                         # Stale: prune even if it still has a TTL left.
                         r.delete(key)
                         handled += 1

@@ -85,7 +85,8 @@ try:
         os.environ.get(
             "TELETHON_LOG_PATH",
             os.path.join(
-                os.environ.get("TEMP_PATH", tempfile.gettempdir()), "telethon_ingest.log"
+                os.environ.get("TEMP_PATH", tempfile.gettempdir()),
+                "telethon_ingest.log",
             ),
         )
     )  # nosec B108 - /tmp is last fallback, prefers env vars  # noqa: S108
@@ -1023,7 +1024,10 @@ async def main():
                             location = None
                         if location is not None:
                             await client_instance.download_file(
-                                location, file=tmp, part_size_kb=512, dc_id=dc_id
+                                location,
+                                file=tmp,
+                                part_size_kb=512,
+                                dc_id=dc_id,
                             )
                         else:
                             await client_instance.download_media(msg, file=tmp)

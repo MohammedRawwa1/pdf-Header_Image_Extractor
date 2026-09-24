@@ -11,6 +11,74 @@ from collections.abc import Callable
 
 import requests
 
+import config
+from tools import (
+    compress_pdf,
+    create_thumbnail_from_image,
+    create_thumbnail_from_image_bytes,
+    create_thumbnail_from_pdf,
+    create_thumbnail_from_pdf_bytes,
+    extract_pdf_embedded_thumbnail,
+    extract_pdf_embedded_thumbnail_bytes,
+    extract_pdf_metadata,
+    is_supported_format,
+    pdf_has_text_layer,
+    thumbnail_bytes_is_blank,
+    thumbnail_is_usable,
+)
+from utils.db import COL_JOBS, get_sync_db, sync_query
+from utils.ebook_converter import (
+    ConversionCancelledError,
+    DRMProtectedError,
+    calibre_available,
+    convert_book_to_pdf_with_thumbnail,
+    convert_ebook_robust,
+    is_book_format,
+    safe_target_name,
+)
+from utils.ocr import (
+    OCRCancelledError,
+    _extract_pdf_text,
+    is_ocr_source,
+    ocr_enabled,
+    run_ocr,
+    run_ocr_pdf,
+)
+from utils.processed_cache import (
+    _get_pdf_checks,
+    _store_fuid_binding,
+    _store_pdf_checks,
+    content_sha256,
+    content_sha256_file,
+    get_processed_op,
+    get_processed_record,
+    upsert_processed_record,
+)
+from utils.progress_tracker import _format_size, _format_time
+from utils.redis_client import get_sync_redis
+from utils.storage import _TransferProgress
+from utils.tg_http import (
+    BOOK_CONVERT_ACTION,
+    COMPRESS_PDF_ACTION,
+    OCR_ACTION,
+    _tg_delete_message,
+    _tg_download_to_bytes,
+    _tg_download_to_file,
+    _tg_edit_message_reply_markup,
+    _tg_forward_message,
+    _tg_get_file_path,
+    _tg_send_document,
+    _tg_send_document_by_id,
+    _tg_send_message,
+    _tg_send_pending_prompt,
+    _tg_send_progress,
+    sent_doc_file_unique_id,
+)
+from utils.url_validation import _validate_url_safe
+from utils.weasyprint_converter import (
+    convert_epub_to_pdf_fast,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,18 +133,11 @@ def _mark_pipeline_hash_status(job_id: str | None, status: str) -> None:
         if not r:
             return
 
-
         if not r.exists(f"pdf:job:{job_id}"):
             return
         r.hset(f"pdf:job:{job_id}", mapping={"status": status})
     except Exception:
         pass
-
-
-
-
-
-
 
 
 def _live_edit(
@@ -92,8 +153,6 @@ def _live_edit(
     if not total:
         return
     if not state.get("msg_id"):
-
-
         return
     pct = int(recv * 100 / total)
     now = time.time()
@@ -112,12 +171,6 @@ def _live_edit(
     )
     if new_id:
         state["msg_id"] = new_id
-
-
-
-
-
-
 
 
 QUEUED_MSG_KEY = "queued_msg:{}"
@@ -250,11 +303,9 @@ def _deliver_result_via_userbot(
         return None
     target = _get_bot_user_id() or "me"
 
-
     if not thumbnail_is_usable(thumb_path):
         logger.info(
-            "worker: skipping unusable thumbnail for %s "
-            "(userbot delivery)",
+            "worker: skipping unusable thumbnail for %s (userbot delivery)",
             filename,
         )
         thumb_path = None
@@ -270,8 +321,6 @@ def _deliver_result_via_userbot(
             )
         )
     except Exception:
-
-
         logger.exception(
             "worker: userbot result delivery raised (chat=%s target=%s user_id=%s)",
             chat_id,
@@ -281,8 +330,6 @@ def _deliver_result_via_userbot(
         return None
     if not _sent:
         return None
-
-
 
     if str(_used) == "me":
         _src = "me"
@@ -347,7 +394,9 @@ def _cleanup_after_failure(
     skip_queued_delete: bool = False,
 ) -> None:
     """Delete transient progress + "Queued..." messages after a failed job."""
-    _cleanup_after_success(chat_id, job_id, progress_msg_id, skip_queued_delete)
+    _cleanup_after_success(
+        chat_id, job_id, progress_msg_id, skip_queued_delete
+    )
 
 
 def _cancel_pipeline_cleanup(
@@ -384,70 +433,18 @@ def _short_error(exc: BaseException, limit: int = 120) -> str:
     return first
 
 
-import config
-from tools import (
-    compress_pdf,
-    create_thumbnail_from_image,
-    create_thumbnail_from_image_bytes,
-    create_thumbnail_from_pdf,
-    create_thumbnail_from_pdf_bytes,
-    extract_pdf_embedded_thumbnail,
-    extract_pdf_embedded_thumbnail_bytes,
-    extract_pdf_metadata,
-    is_supported_format,
-    pdf_has_text_layer,
-    thumbnail_bytes_is_blank,
-    thumbnail_is_usable,
-)
-from utils.ebook_converter import (
-    ConversionCancelledError,
-    DRMProtectedError,
-    calibre_available,
-    convert_book_to_pdf_with_thumbnail,
-    convert_ebook_robust,
-    is_book_format,
-    safe_target_name,
-)
-from utils.ocr import (
-    OCRCancelledError,
-    _extract_pdf_text,
-    is_ocr_source,
-    ocr_enabled,
-    run_ocr,
-    run_ocr_pdf,
-)
-from utils.weasyprint_converter import (
-    convert_epub_to_pdf_fast,
-)
-
-
 def _is_ebook(filename: str | None) -> bool:
     """True for non-PDF book formats — the conversion-only interface."""
-    return bool(filename) and is_book_format(filename) and not filename.lower().endswith(".pdf")
+    return (
+        bool(filename)
+        and is_book_format(filename)
+        and not filename.lower().endswith(".pdf")
+    )
 
 
 def _book_conversion_enabled() -> bool:
     """The ENABLE_BOOK_CONVERSION master switch (default on)."""
     return bool(getattr(config, "ENABLE_BOOK_CONVERSION", False))
-from utils.progress_tracker import _format_size, _format_time
-from utils.storage import _TransferProgress
-from utils.tg_http import (
-    BOOK_CONVERT_ACTION,
-    COMPRESS_PDF_ACTION,
-    OCR_ACTION,
-    _tg_delete_message,
-    _tg_download_to_bytes,
-    _tg_download_to_file,
-    _tg_edit_message_reply_markup,
-    _tg_forward_message,
-    _tg_get_file_path,
-    _tg_send_document,
-    _tg_send_document_by_id,
-    _tg_send_message,
-    _tg_send_pending_prompt,
-    _tg_send_progress,
-    sent_doc_file_unique_id,
-)
 
 
 def _maybe_attach_result_prompt(
@@ -500,6 +497,7 @@ def _maybe_attach_result_prompt(
             file_unique_id=file_unique_id,
         )
 
+
 try:
     from rq import get_current_job
 except Exception:
@@ -551,7 +549,6 @@ def _download_s3_key_to_file(
         logger.exception("Failed to create S3 client for download of %s", key)
         return False
 
-
     _s3_total = 0
     if progress_callback is not None:
         try:
@@ -563,15 +560,10 @@ def _download_s3_key_to_file(
     _cb = _TransferProgress(_s3_total, progress_callback)
 
     try:
-
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         if cancel_check is None:
             s3.download_file(bucket, key, dest_path, Callback=_cb)
         else:
-
-
-
-
             obj = s3.get_object(Bucket=bucket, Key=key)
             body = obj["Body"]
             with open(dest_path, "wb") as fh:
@@ -637,20 +629,10 @@ def process_input_key_job(job: dict) -> dict:
         job.get("size") or job.get("file_size"),
     )
 
-
-
-
     if _job_cancelled(job_id) or _pipeline_cancel_flag(job_id):
-
-
-
-
-
-
         return _cancel_pipeline_cleanup(
             job_id, chat_id, None, None, unique_key
         )
-
 
     try:
         input_meta = {
@@ -684,7 +666,6 @@ def process_input_key_job(job: dict) -> dict:
         tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
         dest_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
-
         _progress_msg_id = _tg_send_progress(
             chat_id,
             filename,
@@ -693,10 +674,8 @@ def process_input_key_job(job: dict) -> dict:
             file_size=job.get("size") or job.get("file_size") or 0,
         )
 
-
         if job_id and _progress_msg_id:
             _append_queued_message(job_id, _progress_msg_id)
-
 
         _live_state = {
             "msg_id": _progress_msg_id,
@@ -728,14 +707,10 @@ def process_input_key_job(job: dict) -> dict:
                     cancel_check=lambda: _check_cancel_flags(job_id),
                 )
         except _JobCancelledError:
-
-
             return _cancel_pipeline_cleanup(
                 job_id, chat_id, _progress_msg_id, out_meta, unique_key
             )
         if not ok:
-
-
             _tg_send_message(
                 None,
                 chat_id,
@@ -775,7 +750,6 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:
             pass
 
-
         _progress_msg_id = _tg_send_progress(
             chat_id,
             filename,
@@ -784,11 +758,6 @@ def process_input_key_job(job: dict) -> dict:
             file_size=_dl_size_post,
             message_id=_progress_msg_id,
         )
-
-
-
-
-
 
         _content_hash = None
         try:
@@ -814,7 +783,6 @@ def process_input_key_job(job: dict) -> dict:
         if _dedup_src:
             out_meta.setdefault("status", "already_processed")
 
-
             out_meta.setdefault("resend_source", _dedup_src)
             out_meta.setdefault("skipped", True)
             out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -828,7 +796,6 @@ def process_input_key_job(job: dict) -> dict:
             _mark_pipeline_hash_status(job_id, "already_processed")
             return {"status": "already_processed", "skipped": True}
 
-
         _progress_msg_id = _tg_send_progress(
             chat_id,
             filename,
@@ -839,13 +806,6 @@ def process_input_key_job(job: dict) -> dict:
         )
         thumb_path = os.path.join(tmpdir, "thumb.jpg")
         if filename.lower().endswith(".pdf"):
-
-
-
-
-
-
-
             _checks = _get_pdf_checks(job.get("file_unique_id"))
             _cached_layer = (
                 _checks["has_text_layer"] if _checks is not None else None
@@ -858,10 +818,11 @@ def process_input_key_job(job: dict) -> dict:
                 has_text_layer=(
                     _cached_layer
                     if _cached_layer is not None
-
-
-
-                    else (pdf_has_text_layer(dest_path) if ocr_enabled() else None)
+                    else (
+                        pdf_has_text_layer(dest_path)
+                        if ocr_enabled()
+                        else None
+                    )
                 ),
             )
             if _has_thumb:
@@ -885,7 +846,6 @@ def process_input_key_job(job: dict) -> dict:
             create_thumbnail_from_pdf(dest_path, thumb_path)
         else:
             create_thumbnail_from_image(dest_path, thumb_path)
-
 
         if filename.lower().endswith(".pdf"):
             pdf_meta = extract_pdf_metadata(dest_path)
@@ -981,12 +941,10 @@ def process_input_key_job(job: dict) -> dict:
                 except Exception:
                     pass
 
-
         if _check_cancel_flags(job_id):
             return _cancel_pipeline_cleanup(
                 job_id, chat_id, _progress_msg_id, out_meta, unique_key
             )
-
 
         if (
             upload_path == dest_path
@@ -994,8 +952,6 @@ def process_input_key_job(job: dict) -> dict:
             and upload_limit
             and orig_size > upload_limit
         ):
-
-
             try:
                 _progress_msg_id = _tg_send_progress(
                     chat_id,
@@ -1017,8 +973,6 @@ def process_input_key_job(job: dict) -> dict:
             )
             if _ub_res:
                 _sent, _src_chat = _ub_res
-
-
 
                 _maybe_attach_result_prompt(
                     chat_id,
@@ -1093,7 +1047,6 @@ def process_input_key_job(job: dict) -> dict:
                 except Exception:
                     logger.exception("S3 fallback failed for job %s", job_id)
 
-
             try:
                 _tg_send_message(
                     None,
@@ -1102,7 +1055,6 @@ def process_input_key_job(job: dict) -> dict:
                 )
             except Exception:
                 pass
-
 
             _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
             _mark_pipeline_hash_status(job_id, "too_large")
@@ -1117,12 +1069,10 @@ def process_input_key_job(job: dict) -> dict:
                 pass
             return {"error": "file too large after compression"}
 
-
         if _check_cancel_flags(job_id):
             return _cancel_pipeline_cleanup(
                 job_id, chat_id, _progress_msg_id, out_meta, unique_key
             )
-
 
         _progress_msg_id = _tg_send_progress(
             chat_id,
@@ -1207,8 +1157,6 @@ def process_input_key_job(job: dict) -> dict:
         except Exception:
             pass
 
-
-
         _cleanup_after_success(chat_id, job_id, _progress_msg_id)
         _mark_pipeline_hash_status(job_id, "done")
 
@@ -1225,7 +1173,6 @@ def process_input_key_job(job: dict) -> dict:
 
     except Exception as e:
         logger.exception("Error processing input_key job %s", job_id)
-
 
         _cleanup_after_failure(chat_id, job_id, _progress_msg_id)
         out_meta.setdefault("status", "error")
@@ -1256,23 +1203,7 @@ def process_input_key_job(job: dict) -> dict:
             pass
 
 
-
 IO_TTL = 7 * 24 * 3600
-
-
-from utils.db import COL_JOBS, get_sync_db, sync_query
-from utils.processed_cache import (
-    _get_pdf_checks,
-    _store_fuid_binding,
-    _store_pdf_checks,
-    content_sha256,
-    content_sha256_file,
-    get_processed_op,
-    get_processed_record,
-    upsert_processed_record,
-)
-from utils.redis_client import get_sync_redis
-from utils.url_validation import _validate_url_safe
 
 
 def _set_io_keys(
@@ -1296,7 +1227,6 @@ def _set_io_keys(
     except Exception:
         logger.exception("Failed setting IO keys for %s", unique_id)
 
-
     try:
         mongo_meta = {}
         if input_meta is not None:
@@ -1317,12 +1247,6 @@ def _set_io_keys(
         pass
 
     return redis_ok
-
-
-
-
-
-
 
 
 def _cache_delivered_copy(
@@ -1463,15 +1387,12 @@ def _bind_fuid_content(
     _store_pdf_checks(file_unique_id, content_hash=content_hash)
 
 
-
 _OP_DONE_CAPTIONS = {
     "thumb": (
         "\U0001f5bc\ufe0f Here is your file (cached result — "
         "already processed)."
     ),
-    "ocr": (
-        "\U0001f50e Here is the cached OCR result (already processed)."
-    ),
+    "ocr": ("\U0001f50e Here is the cached OCR result (already processed)."),
     "compress": (
         "\U0001f5dc\ufe0f Here is the cached compressed result "
         "(already processed)."
@@ -1519,14 +1440,8 @@ def _resend_cached_processed(
     if _entry.get("status") != "done":
         return None
     if expected_target and (_entry.get("target") or "") != expected_target:
-
-
-
-
         return None
     if _entry.get("delivery") == "userbot":
-
-
         if not (_entry.get("src_chat_id") and _entry.get("src_message_id")):
             return None
         try:
@@ -1634,8 +1549,6 @@ def process_document_job(
         file_size,
     )
 
-
-
     _rq_job_id = None
     try:
         import rq
@@ -1646,10 +1559,8 @@ def process_document_job(
         pass
     _cancel_check_id = _rq_job_id or unique_key
 
-
     if _job_cancelled(_cancel_check_id):
         return {"status": "cancelled"}
-
 
     if not is_supported_format(filename, mime or ""):
         logger.info(
@@ -1667,13 +1578,10 @@ def process_document_job(
                 "I work with **PDFs, images** (JPEG, PNG, WEBP, GIF) and **e-books** "
                 "(EPUB, MOBI, AZW3, FB2, DOCX, TXT, RTF, HTML, ODT and more).\n"
                 "Video files (MKV, AVI, MP4, MOV, etc.) and other formats are not supported.",
-
-
                 parse_mode="Markdown",
             )
         except Exception:
             pass
-
 
         _cleanup_after_failure(
             chat_id,
@@ -1681,8 +1589,11 @@ def process_document_job(
             None,
             skip_queued_delete=_skip_queued_delete,
         )
-        return {"error": "unsupported format", "filename": filename, "mime": mime}
-
+        return {
+            "error": "unsupported format",
+            "filename": filename,
+            "mime": mime,
+        }
 
     try:
         input_meta = {
@@ -1702,7 +1613,6 @@ def process_document_job(
             "Failed to write initial io input key for %s", unique_key
         )
 
-
     out_meta = {
         "status": "processing",
         "timestamps": {"start": int(time.time())},
@@ -1719,25 +1629,13 @@ def process_document_job(
 
     _userbot_dl_data = None
 
-
-
     upload_limit = config.BOT_API_UPLOAD_LIMIT_BYTES
     download_limit = config.BOT_API_DOWNLOAD_LIMIT_BYTES
 
     _progress_msg_id = None
     try:
-
-
-
-
-
-
-
-
         gf_start = time.time()
         try:
-
-
             _skip_bot_api = (
                 file_size and download_limit and file_size > download_limit
             )
@@ -1758,8 +1656,6 @@ def process_document_job(
                 file_size=file_size or 0,
             )
 
-
-
             if _rq_job_id and _progress_msg_id:
                 _append_queued_message(_rq_job_id, _progress_msg_id)
             tg_file_path = _tg_get_file_path(
@@ -1772,9 +1668,6 @@ def process_document_job(
         except requests.HTTPError as _gf_err:
             _gf_err_str = str(_gf_err)
             if "file is too big" in _gf_err_str.lower():
-
-
-
                 try:
                     import config as _config
 
@@ -1790,8 +1683,6 @@ def process_document_job(
                     "Bot API cannot handle large file; trying userbot fallback chain"
                 )
 
-
-
                 _progress_msg_id = _tg_send_progress(
                     chat_id,
                     filename,
@@ -1801,8 +1692,6 @@ def process_document_job(
                     message_id=_progress_msg_id,
                 )
 
-
-
                 if _rq_job_id and _progress_msg_id:
                     _append_queued_message(_rq_job_id, _progress_msg_id)
 
@@ -1810,9 +1699,6 @@ def process_document_job(
 
                 _ub_data = None
                 _fallback_errors = []
-
-
-
 
                 _ub_state = {
                     "msg_id": _progress_msg_id,
@@ -1828,14 +1714,8 @@ def process_document_job(
                     if not total:
                         return
                     if not _ub_state["msg_id"]:
-
-
-
                         return
                     if phase != _ub_state.get("phase"):
-
-
-
                         _ub_state["phase"] = phase
                         _ub_state["last_pct"] = -1
                     pct = int(recv * 100 / total)
@@ -1869,7 +1749,6 @@ def process_document_job(
                     if new_id:
                         _ub_state["msg_id"] = new_id
 
-
                 try:
                     from utils.userbot_downloader import (
                         download_bytes_by_file_id_via_userbot as _dl_file_id,
@@ -1895,7 +1774,6 @@ def process_document_job(
                     logger.warning(
                         "Fallback (a) file_id download failed: %s", _fb_a
                     )
-
 
                 if _ub_data is None and message_id:
                     try:
@@ -1938,7 +1816,6 @@ def process_document_job(
                             "Fallback (b) chat-based download failed: %s",
                             _fb_b,
                         )
-
 
                 if _ub_data is None and message_id:
                     try:
@@ -2007,12 +1884,9 @@ def process_document_job(
                             _fb_d,
                         )
 
-
                 if _ub_data is None and message_id:
                     try:
-                        from utils.bigfile_pipeline import (
-                            BigFilePipeline as _BFP,
-                        )
+                        from utils.bigfile_pipeline import BigFilePipeline
 
                         _progress_msg_id = _tg_send_progress(
                             chat_id,
@@ -2028,7 +1902,7 @@ def process_document_job(
                             message_id,
                             file_size or "unknown",
                         )
-                        _pipeline = _BFP()
+                        _pipeline = BigFilePipeline()
                         _result = _asyncio.run(
                             _pipeline.ingest_large_file(
                                 chat_id=chat_id,
@@ -2047,14 +1921,7 @@ def process_document_job(
                                 _result.s3_key,
                             )
 
-
-
-
-
                             _clear_queued_message_buttons(_rq_job_id)
-
-
-
 
                             _handoff_kb = None
                             if user_id and _result.job_id:
@@ -2085,9 +1952,6 @@ def process_document_job(
                                 reply_markup=_handoff_kb,
                             )
 
-
-
-
                             if _rq_job_id:
                                 _append_queued_message(
                                     _rq_job_id, _progress_msg_id
@@ -2106,7 +1970,6 @@ def process_document_job(
                             "Fallback (c) BigFilePipeline failed: %s", _fb_c
                         )
 
-
                 if _ub_data is not None:
                     _userbot_dl_data = _ub_data
                     tg_file_path = "__userbot_fallback__"
@@ -2119,8 +1982,6 @@ def process_document_job(
                         user_id,
                         "; ".join(_fallback_errors),
                     )
-
-
 
                     raise _gf_err from RuntimeError(
                         f"All {len(_fallback_errors)} fallbacks exhausted: "
@@ -2138,17 +1999,12 @@ def process_document_job(
         except Exception:
             pass
 
-
-
         if config.TMP_DIR:
-
             tmpdir = tempfile.mkdtemp(dir=config.TMP_DIR)
             file_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
-
             dl_start = time.time()
             if _userbot_dl_data is not None:
-
                 with open(file_path, "wb") as fh:
                     fh.write(_userbot_dl_data)
                 logger.info(
@@ -2208,7 +2064,6 @@ def process_document_job(
             except Exception:
                 pass
 
-
             _progress_msg_id = _tg_send_progress(
                 chat_id,
                 filename,
@@ -2217,11 +2072,6 @@ def process_document_job(
                 file_size=_dl_size_post,
                 message_id=_progress_msg_id,
             )
-
-
-
-
-
 
             _content_hash = None
             try:
@@ -2247,7 +2097,6 @@ def process_document_job(
             if _dedup_src:
                 out_meta.setdefault("status", "already_processed")
 
-
                 out_meta.setdefault("resend_source", _dedup_src)
                 out_meta.setdefault("skipped", True)
                 out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -2265,7 +2114,6 @@ def process_document_job(
                 )
                 return {"status": "already_processed", "skipped": True}
 
-
             _progress_msg_id = _tg_send_progress(
                 chat_id,
                 filename,
@@ -2279,16 +2127,9 @@ def process_document_job(
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
             ):
-
-
-
-
-
                 _checks = _get_pdf_checks(file_unique_id)
                 _cached_layer = (
-                    _checks["has_text_layer"]
-                    if _checks is not None
-                    else None
+                    _checks["has_text_layer"] if _checks is not None else None
                 )
                 _has_thumb = extract_pdf_embedded_thumbnail(
                     file_path, thumb_path
@@ -2300,10 +2141,6 @@ def process_document_job(
                     has_text_layer=(
                         _cached_layer
                         if _cached_layer is not None
-
-
-
-
                         else (
                             pdf_has_text_layer(file_path)
                             if ocr_enabled()
@@ -2311,10 +2148,6 @@ def process_document_job(
                         )
                     ),
                 )
-
-
-
-
 
                 if _has_thumb:
                     _skip_already_thumbed(
@@ -2341,7 +2174,6 @@ def process_document_job(
                     return {"status": "already_thumbed", "skipped": True}
                 create_thumbnail_from_pdf(file_path, thumb_path)
 
-
             if (
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
@@ -2353,7 +2185,6 @@ def process_document_job(
                         _set_io_keys(unique_key, output_meta=out_meta)
                     except Exception:
                         pass
-
 
             upload_path = file_path
             try:
@@ -2402,7 +2233,6 @@ def process_document_job(
                     pass
 
                 if upload_path == file_path:
-
                     _progress_msg_id = _tg_send_progress(
                         chat_id,
                         filename,
@@ -2440,15 +2270,12 @@ def process_document_job(
                     except Exception:
                         pass
 
-
             if (
                 upload_path == file_path
                 and orig_size
                 and upload_limit
                 and orig_size > upload_limit
             ):
-
-
                 try:
                     _progress_msg_id = _tg_send_progress(
                         chat_id,
@@ -2470,8 +2297,6 @@ def process_document_job(
                 )
                 if _ub_res:
                     _sent, _src_chat = _ub_res
-
-
 
                     _maybe_attach_result_prompt(
                         chat_id,
@@ -2555,7 +2380,6 @@ def process_document_job(
                             "S3 fallback failed for file_id=%s", file_id
                         )
 
-
                 try:
                     _tg_send_message(
                         None,
@@ -2564,7 +2388,6 @@ def process_document_job(
                     )
                 except Exception:
                     pass
-
 
                 _cleanup_after_failure(
                     chat_id,
@@ -2583,11 +2406,7 @@ def process_document_job(
                     pass
                 return {"error": "file too large after compression"}
 
-
             if _job_cancelled(_cancel_check_id):
-
-
-
                 _tg_delete_message(chat_id, _progress_msg_id)
                 _delete_queued_messages(_cancel_check_id)
                 out_meta.setdefault("status", "cancelled")
@@ -2599,7 +2418,6 @@ def process_document_job(
                 except Exception:
                     pass
                 return {"status": "cancelled"}
-
 
             _progress_msg_id = _tg_send_progress(
                 chat_id,
@@ -2666,10 +2484,6 @@ def process_document_job(
             except Exception:
                 pass
 
-
-
-
-
             _cleanup_after_success(
                 chat_id,
                 _rq_job_id,
@@ -2690,7 +2504,6 @@ def process_document_job(
             return res
 
         else:
-
             dl_start = time.time()
             if _userbot_dl_data is not None:
                 file_bytes = _userbot_dl_data
@@ -2718,9 +2531,6 @@ def process_document_job(
             except Exception:
                 pass
 
-
-
-
             _content_hash = None
             try:
                 _content_hash = content_sha256(file_bytes)
@@ -2745,7 +2555,6 @@ def process_document_job(
             if _dedup_src:
                 out_meta.setdefault("status", "already_processed")
 
-
                 out_meta.setdefault("resend_source", _dedup_src)
                 out_meta.setdefault("skipped", True)
                 out_meta.setdefault("timestamps", {})["finished"] = int(
@@ -2767,8 +2576,6 @@ def process_document_job(
                 filename.lower().endswith(".pdf")
                 or "pdf" in (mime or "").lower()
             ):
-
-
                 _embedded_thumb = extract_pdf_embedded_thumbnail_bytes(
                     file_bytes
                 )
@@ -2799,13 +2606,11 @@ def process_document_job(
             else:
                 thumb_bytes = create_thumbnail_from_image_bytes(file_bytes)
 
-
             try:
                 if not thumb_bytes or thumbnail_bytes_is_blank(thumb_bytes):
                     thumb_bytes = b""
             except Exception:
                 pass
-
 
             if upload_limit and len(file_bytes) > upload_limit:
                 td = tempfile.mkdtemp()
@@ -2878,20 +2683,13 @@ def process_document_job(
                         except Exception:
                             pass
 
-
                     if len(file_bytes) > upload_limit:
-
-
-
-
                         _ub_tmp = os.path.join(td, filename)
                         with open(_ub_tmp, "wb") as _ub_fh:
                             _ub_fh.write(file_bytes)
                         _ub_thumb = None
                         if thumb_bytes:
-                            _ub_thumb = os.path.join(
-                                td, "userbot_thumb.jpg"
-                            )
+                            _ub_thumb = os.path.join(td, "userbot_thumb.jpg")
                             with open(_ub_thumb, "wb") as _ub_th:
                                 _ub_th.write(thumb_bytes)
                         _ub_res = _deliver_result_via_userbot(
@@ -2904,9 +2702,6 @@ def process_document_job(
                         )
                         if _ub_res:
                             _sent, _src_chat = _ub_res
-
-
-
 
                             _maybe_attach_result_prompt(
                                 chat_id,
@@ -2936,9 +2731,7 @@ def process_document_job(
                             try:
                                 out_meta.setdefault("status", "done")
                                 out_meta.setdefault("delivery", "userbot")
-                                _set_io_keys(
-                                    unique_key, output_meta=out_meta
-                                )
+                                _set_io_keys(unique_key, output_meta=out_meta)
                             except Exception:
                                 pass
                             _cleanup_after_success(
@@ -3035,12 +2828,9 @@ def process_document_job(
                 finally:
                     shutil.rmtree(td, ignore_errors=True)
 
-
             send_start = time.time()
             doc_buf = io.BytesIO(file_bytes)
-            thumb_buf = (
-                io.BytesIO(thumb_bytes) if thumb_bytes else None
-            )
+            thumb_buf = io.BytesIO(thumb_bytes) if thumb_bytes else None
             doc_buf.seek(0)
             if thumb_buf is not None:
                 thumb_buf.seek(0)
@@ -3095,7 +2885,6 @@ def process_document_job(
             except Exception:
                 pass
 
-
             _cleanup_after_success(
                 chat_id,
                 _rq_job_id,
@@ -3115,8 +2904,6 @@ def process_document_job(
             _set_io_keys(unique_key, output_meta=out_meta)
         except Exception:
             pass
-
-
 
         _cleanup_after_failure(
             chat_id,
@@ -3167,7 +2954,9 @@ def process_document_batch_job(
                 },
             )
         except Exception:
-            logger.exception("Failed to write io:in for batch job %s", _rq_job_id)
+            logger.exception(
+                "Failed to write io:in for batch job %s", _rq_job_id
+            )
     results = []
     for item in items:
         file_id = item.get("file_id")
@@ -3188,7 +2977,13 @@ def process_document_batch_job(
                 mime,
                 user_id,
             )
-            results.append({"skipped": "unsupported format", "filename": filename, "mime": mime})
+            results.append(
+                {
+                    "skipped": "unsupported format",
+                    "filename": filename,
+                    "mime": mime,
+                }
+            )
             continue
 
         if _is_ebook(filename):
@@ -3251,9 +3046,7 @@ def process_document_batch_job(
 
     try:
         _batch_job = get_current_job()
-        _delete_queued_messages(
-            getattr(_batch_job, "id", None)
-        )
+        _delete_queued_messages(getattr(_batch_job, "id", None))
     except Exception:
         pass
     logger.info(
@@ -3328,8 +3121,6 @@ def _download_job_file(
         if cancel_check and cancel_check():
             raise _JobCancelledError("download cancelled")
 
-
-
     _bot_dl_limit = getattr(config, "BOT_API_DOWNLOAD_LIMIT_BYTES", 0)
     if file_size is None or not _bot_dl_limit or file_size <= _bot_dl_limit:
         try:
@@ -3343,7 +3134,10 @@ def _download_job_file(
                     total=file_size or 0,
                     progress_callback=progress_callback,
                 )
-                if _os.path.exists(dest_path) and _os.path.getsize(dest_path) > 0:
+                if (
+                    _os.path.exists(dest_path)
+                    and _os.path.getsize(dest_path) > 0
+                ):
                     return True
                 _fails.append("bot api: empty file")
             else:
@@ -3352,15 +3146,14 @@ def _download_job_file(
             raise
         except Exception as exc:
             _fails.append(f"bot api: {exc}")
-            logger.warning("_download_job_file: Bot API download failed: %s", exc)
+            logger.warning(
+                "_download_job_file: Bot API download failed: %s", exc
+            )
     else:
         logger.info(
             "_download_job_file: size %s above Bot API getFile cap, using userbot pipes",
             _format_size(file_size),
         )
-
-
-
 
     _in_mem_max = 200 * 1024 * 1024
     try:
@@ -3371,7 +3164,6 @@ def _download_job_file(
         _in_mem_max = int(_IMM)
     except Exception:
         pass
-
 
     _skip_file_id = bool(
         chat_id
@@ -3394,7 +3186,9 @@ def _download_job_file(
 
             _data = _asyncio.run(
                 download_bytes_by_file_id_via_userbot(
-                    file_id, progress_callback=progress_callback, user_id=user_id
+                    file_id,
+                    progress_callback=progress_callback,
+                    user_id=user_id,
                 )
             )
             if _data:
@@ -3407,8 +3201,9 @@ def _download_job_file(
             raise
         except Exception as exc:
             _fails.append(f"userbot file_id: {exc}")
-            logger.warning("_download_job_file: file_id download failed: %s", exc)
-
+            logger.warning(
+                "_download_job_file: file_id download failed: %s", exc
+            )
 
     if chat_id and message_id:
         try:
@@ -3426,7 +3221,11 @@ def _download_job_file(
                     user_id=user_id,
                 )
             )
-            if _ok and _os.path.exists(dest_path) and _os.path.getsize(dest_path) > 0:
+            if (
+                _ok
+                and _os.path.exists(dest_path)
+                and _os.path.getsize(dest_path) > 0
+            ):
                 return True
             _fails.append("userbot chat: empty")
         except _JobCancelledError:
@@ -3439,7 +3238,6 @@ def _download_job_file(
                 message_id,
                 exc,
             )
-
 
     if chat_id and message_id:
         try:
@@ -3478,7 +3276,9 @@ def _download_job_file(
             raise
         except Exception as exc:
             _fails.append(f"relay: {exc}")
-            logger.warning("_download_job_file: relay download failed: %s", exc)
+            logger.warning(
+                "_download_job_file: relay download failed: %s", exc
+            )
 
     logger.warning(
         "_download_job_file: all download pipes failed for %s: %s",
@@ -3509,7 +3309,10 @@ def _deliver_converted_file(
         if not total:
             return
         pct = int(recv * 100 / total)
-        if pct - _cb_state["last_pct"] < 2 and time.time() - _cb_state["last_t"] < 2.0:
+        if (
+            pct - _cb_state["last_pct"] < 2
+            and time.time() - _cb_state["last_t"] < 2.0
+        ):
             return
         _cb_state["last_pct"] = pct
         _cb_state["last_t"] = time.time()
@@ -3529,8 +3332,6 @@ def _deliver_converted_file(
         except Exception:
             pass
 
-
-
     if not thumbnail_is_usable(thumb_path):
         logger.info(
             "_deliver_converted_file: skipping unusable thumbnail for %s",
@@ -3540,11 +3341,6 @@ def _deliver_converted_file(
     _thumb = None
     try:
         try:
-
-
-
-
-
             _ul_limit = getattr(config, "BOT_API_UPLOAD_LIMIT_BYTES", 0)
             if _ul_limit and os.path.getsize(file_path) > _ul_limit:
                 logger.info(
@@ -3571,9 +3367,6 @@ def _deliver_converted_file(
                     done_ops=done_ops,
                 )
         except Exception:
-
-
-
             logger.warning(
                 "_deliver_converted_file: Bot API send failed for %s, "
                 "trying userbot",
@@ -3587,9 +3380,6 @@ def _deliver_converted_file(
             _sent, _src_chat = _res
             _sent_id = getattr(_sent, "id", None)
 
-
-
-
             _sent_fuid = sent_doc_file_unique_id(_sent)
             try:
                 _dl_size = 0
@@ -3599,9 +3389,6 @@ def _deliver_converted_file(
                     pass
                 _name = filename or ""
                 _is_pdf = _name.lower().endswith(".pdf")
-
-
-
 
                 _want_compress = _is_pdf and "compress" not in done_ops
                 _want_ocr = (
@@ -3664,14 +3451,12 @@ def _deliver_converted_file(
                     filename,
                 )
 
-
             _send_res = {
                 "ok": False,
                 "delivery": "userbot",
                 "src_chat_id": _src_chat,
                 "src_message_id": _sent_id,
             }
-
 
         try:
             _tg_delete_message(chat_id, progress_msg_id)
@@ -3713,9 +3498,7 @@ def _deliver_book_echo(
         )
         return True
     except Exception:
-        logger.warning(
-            "_deliver_book_echo: delivery failed for %s", filename
-        )
+        logger.warning("_deliver_book_echo: delivery failed for %s", filename)
         return False
 
 
@@ -3835,10 +3618,6 @@ def deliver_book_job(
             )
             return {"error": "download_failed"}
 
-
-
-
-
         if not _deliver_book_echo(
             chat_id, _src, filename, user_id, _progress_msg_id
         ):
@@ -3931,7 +3710,9 @@ def convert_book_job(
                 },
             )
         except Exception:
-            logger.exception("Failed to write io:in for convert job %s", _rq_job_id)
+            logger.exception(
+                "Failed to write io:in for convert job %s", _rq_job_id
+            )
     _cancel_check_id = _rq_job_id or file_id
     if _job_cancelled(_cancel_check_id):
         return {"status": "cancelled"}
@@ -3969,8 +3750,6 @@ def convert_book_job(
                 file_size,
                 user_id,
                 progress_callback=_dl_cb,
-
-
                 chat_id=source_chat_id or chat_id,
                 message_id=message_id,
                 file_unique_id=file_unique_id,
@@ -3984,11 +3763,12 @@ def convert_book_job(
             )
             return {"status": "cancelled"}
 
-
         _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
         if not _ok:
             _tg_send_progress(
-                chat_id, filename, "failed",
+                chat_id,
+                filename,
+                "failed",
                 detail="\u274c Failed to download the file.",
                 message_id=_progress_msg_id,
             )
@@ -3998,22 +3778,15 @@ def convert_book_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
 
-
-
-
-
-
-
-
-
-
         _content_hash = None
         try:
             _content_hash = content_sha256_file(_src)
         except Exception:
             logger.debug("Failed to hash %s", _src)
         _bind_fuid_content(file_unique_id, _content_hash)
-        _convert_target_key = f"{target_fmt}:compress" if compress else target_fmt
+        _convert_target_key = (
+            f"{target_fmt}:compress" if compress else target_fmt
+        )
         _dedup_src = (
             _shortcircuit_if_processed(
                 _content_hash,
@@ -4048,7 +3821,9 @@ def convert_book_job(
             return {"status": "already_processed", "skipped": True}
 
         _tg_send_progress(
-            chat_id, filename, "compressing",
+            chat_id,
+            filename,
+            "compressing",
             detail=f"\u2699\ufe0f Converting to {target_fmt.upper()}...",
             message_id=_progress_msg_id,
         )
@@ -4057,11 +3832,6 @@ def convert_book_job(
         _timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
         _thumb = None
         _thumb_path = None
-
-
-
-
-
 
         _hb_stop = threading.Event()
         _hb_holder: dict[str, int | None] = {"msg_id": _progress_msg_id}
@@ -4094,26 +3864,28 @@ def convert_book_job(
             _hb_thread.start()
         try:
             if target_fmt.lower() == "pdf" and _src.lower().endswith(".epub"):
-
-
-
-
                 _conv_ok = convert_epub_to_pdf_fast(
-                    _src, _out, os.path.join(tmpdir, "thumb.jpg"),
+                    _src,
+                    _out,
+                    os.path.join(tmpdir, "thumb.jpg"),
                     timeout=_timeout,
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
                 _thumb_path = os.path.join(tmpdir, "thumb.jpg")
             elif target_fmt.lower() == "pdf":
                 _conv_ok = convert_book_to_pdf_with_thumbnail(
-                    _src, _out, os.path.join(tmpdir, "thumb.jpg"),
+                    _src,
+                    _out,
+                    os.path.join(tmpdir, "thumb.jpg"),
                     timeout=_timeout,
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
                 _thumb_path = os.path.join(tmpdir, "thumb.jpg")
             else:
                 _conv_ok = convert_ebook_robust(
-                    _src, _out, timeout=_timeout,
+                    _src,
+                    _out,
+                    timeout=_timeout,
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
         except ConversionCancelledError:
@@ -4127,8 +3899,6 @@ def convert_book_job(
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "cancelled"}
         except DRMProtectedError:
-
-
             _hb_stop.set()
             if _hb_thread is not None:
                 _hb_thread.join(timeout=1.0)
@@ -4138,7 +3908,9 @@ def convert_book_job(
                 filename,
             )
             _tg_send_progress(
-                chat_id, filename, "failed",
+                chat_id,
+                filename,
+                "failed",
                 detail=(
                     "\u274c This book is DRM-protected and can't be "
                     "converted. Provide a DRM-free copy."
@@ -4150,16 +3922,14 @@ def convert_book_job(
         finally:
             _hb_stop.set()
 
-
-
-
-
         if _hb_thread is not None:
             _hb_thread.join(timeout=1.0)
         _progress_msg_id = _hb_holder["msg_id"]
         if not _conv_ok or not os.path.exists(_out):
             _tg_send_progress(
-                chat_id, filename, "failed",
+                chat_id,
+                filename,
+                "failed",
                 detail=(
                     f"\u274c Conversion to {target_fmt.upper()} failed. "
                     "The file may be DRM-protected or corrupt — check the "
@@ -4167,8 +3937,6 @@ def convert_book_job(
                 ),
                 message_id=_progress_msg_id,
             )
-
-
 
             _delete_queued_messages(_rq_job_id)
             return {"error": "conversion_failed"}
@@ -4179,24 +3947,17 @@ def convert_book_job(
 
         _caption = f"Here is your file converted to {target_fmt.upper()}."
 
-
-
-
         if compress and target_fmt.lower() == "pdf":
             _comp_path = os.path.join(tmpdir, "compressed_" + _out_name)
             _gs = getattr(config, "PDF_COMPRESS_QUALITY", "/ebook")
             try:
                 if compress_pdf(_out, _comp_path, gs_quality=_gs) and (
-                    os.path.exists(_comp_path)
-                    and os.path.getsize(_comp_path)
+                    os.path.exists(_comp_path) and os.path.getsize(_comp_path)
                 ):
                     _out = _comp_path
                     _caption = (
                         "Here is your book converted to PDF and compressed."
                     )
-
-
-
 
                     try:
                         if _thumb_path:
@@ -4215,10 +3976,14 @@ def convert_book_job(
                     filename,
                 )
         _conv_res = _deliver_converted_file(
-            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
+            chat_id,
+            _out,
+            _out_name,
+            _thumb_path,
+            _caption,
+            user_id,
             progress_msg_id=_progress_msg_id,
         )
-
 
         if _conv_res and _conv_res.get("ok"):
             try:
@@ -4231,9 +3996,7 @@ def convert_book_job(
                     file_size=file_size,
                     target=_convert_target_key,
                     file_id=_doc.get("file_id"),
-                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
-                        "file_id"
-                    ),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get("file_id"),
                     user_id=user_id,
                     chat_id=chat_id,
                 )
@@ -4305,7 +4068,10 @@ def compress_pdf_job(
     _rq_job_id = _attach_job_user_meta(user_id)
     logger.info(
         "compress_pdf_job: start chat_id=%s user_id=%s file=%s size=%s",
-        chat_id, user_id, filename, file_size,
+        chat_id,
+        user_id,
+        filename,
+        file_size,
     )
     if _rq_job_id:
         try:
@@ -4323,7 +4089,9 @@ def compress_pdf_job(
                 },
             )
         except Exception:
-            logger.exception("Failed to write io:in for compress job %s", _rq_job_id)
+            logger.exception(
+                "Failed to write io:in for compress job %s", _rq_job_id
+            )
     _cancel_check_id = _rq_job_id or file_id
     if _job_cancelled(_cancel_check_id):
         return {"status": "cancelled"}
@@ -4336,7 +4104,9 @@ def compress_pdf_job(
     _progress_msg_id = None
     try:
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "downloading",
+            chat_id,
+            filename,
+            "downloading",
             detail="\U0001f4e5 Downloading PDF...",
         )
         _src = os.path.join(tmpdir, _safe_local_filename(filename))
@@ -4358,8 +4128,6 @@ def compress_pdf_job(
                 file_size,
                 user_id,
                 progress_callback=_dl_cb,
-
-
                 chat_id=source_chat_id or chat_id,
                 message_id=message_id,
                 file_unique_id=file_unique_id,
@@ -4372,7 +4140,6 @@ def compress_pdf_job(
                 int(_dl_state["msg_id"]) or _progress_msg_id,
             )
             return {"status": "cancelled"}
-
 
         _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
         if not _ok:
@@ -4387,10 +4154,6 @@ def compress_pdf_job(
                 pass
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
-
-
-
-
 
         _content_hash = None
         try:
@@ -4427,21 +4190,18 @@ def compress_pdf_job(
             except Exception:
                 pass
 
-
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "already_processed", "skipped": True}
 
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "compressing",
+            chat_id,
+            filename,
+            "compressing",
             detail="\U0001f5dc\ufe0f Compressing PDF...",
             message_id=_progress_msg_id,
         )
 
         _out_name = safe_target_name(filename, "pdf")
-
-
-
-
 
         _out = os.path.join(tmpdir, f"compressed_{_out_name}")
         _gs = getattr(config, "PDF_COMPRESS_QUALITY", "/ebook")
@@ -4474,16 +4234,15 @@ def compress_pdf_job(
         _comp = os.path.getsize(_out)
         _saved = max(0, int((1 - _comp / _orig) * 100)) if _orig else 0
 
-
-
-
-
-
         _min_gain_pct = float(getattr(config, "COMPRESS_MIN_GAIN_PCT", 5) or 5)
         _min_gain_bytes = int(
             getattr(config, "COMPRESS_MIN_GAIN_BYTES", 100_000) or 100_000
         )
-        if _orig and _saved < _min_gain_pct and max(0, _orig - _comp) < _min_gain_bytes:
+        if (
+            _orig
+            and _saved < _min_gain_pct
+            and max(0, _orig - _comp) < _min_gain_bytes
+        ):
             upsert_processed_record(
                 _content_hash,
                 "compress",
@@ -4525,7 +4284,12 @@ def compress_pdf_job(
 
         _caption = f"Here is your compressed PDF ({_saved}% smaller)."
         _comp_res = _deliver_converted_file(
-            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
+            chat_id,
+            _out,
+            _out_name,
+            _thumb_path,
+            _caption,
+            user_id,
             progress_msg_id=_progress_msg_id,
             done_ops=("compress",),
         )
@@ -4539,9 +4303,7 @@ def compress_pdf_job(
                     filename=filename,
                     file_size=file_size,
                     file_id=_doc.get("file_id"),
-                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
-                        "file_id"
-                    ),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get("file_id"),
                     user_id=user_id,
                     chat_id=chat_id,
                 )
@@ -4639,10 +4401,11 @@ def ocr_job(
     _rq_job_id = _attach_job_user_meta(user_id)
     logger.info(
         "ocr_job: start chat_id=%s user_id=%s file=%s size=%s",
-        chat_id, user_id, filename, file_size,
+        chat_id,
+        user_id,
+        filename,
+        file_size,
     )
-
-
 
     _orig_filename = filename
     if _rq_job_id:
@@ -4661,7 +4424,9 @@ def ocr_job(
                 },
             )
         except Exception:
-            logger.exception("Failed to write io:in for ocr job %s", _rq_job_id)
+            logger.exception(
+                "Failed to write io:in for ocr job %s", _rq_job_id
+            )
     _cancel_check_id = _rq_job_id or file_id
     if _job_cancelled(_cancel_check_id):
         return {"status": "cancelled"}
@@ -4674,7 +4439,9 @@ def ocr_job(
     _progress_msg_id = None
     try:
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "downloading",
+            chat_id,
+            filename,
+            "downloading",
             detail="\U0001f4e5 Downloading file...",
             file_size=file_size or 0,
         )
@@ -4697,8 +4464,6 @@ def ocr_job(
                 file_size,
                 user_id,
                 progress_callback=_dl_cb,
-
-
                 chat_id=source_chat_id or chat_id,
                 message_id=message_id,
                 file_unique_id=file_unique_id,
@@ -4723,11 +4488,6 @@ def ocr_job(
                 pass
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"error": "download_failed"}
-
-
-
-
-
 
         _content_hash = None
         try:
@@ -4764,32 +4524,31 @@ def ocr_job(
             except Exception:
                 pass
 
-
             _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
             return {"status": "already_processed", "skipped": True}
 
-
-
-
         _thumb_path = None
 
-
-
         _converted_book = False
-
 
         if is_book_format(filename) and not filename.lower().endswith(".pdf"):
             _pdf_name = safe_target_name(filename, "pdf")
             _pdf_src = os.path.join(tmpdir, _pdf_name)
-            _conv_timeout = getattr(config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600)
+            _conv_timeout = getattr(
+                config, "BOOK_CONVERT_TIMEOUT_SECONDS", 600
+            )
             _tg_send_progress(
-                chat_id, filename, "compressing",
+                chat_id,
+                filename,
+                "compressing",
                 detail="\U0001f4d5 Converting book to PDF for OCR...",
                 message_id=_progress_msg_id,
             )
             try:
                 _conv_ok = convert_book_to_pdf_with_thumbnail(
-                    _src, _pdf_src, os.path.join(tmpdir, "thumb.jpg"),
+                    _src,
+                    _pdf_src,
+                    os.path.join(tmpdir, "thumb.jpg"),
                     timeout=_conv_timeout,
                     cancel_check=lambda: _job_cancelled(_cancel_check_id),
                 )
@@ -4805,7 +4564,9 @@ def ocr_job(
                     "ocr_job: %s is DRM-protected; cannot convert", filename
                 )
                 _tg_send_progress(
-                    chat_id, filename, "failed",
+                    chat_id,
+                    filename,
+                    "failed",
                     detail=(
                         "\u274c This book is DRM-protected and can't be "
                         "converted. Provide a DRM-free copy."
@@ -4816,7 +4577,9 @@ def ocr_job(
                 return {"error": "drm_protected"}
             if not _conv_ok or not os.path.exists(_pdf_src):
                 _tg_send_progress(
-                    chat_id, filename, "failed",
+                    chat_id,
+                    filename,
+                    "failed",
                     detail=(
                         "\u274c Couldn't convert the book to PDF for OCR. "
                         "The file may be DRM-protected or corrupt."
@@ -4829,9 +4592,6 @@ def ocr_job(
             filename = _pdf_name
             _converted_book = True
 
-
-
-
             if target == "pdf":
                 _thumb_path = os.path.join(tmpdir, "thumb.jpg")
 
@@ -4841,17 +4601,9 @@ def ocr_job(
 
         _is_pdf_out = target == "pdf"
 
-
-
-
-
-
         _src_is_pdf = filename.lower().endswith(".pdf")
         _checks = _get_pdf_checks(file_unique_id) if _src_is_pdf else None
         if _checks is not None and _checks["has_text_layer"] is not None:
-
-
-
             _already_ocr = bool(_checks["has_text_layer"])
         else:
             _already_ocr = _src_is_pdf and pdf_has_text_layer(_src)
@@ -4862,10 +4614,6 @@ def ocr_job(
                     content_hash=_content_hash,
                 )
         if _already_ocr and _is_pdf_out:
-
-
-
-
             if _converted_book:
                 _caption = (
                     "\U0001f4d6 Here is your book as a searchable PDF — the "
@@ -4873,9 +4621,6 @@ def ocr_job(
                     "was needed."
                 )
             else:
-
-
-
                 _thumb_path = _build_pdf_output_preview(
                     _src, filename, file_unique_id, tmpdir
                 )
@@ -4884,15 +4629,18 @@ def ocr_job(
                     "searchable text layer, so no OCR was needed."
                 )
             _ocr_res = _deliver_converted_file(
-                chat_id, _src, filename, _thumb_path, _caption, user_id,
+                chat_id,
+                _src,
+                filename,
+                _thumb_path,
+                _caption,
+                user_id,
                 progress_msg_id=_progress_msg_id,
                 done_ops=("ocr",),
             )
             if _ocr_res and _ocr_res.get("ok"):
                 try:
-                    _doc = (_ocr_res.get("result") or {}).get(
-                        "document"
-                    ) or {}
+                    _doc = (_ocr_res.get("result") or {}).get("document") or {}
                     upsert_processed_record(
                         _content_hash,
                         "ocr",
@@ -4922,9 +4670,6 @@ def ocr_job(
                     target=target,
                 )
             if _ocr_res and not _converted_book:
-
-
-
                 _publish_thumb_ready(
                     file_unique_id,
                     filename.lower().endswith(".pdf"),
@@ -4945,8 +4690,6 @@ def ocr_job(
             return {"status": "already_ocr_delivered", "delivered": True}
 
         if _is_pdf_out and _thumb_path is None:
-
-
             _thumb_path = _build_pdf_output_preview(
                 _src, filename, file_unique_id, tmpdir
             )
@@ -4960,7 +4703,9 @@ def ocr_job(
             )
         )
         _progress_msg_id = _tg_send_progress(
-            chat_id, filename, "ocr",
+            chat_id,
+            filename,
+            "ocr",
             detail=_ocr_detail,
             message_id=_progress_msg_id,
         )
@@ -4969,10 +4714,8 @@ def ocr_job(
         _ocr_to = int(getattr(config, "OCR_TIMEOUT_SECONDS", 600) or 0)
         try:
             if _is_pdf_out:
-
                 _out_name = safe_target_name(filename, "pdf")
                 _out = os.path.join(tmpdir, _out_name)
-
 
                 if os.path.abspath(_out) == os.path.abspath(_src):
                     _base = os.path.splitext(_out_name)[0]
@@ -4989,7 +4732,9 @@ def ocr_job(
                 )
                 if _pdf_text is None:
                     _tg_send_progress(
-                        chat_id, filename, "failed",
+                        chat_id,
+                        filename,
+                        "failed",
                         detail=(
                             "\u274c OCR failed to build the searchable PDF. "
                             "The file may be corrupt/DRM-protected, or the OCR "
@@ -4998,21 +4743,14 @@ def ocr_job(
                         message_id=_progress_msg_id,
                     )
 
-
-
-
                     _delete_queued_messages(_rq_job_id)
                     return {"error": "ocr_failed"}
                 text = _pdf_text or ""
             elif _already_ocr:
-
-
                 _out_name = safe_target_name(filename, "txt")
                 _out = os.path.join(tmpdir, _out_name)
                 text = _extract_pdf_text(_src)
                 if not (text or "").strip():
-
-
                     text = run_ocr(
                         _src,
                         filename,
@@ -5038,9 +4776,6 @@ def ocr_job(
             return {"status": "cancelled"}
 
         if _is_pdf_out:
-
-
-
             if text.strip():
                 _caption = (
                     "\U0001f50e Here is your searchable PDF — it looks exactly "
@@ -5056,7 +4791,9 @@ def ocr_job(
         else:
             if not text or not text.strip():
                 _tg_send_progress(
-                    chat_id, filename, "failed",
+                    chat_id,
+                    filename,
+                    "failed",
                     detail=(
                         "\u274c No text was found. The file may contain no "
                         "text (e.g. a blank page or a DRM-protected PDF), or "
@@ -5066,21 +4803,22 @@ def ocr_job(
                     message_id=_progress_msg_id,
                 )
 
-
                 _delete_queued_messages(_rq_job_id)
                 return {"error": "no_text_found"}
             with open(_out, "w", encoding="utf-8") as _fh:
                 _fh.write(text)
             _caption = "\U0001f50e Here is the extracted text."
         _ocr_res = _deliver_converted_file(
-            chat_id, _out, _out_name, _thumb_path, _caption, user_id,
+            chat_id,
+            _out,
+            _out_name,
+            _thumb_path,
+            _caption,
+            user_id,
             progress_msg_id=_progress_msg_id,
             done_ops=("ocr",),
         )
         if _ocr_res and not _converted_book:
-
-
-
             _publish_thumb_ready(
                 file_unique_id,
                 filename.lower().endswith(".pdf"),
@@ -5096,9 +4834,7 @@ def ocr_job(
                     filename=_orig_filename,
                     file_size=file_size,
                     file_id=_doc.get("file_id"),
-                    thumb_file_id=(_doc.get("thumbnail") or {}).get(
-                        "file_id"
-                    ),
+                    thumb_file_id=(_doc.get("thumbnail") or {}).get("file_id"),
                     user_id=user_id,
                     chat_id=chat_id,
                     target=target,
@@ -5182,7 +4918,9 @@ def process_url_job(
                 },
             )
         except Exception:
-            logger.exception("Failed to write io:in for URL job %s", _rq_job_id)
+            logger.exception(
+                "Failed to write io:in for URL job %s", _rq_job_id
+            )
 
     def _write_out(status: str, **extra) -> None:
         """Persist io:out for this URL job (best-effort)."""
@@ -5201,7 +4939,6 @@ def process_url_job(
             )
         except Exception:
             pass
-
 
     if not _validate_url_safe(url):
         logger.warning(
@@ -5226,7 +4963,6 @@ def process_url_job(
         tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None) or None)
         file_path = os.path.join(tmpdir, _safe_local_filename(filename))
 
-
         _progress_msg_id = _tg_send_progress(
             chat_id,
             filename,
@@ -5239,9 +4975,7 @@ def process_url_job(
             "last_t": 0.0,
         }
         try:
-            with requests.head(
-                url, allow_redirects=False, timeout=30
-            ) as _hr:
+            with requests.head(url, allow_redirects=False, timeout=30) as _hr:
                 _total = int(_hr.headers.get("Content-Length") or 0)
         except Exception:
             _total = 0
@@ -5260,7 +4994,6 @@ def process_url_job(
                             chat_id, filename, _seen, _total, _dl_state
                         )
         _progress_msg_id = int(_dl_state["msg_id"]) or _progress_msg_id
-
 
         if _is_ebook(filename):
             if not _book_conversion_enabled():
@@ -5284,13 +5017,9 @@ def process_url_job(
             else:
                 _write_out("error", error="book echo failed")
             if _ebook_ok:
-                _cleanup_after_success(
-                    chat_id, _rq_job_id, _progress_msg_id
-                )
+                _cleanup_after_success(chat_id, _rq_job_id, _progress_msg_id)
             else:
-                _cleanup_after_failure(
-                    chat_id, _rq_job_id, _progress_msg_id
-                )
+                _cleanup_after_failure(chat_id, _rq_job_id, _progress_msg_id)
                 try:
                     _tg_send_message(
                         None,
@@ -5328,8 +5057,6 @@ def process_url_job(
             message_id=_progress_msg_id,
         )
 
-
-
         try:
             _dl_size = os.path.getsize(file_path)
         except Exception:
@@ -5349,8 +5076,6 @@ def process_url_job(
             )
             if _ub_res:
                 _sent, _src_chat = _ub_res
-
-
 
                 _maybe_attach_result_prompt(
                     chat_id,
