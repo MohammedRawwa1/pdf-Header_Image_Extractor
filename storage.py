@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import uuid
@@ -10,6 +11,75 @@ except Exception:
     config = None
 
 
+def _build_s3_client(cfg=None):
+    """Create a boto3 S3 client from app config, or return None.
+
+    Mirrors the client construction in ``utils/storage.py`` so background jobs
+    see the same endpoint/region/addressing behaviour as the rest of the app:
+    a missing region or a virtual-hosted-style request against an
+    S3-compatible endpoint makes S3 answer ``301 PermanentRedirect``, which
+    botocore resolves by calling ``head_bucket`` — and that call redirects
+    again, looping until ``RecursionError``.  Getting the endpoint and region
+    right (plus path-style addressing where configured) avoids the redirect
+    entirely.
+    """
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except Exception:
+        logger.exception("boto3 not available; cannot create S3 client")
+        return None
+
+    cfg = cfg if cfg is not None else config
+
+    client_kwargs = {}
+    region = (
+        getattr(cfg, "S3_REGION", None)
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+    )
+    if region:
+        client_kwargs["region_name"] = region
+    endpoint = str(getattr(cfg, "S3_ENDPOINT", "") or "").strip()
+    if endpoint:
+        if not endpoint.startswith(("http://", "https://")):
+            scheme = (
+                "https"
+                if getattr(cfg, "S3_USE_SSL", True) is not False
+                else "http"
+            )
+            endpoint = f"{scheme}://{endpoint}"
+        client_kwargs["endpoint_url"] = endpoint.rstrip("/")
+    access_key = getattr(cfg, "AWS_ACCESS_KEY_ID", None)
+    secret_key = getattr(cfg, "AWS_SECRET_ACCESS_KEY", None)
+    if access_key or secret_key:
+        client_kwargs["aws_access_key_id"] = access_key or None
+        client_kwargs["aws_secret_access_key"] = secret_key or None
+    session_token = os.getenv("AWS_SESSION_TOKEN")
+    if session_token:
+        client_kwargs["aws_session_token"] = session_token
+
+    try:
+        sig = getattr(cfg, "S3_SIGNATURE_VERSION", None) or "s3v4"
+        force_path = str(os.getenv("S3_FORCE_PATH_STYLE", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        cfg_kwargs = {
+            "signature_version": sig,
+            "retries": {"max_attempts": 3, "mode": "standard"},
+        }
+        if force_path:
+            cfg_kwargs["s3"] = {"addressing_style": "path"}
+        return boto3.client(
+            "s3", config=BotoConfig(**cfg_kwargs), **client_kwargs
+        )
+    except Exception:
+        logger.exception("Failed to create S3 client")
+        return None
+
+
 def upload_file_and_get_presigned_url(
     file_path: str, object_name: str | None = None
 ) -> str | None:
@@ -18,48 +88,15 @@ def upload_file_and_get_presigned_url(
     Uses `boto3` and configuration from `config.py`.
     Returns the presigned URL string on success, or `None` on failure.
     """
-    try:
-        import boto3
-    except Exception:
-        logger.exception("boto3 not available; cannot upload to S3")
-        return None
-
-    try:
-        import config
-    except Exception:
-        logger.exception("Failed to import config for S3 upload")
-        return None
-
-    bucket = getattr(config, "S3_BUCKET", None)
-    if not bucket:
+    if not getattr(config, "S3_BUCKET", None):
         logger.error("S3 bucket not configured")
         return None
 
-    # Build client kwargs
-    client_kwargs = {}
-    if getattr(config, "S3_REGION", None):
-        client_kwargs["region_name"] = config.S3_REGION
-    if getattr(config, "S3_ENDPOINT", None):
-        client_kwargs["endpoint_url"] = config.S3_ENDPOINT
-    # Allow explicit credentials if provided, otherwise boto3 will use env/instance role
-    if getattr(config, "AWS_ACCESS_KEY_ID", None) or getattr(
-        config, "AWS_SECRET_ACCESS_KEY", None
-    ):
-        client_kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID or None
-        client_kwargs["aws_secret_access_key"] = (
-            config.AWS_SECRET_ACCESS_KEY or None
-        )
-
-    try:
-        from botocore.config import Config as BotoConfig
-
-        sig = getattr(config, "S3_SIGNATURE_VERSION", "s3v4")
-        boto_cfg = BotoConfig(signature_version=sig)
-        s3 = boto3.client("s3", config=boto_cfg, **client_kwargs)
-    except Exception:
-        logger.exception("Failed to create S3 client")
+    s3 = _build_s3_client()
+    if s3 is None:
         return None
 
+    bucket = config.S3_BUCKET
     if not object_name:
         object_name = os.path.basename(file_path)
     # create a unique key to avoid collisions
@@ -108,59 +145,26 @@ def purge_objects_older_than(
 
     Returns the number of deleted objects.
     """
-    try:
-        import boto3
-    except Exception:
-        logger.exception("boto3 not available; cannot purge S3 objects")
-        return 0
-
-    try:
-        import config
-    except Exception:
-        logger.exception("Failed to import config for S3 purge")
-        return 0
-
-    bucket = getattr(config, "S3_BUCKET", None)
-    if not bucket:
+    if not getattr(config, "S3_BUCKET", None):
         logger.error("S3 bucket not configured for purge")
         return 0
 
-    client_kwargs = {}
-    if getattr(config, "S3_REGION", None):
-        client_kwargs["region_name"] = config.S3_REGION
-    if getattr(config, "S3_ENDPOINT", None):
-        client_kwargs["endpoint_url"] = config.S3_ENDPOINT
-    if getattr(config, "AWS_ACCESS_KEY_ID", None) or getattr(
-        config, "AWS_SECRET_ACCESS_KEY", None
-    ):
-        client_kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID or None
-        client_kwargs["aws_secret_access_key"] = (
-            config.AWS_SECRET_ACCESS_KEY or None
-        )
-
-    try:
-        from botocore.config import Config as BotoConfig
-
-        sig = getattr(config, "S3_SIGNATURE_VERSION", "s3v4")
-        boto_cfg = BotoConfig(signature_version=sig)
-        s3 = boto3.client("s3", config=boto_cfg, **client_kwargs)
-    except Exception:
-        logger.exception("Failed to create S3 client for purge")
+    s3 = _build_s3_client()
+    if s3 is None:
         return 0
 
+    bucket = config.S3_BUCKET
     deleted_count = 0
     paginator = s3.get_paginator("list_objects_v2")
+    now = datetime.datetime.now(datetime.UTC)
     try:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 last_modified = obj["LastModified"]
-                # compare with now
-                import datetime
-
-                age = datetime.datetime.utcnow() - last_modified.replace(
-                    tzinfo=None
-                )
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=datetime.UTC)
+                age = now - last_modified
                 if age.total_seconds() > ttl_seconds:
                     try:
                         s3.delete_object(Bucket=bucket, Key=key)
@@ -173,6 +177,22 @@ def purge_objects_older_than(
                     except Exception:
                         logger.exception("Failed deleting S3 object %s", key)
         return deleted_count
+    except RecursionError:
+        # botocore follows a 301/PermanentRedirect by calling head_bucket, and
+        # with a wrong endpoint/region that call redirects too, recursing until
+        # the interpreter gives up.  Report it once instead of dumping a
+        # multi-thousand-line traceback every cleanup cycle.
+        logger.error(
+            "Failed listing S3 objects for purge: botocore entered a "
+            "bucket-region redirect loop (bucket=%s endpoint=%s region=%s). "
+            "Check S3_BUCKET/S3_REGION against S3_ENDPOINT and set "
+            "S3_FORCE_PATH_STYLE=1 for S3-compatible endpoints that require "
+            "path-style addressing.",
+            bucket,
+            getattr(config, "S3_ENDPOINT", "") or "default",
+            getattr(config, "S3_REGION", "") or "default",
+        )
+        return deleted_count
     except Exception:
         logger.exception("Failed listing S3 objects for purge")
         return deleted_count
@@ -184,15 +204,6 @@ def get_storage_backend_sync():
     Returns None when S3 is not configured or boto3 is unavailable.
     """
     try:
-        import boto3
-        from botocore.config import Config as BotoConfig
-    except Exception:
-        logger.exception(
-            "boto3 not available; storage backend sync not available"
-        )
-        return None
-
-    try:
         # reload config inside function to allow dynamic env changes
         import config as _config
     except Exception:
@@ -203,25 +214,8 @@ def get_storage_backend_sync():
         logger.error("S3 bucket not configured; storage backend not available")
         return None
 
-    client_kwargs = {}
-    if getattr(_config, "S3_REGION", None):
-        client_kwargs["region_name"] = _config.S3_REGION
-    if getattr(_config, "S3_ENDPOINT", None):
-        client_kwargs["endpoint_url"] = _config.S3_ENDPOINT
-    if getattr(_config, "AWS_ACCESS_KEY_ID", None) or getattr(
-        _config, "AWS_SECRET_ACCESS_KEY", None
-    ):
-        client_kwargs["aws_access_key_id"] = _config.AWS_ACCESS_KEY_ID or None
-        client_kwargs["aws_secret_access_key"] = (
-            _config.AWS_SECRET_ACCESS_KEY or None
-        )
-
-    try:
-        sig = getattr(_config, "S3_SIGNATURE_VERSION", "s3v4")
-        boto_cfg = BotoConfig(signature_version=sig)
-        s3 = boto3.client("s3", config=boto_cfg, **client_kwargs)
-    except Exception:
-        logger.exception("Failed to create S3 client for backend")
+    s3 = _build_s3_client(_config)
+    if s3 is None:
         return None
 
     class _S3BackendSync:
@@ -254,9 +248,13 @@ def get_storage_backend_sync():
             )
 
         def _upload_bytes_sync(self, data: bytes, dest_key: str) -> str:
-            extra = {"Metadata": {"orig_size": str(len(data))}}
+            # put_object takes Metadata directly; there is no ExtraArgs
+            # parameter, and passing one raised ParamValidationError.
             self.s3.put_object(
-                Bucket=self.bucket, Key=dest_key, Body=data, ExtraArgs=extra
+                Bucket=self.bucket,
+                Key=dest_key,
+                Body=data,
+                Metadata={"orig_size": str(len(data))},
             )
             return dest_key
 
