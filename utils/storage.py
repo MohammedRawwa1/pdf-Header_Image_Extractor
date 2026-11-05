@@ -30,6 +30,32 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int], None] | None
 
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def use_path_style_addressing(endpoint_url: str | None = None) -> bool:
+    """Return whether S3 requests must use path-style addressing.
+
+    S3-compatible services (MinIO, Cloudflare R2, IDrive e2, Backblaze B2, ...)
+    answer a virtual-hosted-style ``bucket.host`` request with
+    ``301 PermanentRedirect``.  botocore then calls ``head_bucket`` to discover
+    the bucket region, that call redirects as well, and the redirector recurses
+    until ``RecursionError`` -- taking down uploads and the hourly purge alike.
+    Path-style requests avoid the redirect, so they are the default whenever a
+    custom ``S3_ENDPOINT`` is configured.
+
+    ``S3_FORCE_PATH_STYLE`` overrides the default: ``1/true/yes/on`` forces
+    path style (also for AWS), ``0/false/no/off`` disables it.
+    """
+    raw = str(os.getenv("S3_FORCE_PATH_STYLE", "") or "").strip().lower()
+    if raw in _FALSY:
+        return False
+    if raw in _TRUTHY:
+        return True
+    endpoint = str(endpoint_url or "").strip()
+    return bool(endpoint)
+
 
 class _TransferProgress:
     def __init__(self, total: int, callback: ProgressCallback):
@@ -217,10 +243,7 @@ class S3AsyncBackend(AsyncStorageBackend):
         self._boto_config = None
         if BotoConfig is not None:
             try:
-                force_path = str(
-                    os.getenv("S3_FORCE_PATH_STYLE", "")
-                ).lower() in ("1", "true", "yes")
-                if force_path:
+                if use_path_style_addressing(self.endpoint_url):
                     try:
                         self._boto_config = BotoConfig(
                             signature_version="s3v4",

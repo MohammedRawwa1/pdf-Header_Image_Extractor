@@ -134,11 +134,16 @@ def _s3_client():
         client_kwargs["aws_session_token"] = _env("AWS_SESSION_TOKEN")
     try:
         sig = _env("S3_SIGNATURE_VERSION") or "s3v4"
-        force_path = _env("S3_FORCE_PATH_STYLE").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        # Custom endpoints reject virtual-hosted-style bucket URLs with a
+        # 301, so path style is the default whenever S3_ENDPOINT is set;
+        # S3_FORCE_PATH_STYLE=0 turns it off.
+        raw_path_style = _env("S3_FORCE_PATH_STYLE").lower()
+        if raw_path_style in ("0", "false", "no", "off"):
+            force_path = False
+        elif raw_path_style in ("1", "true", "yes", "on"):
+            force_path = True
+        else:
+            force_path = bool(_env("S3_ENDPOINT"))
         if force_path:
             boto_cfg = BotoConfig(
                 signature_version=sig,

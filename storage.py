@@ -20,8 +20,8 @@ def _build_s3_client(cfg=None):
     S3-compatible endpoint makes S3 answer ``301 PermanentRedirect``, which
     botocore resolves by calling ``head_bucket`` — and that call redirects
     again, looping until ``RecursionError``.  Getting the endpoint and region
-    right (plus path-style addressing where configured) avoids the redirect
-    entirely.
+    right (plus path-style addressing, which is the default for custom
+    endpoints) avoids the redirect entirely.
     """
     try:
         import boto3
@@ -61,11 +61,21 @@ def _build_s3_client(cfg=None):
 
     try:
         sig = getattr(cfg, "S3_SIGNATURE_VERSION", None) or "s3v4"
-        force_path = str(os.getenv("S3_FORCE_PATH_STYLE", "")).lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        try:
+            from utils.storage import use_path_style_addressing
+
+            force_path = use_path_style_addressing(
+                client_kwargs.get("endpoint_url")
+            )
+        except Exception:
+            # Standalone use (scripts) without utils/ on sys.path.
+            raw = str(os.getenv("S3_FORCE_PATH_STYLE", "")).strip().lower()
+            if raw in ("0", "false", "no", "off"):
+                force_path = False
+            elif raw in ("1", "true", "yes", "on"):
+                force_path = True
+            else:
+                force_path = bool(client_kwargs.get("endpoint_url"))
         cfg_kwargs = {
             "signature_version": sig,
             "retries": {"max_attempts": 3, "mode": "standard"},
@@ -185,9 +195,9 @@ def purge_objects_older_than(
         logger.error(
             "Failed listing S3 objects for purge: botocore entered a "
             "bucket-region redirect loop (bucket=%s endpoint=%s region=%s). "
-            "Check S3_BUCKET/S3_REGION against S3_ENDPOINT and set "
-            "S3_FORCE_PATH_STYLE=1 for S3-compatible endpoints that require "
-            "path-style addressing.",
+            "Check S3_REGION against the bucket's real region and that the "
+            "endpoint matches it; set S3_FORCE_PATH_STYLE=0 only if the "
+            "provider requires virtual-hosted-style URLs.",
             bucket,
             getattr(config, "S3_ENDPOINT", "") or "default",
             getattr(config, "S3_REGION", "") or "default",

@@ -504,9 +504,10 @@ except Exception:
     get_current_job = None
 
 try:
-    from storage import upload_file_and_get_presigned_url
+    from storage import _build_s3_client, upload_file_and_get_presigned_url
 except Exception:
     upload_file_and_get_presigned_url = None
+    _build_s3_client = None
 
 
 def _download_s3_key_to_file(
@@ -516,37 +517,19 @@ def _download_s3_key_to_file(
     cancel_check: Callable[[], bool] | None = None,
 ) -> bool:
     """Download an S3 object (by key) to local `dest_path` using boto3."""
-    try:
-        import boto3
-        from botocore.config import Config as BotoConfig
-    except Exception:
-        logger.exception("boto3 not available for downloading S3 key %s", key)
-        return False
-
     bucket = getattr(config, "S3_BUCKET", None)
     if not bucket:
         logger.error("S3 bucket not configured; cannot download key %s", key)
         return False
 
-    client_kwargs = {}
-    if getattr(config, "S3_REGION", None):
-        client_kwargs["region_name"] = config.S3_REGION
-    if getattr(config, "S3_ENDPOINT", None):
-        client_kwargs["endpoint_url"] = config.S3_ENDPOINT
-    if getattr(config, "AWS_ACCESS_KEY_ID", None) or getattr(
-        config, "AWS_SECRET_ACCESS_KEY", None
-    ):
-        client_kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID or None
-        client_kwargs["aws_secret_access_key"] = (
-            config.AWS_SECRET_ACCESS_KEY or None
-        )
-
-    try:
-        sig = getattr(config, "S3_SIGNATURE_VERSION", "s3v4")
-        boto_cfg = BotoConfig(signature_version=sig)
-        s3 = boto3.client("s3", config=boto_cfg, **client_kwargs)
-    except Exception:
-        logger.exception("Failed to create S3 client for download of %s", key)
+    if _build_s3_client is None:
+        logger.error("storage module unavailable; cannot download key %s", key)
+        return False
+    # Shared client builder keeps this in sync with the rest of the app
+    # (endpoint normalization, path-style addressing, session tokens).
+    s3 = _build_s3_client()
+    if s3 is None:
+        logger.error("Failed to create S3 client for download of %s", key)
         return False
 
     _s3_total = 0
