@@ -5,13 +5,10 @@ import os
 
 from telegram import Bot, BotCommand
 
-DEFAULT_COMMANDS = [
-    ("start", "Start interaction with the bot"),
-    ("help", "Show help and available commands"),
-    ("status", "Get bot status"),
-    ("setwebhook", "(admin) Set webhook to provided URL"),
-    ("delwebhook", "(admin) Delete the webhook"),
-]
+from utils.i18n import command_menu
+
+#: One list, shared with bot.py and /setcommands (was a stale 5-entry copy).
+DEFAULT_COMMANDS = command_menu()
 
 
 async def set_commands(token: str, commands=None):

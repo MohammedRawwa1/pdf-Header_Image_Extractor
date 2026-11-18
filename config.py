@@ -185,7 +185,9 @@ ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() in (
     "true",
     "yes",
 )
-OCR_LANG: str = os.getenv("OCR_LANG", "eng")
+# "+"-separated Tesseract languages. The image ships eng + ara; languages
+# whose traineddata is missing are dropped at runtime (see utils/ocr.py).
+OCR_LANG: str = os.getenv("OCR_LANG", "eng+ara")
 OCR_TIMEOUT_SECONDS: int = int(os.getenv("OCR_TIMEOUT_SECONDS", "600"))
 OCR_DPI: int = int(os.getenv("OCR_DPI", "200"))
 

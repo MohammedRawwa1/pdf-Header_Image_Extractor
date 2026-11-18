@@ -9,6 +9,7 @@ import signal
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -40,8 +41,20 @@ from telegram.ext import (
 )
 
 # ── Security helpers ────────────────────────────────────────────
-_SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._\- ]")
+# Keep letters, combining marks and digits of *every* script (Arabic, Persian,
+# Cyrillic, Greek, CJK, ...) plus a small set of separators. The previous
+# Latin-only class turned an Arabic output title into a row of underscores.
+# Control/format characters (bidi overrides, zero-width marks, nulls) are still
+# replaced - they are a filename-spoofing hazard, not letters.
+_FILENAME_SEPARATORS = frozenset("._- ()[]")
 _MAX_FILENAME_LENGTH = 255
+
+
+def _is_safe_filename_char(ch: str) -> bool:
+    """Whether *ch* may stay in a sanitized filename."""
+    if ch in _FILENAME_SEPARATORS:
+        return True
+    return unicodedata.category(ch)[0] in ("L", "M", "N")
 
 
 def _sanitize_filename(filename: str, default: str = "file") -> str:
@@ -60,8 +73,10 @@ def _sanitize_filename(filename: str, default: str = "file") -> str:
     filename = "".join(c for c in filename if c >= " ")
     # Strip directory traversal sequences
     filename = filename.replace("..", "_")
-    # Remove any remaining dangerous characters
-    filename = _SAFE_FILENAME_RE.sub("_", filename)
+    # Remove any remaining dangerous characters, keeping all scripts' letters
+    filename = "".join(
+        ch if _is_safe_filename_char(ch) else "_" for ch in filename
+    )
     # Limit length
     filename = filename[:_MAX_FILENAME_LENGTH]
     # Strip leading dots and spaces
@@ -95,6 +110,7 @@ from utils.error_handler import (  # noqa: E402
     get_error_handler,
     handle_bot_error,
 )
+from utils.i18n import command_menu, t  # noqa: E402
 from utils.markdown_utils import escape_markdown, safe_code_span  # noqa: E402
 from utils.ocr import (  # noqa: E402
     is_ocr_source,
@@ -1362,7 +1378,7 @@ async def handle_document(
     doc = msg.document
     # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
-        await msg.reply_text("Access denied. This bot is private.")
+        await msg.reply_text(t("access_denied"))
         return
 
     # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
@@ -1912,7 +1928,7 @@ async def handle_photo(
 
     # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
-        await msg.reply_text("Access denied. This bot is private.")
+        await msg.reply_text(t("access_denied"))
         return
 
     # ── Respect Telegram API rate limits (global 30/s + per-user 1/s) ──
@@ -2274,9 +2290,7 @@ async def cmd_start(
     await _track_user_session(update, "/start")
     user_id = getattr(update.effective_user, "id", None)
     if not config.is_user_allowed(user_id):
-        await update.effective_message.reply_text(
-            "Access denied. This bot is private."
-        )
+        await update.effective_message.reply_text(t("access_denied"))
         return
     # Prefer the Telegram username (e.g. @mohammad) over the display name
     # so the welcome matches the name the user is known by on Telegram.
@@ -2285,6 +2299,8 @@ async def cmd_start(
         user_name = "@" + _eff_user.username
     else:
         user_name = getattr(_eff_user, "first_name", None) or "there"
+    # Arabic half of the welcome, so a mixed audience reads the same screen.
+    _ar_welcome = "\n\n" + t("start_ar", name=escape_markdown(user_name))
     await update.effective_message.reply_text(
         f"🎉 Welcome, {escape_markdown(user_name)}!\n\n"
         "📄 Send a **PDF**, **image**, or **e-book** and I'll show you an "
@@ -2300,7 +2316,8 @@ async def cmd_start(
         "• /ocr [pdf|txt|picker] — pick your **OCR output default** (skip the picker)\n"
         "• /canceljob <id> — cancel a queued/in-flight job (asks to confirm)\n"
         "• /startbatch + /endbatch — process multiple files at once\n\n"
-        "_Sessions are per-user: nobody else can use your account._",
+        "_Sessions are per-user: nobody else can use your account._"
+        + _ar_welcome,
         parse_mode="Markdown",
     )
 
@@ -2309,7 +2326,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _track_user_session(update, "/help")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
 
@@ -2356,7 +2373,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n"
         "Send any supported file to get its action menu."
     )
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(text + "\n\n" + t("help_ar"))
 
 
 def _ago(ts: float | None) -> str:
@@ -2450,7 +2467,7 @@ def _cancel_all_kb() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "\U0001f5d1 Cancel all jobs", callback_data="cancelall"
+                    t("menu_cancel_all"), callback_data="cancelall"
                 )
             ]
         ]
@@ -2702,7 +2719,7 @@ def _ctx_menu_kb(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f5bc\ufe0f Thumbnail",
+                    t("menu_thumb"),
                     callback_data=f"ctxthumb:{uid}:{token}",
                 )
             ]
@@ -2711,7 +2728,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
+                        t("menu_ocr_thumb"),
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -2719,7 +2736,7 @@ def _ctx_menu_kb(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f5dc\ufe0f\U0001f5bc\ufe0f Compress & Thumbnail",
+                    t("menu_compress_thumb"),
                     callback_data=f"compresspdf:{uid}:{token}",
                 )
             ]
@@ -2728,7 +2745,7 @@ def _ctx_menu_kb(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f5bc\ufe0f Thumbnail",
+                    t("menu_thumb"),
                     callback_data=f"ctxthumb:{uid}:{token}",
                 )
             ]
@@ -2737,7 +2754,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail",
+                        t("menu_ocr_thumb"),
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -2750,7 +2767,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f501 Convert",
+                        t("menu_convert"),
                         callback_data=f"bookconvert:{uid}:{token}",
                     )
                 ]
@@ -2774,7 +2791,7 @@ def _ctx_menu_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\U0001f50e\U0001f5bc\ufe0f OCR & Thumbnail PDF",
+                        t("menu_ocr_thumb_pdf"),
                         callback_data=f"ocr:{uid}:{token}",
                     )
                 ]
@@ -2994,7 +3011,7 @@ async def cmd_status(
     await _track_user_session(update, "/status")
     if not config.is_user_allowed(uid):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     # Per-user summary: global queue depth + the caller's active/queued jobs.
@@ -3021,7 +3038,7 @@ async def cmd_setwebhook(
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
         await update.effective_message.reply_text(
-            "⛔ Only the bot owner can run this command."
+            t("only_owner")
         )
         return
     args = context.args or []
@@ -3097,7 +3114,7 @@ async def cmd_delwebhook(
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
         await update.effective_message.reply_text(
-            "⛔ Only the bot owner can run this command."
+            t("only_owner")
         )
         return
     try:
@@ -3118,42 +3135,17 @@ async def cmd_setcommands(
     uid = getattr(user, "id", None)
     if not config.is_owner(uid):
         await update.effective_message.reply_text(
-            "⛔ Only the bot owner can run this command."
+            t("only_owner")
         )
         return
-    # Default command set
-    commands = [
-        BotCommand("start", "Start interaction with the bot"),
-        BotCommand("help", "Show help and available commands"),
-        BotCommand("status", "Bot status: queue & your jobs"),
-        BotCommand("login", "Login your Telethon userbot"),
-        BotCommand("loginpyro", "Login your Pyrogram userbot"),
-        BotCommand("loginstatus", "Check your live session health"),
-        BotCommand("logout", "Logout your Telethon session"),
-        BotCommand("logoutpyro", "Logout your Pyrogram session"),
-        BotCommand("clearflood", "Clear an active login flow"),
-        BotCommand("admin", "Manage allowed users"),
-        BotCommand("clear_cache", "(admin) Clear cached results & thumbnails"),
-        BotCommand("startbatch", "Start collecting forwarded files"),
-        BotCommand("endbatch", "Process collected batch"),
-        BotCommand("cancelbatch", "Cancel batch collection"),
-        BotCommand("ocr", "Set OCR output default (pdf/txt/picker)"),
-        BotCommand("canceljob", "Cancel a job (asks to confirm)"),
-        BotCommand("cancelall", "(admin) Cancel all queued jobs"),
-        BotCommand("cancel", "Cancel an active login flow"),
-        BotCommand("setcommands", "(owner) Update the command list"),
-        BotCommand("sessionstatus", "(owner) Check userbot session health"),
-        BotCommand("setwebhook", "(owner) Set webhook URL"),
-        BotCommand("delwebhook", "(owner) Delete webhook"),
-    ]
+    # One shared command list (utils.i18n.COMMANDS), localized.
+    commands = [BotCommand(cmd, desc) for cmd, desc in command_menu()]
     try:
         await context.bot.set_my_commands(commands)
-        await update.effective_message.reply_text("Commands updated")
+        await update.effective_message.reply_text(t("commands_updated"))
     except Exception:
         logger.exception("Failed to set commands")
-        await update.effective_message.reply_text(
-            "\u274c Failed to update commands."
-        )
+        await update.effective_message.reply_text(t("failed_commands"))
 
 
 application.add_handler(CommandHandler("start", cmd_start))
@@ -3170,7 +3162,7 @@ async def cmd_startbatch(
     await _track_user_session(update, "/startbatch")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user = update.effective_user
@@ -3193,7 +3185,7 @@ async def cmd_endbatch(
     await _track_user_session(update, "/endbatch")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user = update.effective_user
@@ -3267,7 +3259,7 @@ async def cmd_cancelbatch(
     await _track_user_session(update, "/cancelbatch")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user = update.effective_user
@@ -3334,7 +3326,7 @@ async def cmd_logout(
     """Log out the calling user's Telethon session (per-user)."""
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user_id = update.effective_user.id
@@ -3458,7 +3450,7 @@ async def cmd_logoutpyro(
     """Log out the calling user's Pyrogram session (per-user)."""
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user_id = update.effective_user.id
@@ -3561,7 +3553,7 @@ async def cmd_loginstatus(
     """Live session health check for the calling user (per-user)."""
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     await update.message.reply_text(
@@ -3959,7 +3951,7 @@ async def cmd_clearflood(
     """Clear the calling user's active login flow (FloodWait cleanup)."""
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user_id = update.effective_user.id
@@ -3980,7 +3972,7 @@ async def cmd_cancel(
     await _track_user_session(update, "/cancel")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     user_id = update.effective_user.id
@@ -4482,7 +4474,7 @@ async def cmd_canceljob(
     await _track_user_session(update, "/canceljob")
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     args = context.args if hasattr(context, "args") else []
@@ -5885,7 +5877,7 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = getattr(update.effective_user, "id", None)
     if not config.is_user_allowed(uid):
         await update.effective_message.reply_text(
-            "Access denied. This bot is private."
+            t("access_denied")
         )
         return
     if not ocr_enabled():
@@ -7158,7 +7150,7 @@ async def handle_text_with_url(
         return
     # ── ACL check (open bot when ALLOWED_USER_IDS is empty) ──
     if not config.is_user_allowed(getattr(update.effective_user, "id", None)):
-        await msg.reply_text("Access denied. This bot is private.")
+        await msg.reply_text(t("access_denied"))
         return
     urls = URL_RE.findall(msg.text)
     if not urls:
@@ -7581,13 +7573,9 @@ async def set_commands(
             ]
             await application.bot.set_my_commands(cmds)
         else:
-            # fallback to default commands
+            # fallback to the shared default list
             await application.bot.set_my_commands(
-                [
-                    BotCommand("start", "Start interaction with the bot"),
-                    BotCommand("help", "Show help and available commands"),
-                    BotCommand("status", "Bot status: queue & your jobs"),
-                ]
+                [BotCommand(cmd, desc) for cmd, desc in command_menu()]
             )
         return {"ok": True}
     except Exception:

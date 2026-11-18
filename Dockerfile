@@ -30,10 +30,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ghostscript xz-utils \
 		libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libffi-dev \
-		fonts-dejavu-core \
+		fonts-dejavu-core fonts-arabeyes \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Install Tesseract OCR (tesseract binary + English language pack) for the
+# Install Tesseract OCR (tesseract binary + English and Arabic language packs)
+# for the
 # 🔎🖼 OCR & Thumbnail feature.  The binary is an OS package (not a Python
 # dependency); the
 # Python wrapper (pytesseract) ships in requirements.txt.  Build arg lets
@@ -41,7 +42,7 @@ RUN apt-get update \
 ARG INSTALL_OCR="1"
 RUN if [ "$INSTALL_OCR" = "1" ]; then \
 		apt-get update && apt-get install -y --no-install-recommends \
-			tesseract-ocr tesseract-ocr-eng \
+			tesseract-ocr tesseract-ocr-eng tesseract-ocr-ara \
 			&& rm -rf /var/lib/apt/lists/* && \
 		# Fail the build fast if the binaries cannot run instead of deploying an
 		# image where every OCR job fails.  ocrmypdf (pip, installed above)

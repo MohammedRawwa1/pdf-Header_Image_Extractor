@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
 
@@ -360,9 +361,17 @@ def _publish_thumb_ready(
 
 
 def _safe_local_filename(filename: str) -> str:
-    """Filesystem-safe local name for a user-supplied filename."""
+    """Filesystem-safe local name for a user-supplied filename.
+
+    Unprintable/control and format characters are dropped - including bidi
+    overrides (U+202E) and zero-width marks, which can make a temp name
+    display as something other than what it is. Letters of every script are
+    kept, so an Arabic name stays readable on disk.
+    """
     name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    name = "".join(c for c in name if c >= " ")
+    name = "".join(
+        c for c in name if not unicodedata.category(c).startswith("C")
+    )
     if not name or set(name) <= {"."}:
         return "file"
     if len(name) > 200:

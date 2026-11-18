@@ -39,8 +39,40 @@ def ocr_pdf_available() -> bool:
     return shutil.which("ocrmypdf") is not None
 
 
+_AVAILABLE_LANGS: set[str] | None = None
+
+
+def _available_languages() -> set[str]:
+    """Traineddata languages actually installed (empty when unknown)."""
+    global _AVAILABLE_LANGS
+    if _AVAILABLE_LANGS is None:
+        try:
+            import pytesseract
+
+            _AVAILABLE_LANGS = set(pytesseract.get_languages(config=""))
+        except Exception:
+            _AVAILABLE_LANGS = set()
+    return _AVAILABLE_LANGS
+
+
 def _resolve_lang(lang: str | None) -> str:
-    return (lang or "eng").strip() or "eng"
+    """Requested OCR languages, limited to the traineddata that exists.
+
+    A language whose traineddata is absent makes Tesseract fail the whole
+    job, so it is dropped instead: asking for ``eng+ara`` on an image that
+    only ships English still runs English OCR rather than failing. ``eng`` is
+    the last resort because every image installs it.
+    """
+    requested = [part.strip() for part in (lang or "eng").split("+") if part.strip()]
+    requested = requested or ["eng"]
+    available = _available_languages()
+    if available:
+        kept = [part for part in requested if part in available]
+        if kept:
+            return "+".join(kept)
+        if "eng" in available:
+            return "eng"
+    return "+".join(requested)
 
 
 def _raise_if_cancelled(cancel_check) -> None:
