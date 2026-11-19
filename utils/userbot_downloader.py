@@ -150,29 +150,36 @@ async def _resolve_pyrogram_peer(client, peer_id: int | str) -> int:
             e,
         )
 
-    try:
-        resolved = await client.get_users(peer_id)
-        if resolved is not None:
-            cached_id = getattr(resolved, "id", None)
-            if cached_id is not None:
-                logger.debug(
-                    "resolve_pyrogram_peer: get_users(%s) -> id=%s",
-                    peer_id,
-                    cached_id,
-                )
-                return cached_id
-    except Exception as e:
-        logger.debug(
-            "resolve_pyrogram_peer: get_users(%s) failed: %s",
-            peer_id,
-            e,
-        )
+    if peer_id > 0:
+        try:
+            resolved = await client.get_users(peer_id)
+            if resolved is not None:
+                cached_id = getattr(resolved, "id", None)
+                if cached_id is not None:
+                    logger.debug(
+                        "resolve_pyrogram_peer: get_users(%s) -> id=%s",
+                        peer_id,
+                        cached_id,
+                    )
+                    return cached_id
+        except Exception as e:
+            logger.debug(
+                "resolve_pyrogram_peer: get_users(%s) failed: %s",
+                peer_id,
+                e,
+            )
 
+    _bare_id = (
+        abs(peer_id) - 1000000000000 if _is_bot_api_channel(peer_id) else abs(peer_id)
+    )
     try:
         _dialogs = await client.get_dialogs(limit=200)
         for _d in _dialogs:
             _chat = getattr(_d, "chat", None)
-            if _chat is not None and getattr(_chat, "id", None) == peer_id:
+            _chat_id = getattr(_chat, "id", None)
+            if _chat is not None and (
+                _chat_id == peer_id or _chat_id == _bare_id
+            ):
                 logger.info(
                     "resolve_pyrogram_peer: found %s via dialog scan",
                     peer_id,
@@ -210,15 +217,9 @@ def _validate_downloaded_pdf(path: str) -> bool:
         return False
 
 
-def _is_large_bot_api_channel(peer_id) -> bool:
-
-    if not isinstance(peer_id, int) or peer_id >= 0:
-        return False
-    s = str(peer_id)
-    if not s.startswith("-100"):
-        return False
-    raw_id = abs(peer_id) - 1000000000000
-    return raw_id > 2147483647
+def _is_bot_api_channel(peer_id) -> bool:
+    """True for a Bot-API style channel id (``-100...``)."""
+    return isinstance(peer_id, int) and str(peer_id).startswith("-100")
 
 
 async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
@@ -241,7 +242,7 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
             chat = result.chats[0]
             access_hash = getattr(chat, "access_hash", 0)
             logger.info(
-                "userbot: resolved large channel %s -> channel_id=%s access_hash=%s",
+                "userbot: resolved channel %s -> channel_id=%s access_hash=%s",
                 bot_api_chat_id,
                 raw_channel_id,
                 access_hash,
@@ -252,7 +253,7 @@ async def _resolve_bot_api_channel_raw(client, bot_api_chat_id: int):
             )
     except Exception as e:
         logger.warning(
-            "userbot: failed to resolve large channel %s via raw API: %s",
+            "userbot: failed to resolve channel %s via raw API: %s",
             bot_api_chat_id,
             e,
         )
@@ -602,6 +603,60 @@ async def _resolve_bot_entity(client):
     return None
 
 
+async def _download_by_bot_file_id(
+    client,
+    file_id: str,
+    dest_path: str,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Download a Bot-API ``file_id`` without resolving its chat.
+
+    This is the fallback when the userbot cannot see the source chat (a peer
+    that is neither cached nor in its dialog list): the file location comes
+    from the Bot API file id itself, so no chat access hash is needed.
+    """
+    if TelegramClient is None or not file_id:
+        return False
+    try:
+        from telethon.utils import resolve_bot_file_id
+
+        resolved = resolve_bot_file_id(file_id)
+        if resolved is None:
+            logger.warning("userbot: could not resolve bot file_id for fallback")
+            return False
+        location, _file_size = resolved
+        kwargs = {
+            "file": dest_path,
+            "part_size_kb": TELETHON_DOWNLOAD_PART_SIZE_KB,
+        }
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        await asyncio.wait_for(
+            client.download_file(location, **kwargs),
+            timeout=TELETHON_DOWNLOAD_TIMEOUT,
+        )
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            if _is_likely_pdf(dest_path) and not _validate_downloaded_pdf(
+                dest_path
+            ):
+                logger.warning(
+                    "userbot: file_id fallback produced an invalid PDF, removing"
+                )
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+                return False
+            logger.info(
+                "userbot: file_id fallback succeeded (%d bytes)",
+                os.path.getsize(dest_path),
+            )
+            return True
+    except Exception as e:
+        logger.warning("userbot: file_id fallback failed: %s", e)
+    return False
+
+
 async def _download_with_telethon(
     chat_id: int | str,
     message_id: int,
@@ -813,6 +868,11 @@ async def _download_with_telethon(
             if _scan_ok:
                 return True
 
+        if file_id and await _download_by_bot_file_id(
+            client, file_id, dest_path, progress_callback
+        ):
+            return True
+
         logger.warning(
             "userbot: Telethon download failed after %d attempts (chat=%s msg=%s)",
             total_attempts,
@@ -994,10 +1054,10 @@ async def _download_bytes_with_pyrogram(
                     if (
                         "Peer id invalid" in err_str
                         and isinstance(_peer, int)
-                        and _is_large_bot_api_channel(_peer)
+                        and _is_bot_api_channel(_peer)
                     ):
                         logger.info(
-                            "userbot: large channel ID %s for in-memory, trying raw API (attempt %s)",
+                            "userbot: channel ID %s for in-memory, trying raw API (attempt %s)",
                             _peer,
                             attempt + 1,
                         )
@@ -1172,10 +1232,10 @@ async def _download_with_pyrogram(
                     if (
                         "Peer id invalid" in err_str
                         and isinstance(_peer, int)
-                        and _is_large_bot_api_channel(_peer)
+                        and _is_bot_api_channel(_peer)
                     ):
                         logger.info(
-                            "userbot: large channel ID %s, trying raw API (attempt %s)",
+                            "userbot: channel ID %s, trying raw API (attempt %s)",
                             _peer,
                             attempt + 1,
                         )
@@ -1377,6 +1437,11 @@ async def download_forward_via_userbot(
                 return True
         except Exception as e:
             logger.warning("userbot: Pyrogram download error (%s)", e)
+
+    if file_id and await _download_file_by_file_id(
+        file_id, dest_path, progress_callback, user_id
+    ):
+        return True
 
     logger.warning(
         "userbot: all download methods failed for %s/%s", chat_id, message_id

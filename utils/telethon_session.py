@@ -678,7 +678,10 @@ async def restore_per_user_session_files() -> int:
 
 
 def build_pyrogram_client(
-    api_id: int, api_hash: str, session_str: str | None = None
+    api_id: int,
+    api_hash: str,
+    session_str: str | None = None,
+    no_updates: bool = True,
 ) -> object | None:
 
     if PyrogramClient is None:
@@ -708,6 +711,7 @@ def build_pyrogram_client(
             api_hash=api_hash,
             session_string=session_str,
             in_memory=True,
+            no_updates=no_updates,
             sleep_threshold=sleep_threshold,
         )
 
